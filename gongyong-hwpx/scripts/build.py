@@ -1081,6 +1081,47 @@ class Builder:
                       "— 표·내용을 바로 두고 설명은 표 아래 ※로 옮기세요.")
 
     # ------------------------------------------------------------ 부연설명 괄호 작게
+    def small_notes(self):
+        """*·※ 설명 문단은 설명하는 글(바로 위 □·○·-·· 문단)보다 1pt 작게(사용자 원칙 2026-11-02 — 표 안·밖 모두
+        설명글은 원글보다 한 포인트 작게). 표 바로 뒤 ※·*는 fit이 표 글자 기준(1pt 작게)으로 맞추므로 건너뛴다.
+        조각마다 크기 차이(작게 한 괄호 등)는 그대로 두고 문단 전체를 같은 만큼 옮긴다. 견본이 이미 1pt 작으면 그대로."""
+        def main_size(p):
+            sizes = [round(self.styles.char.get(r.get("charPrIDRef"), {}).get("size", 0)) for r in indexed_runs(p)
+                     if r.find(T("hp:t")) is not None and run_text(r).strip()
+                     and not self.styles.char.get(r.get("charPrIDRef"), {}).get("superscript")]
+            sizes = [s for s in sizes if s]
+            return max(set(sizes), key=sizes.count) if sizes else 0
+
+        changed, parent, after_table = 0, 0, False
+        for p in self.sec:
+            if p.tag != T("hp:p"):
+                continue
+            if para_tables(p):
+                after_table = True
+                continue
+            text = para_text(p)
+            if not text.strip():
+                continue
+            lvl = marker_level(text)
+            if lvl == 4:
+                if after_table or not parent:
+                    continue
+                cur = main_size(p)
+                delta = (parent - 1) - cur
+                if not cur or not delta:
+                    continue
+                for r in indexed_runs(p):
+                    if r.find(T("hp:t")) is None:
+                        continue
+                    r.set("charPrIDRef", self.hedit.char_size(r.get("charPrIDRef"), delta))
+                changed += 1
+                continue
+            after_table = False
+            if lvl in (1, 2, 3):
+                parent = main_size(p) or parent
+        if changed:
+            self.warn(f"*·※ 설명 {changed}문단을 설명하는 글보다 1pt 작게 했습니다(견본이 그보다 크거나 작았음).")
+
     def small_parens(self, delta):
         """○·- 항목 글 속 부연설명 괄호(괄호와 그 안의 글)를 delta pt 작게 한다(사용자 원칙, 2026-10-31).
         첫머리 괄호 이름표 (현황)·이름의 일부 (안)·요일 (금)·「」 안의 괄호와 굵은·위 첨자 조각은 그대로 둔다."""
@@ -1592,6 +1633,8 @@ class Builder:
             self.word_wrap()
         if opts.get("paren_small", 2):
             self.small_parens(opts.get("paren_small", 2))
+        if opts.get("note_small", True):
+            self.small_notes()
         if opts.get("tighten_quotes", True):
             self.tighten_quotes()
         if self.colons or opts.get("label_hang", True):

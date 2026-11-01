@@ -71,6 +71,7 @@ SHORT_COST = 2               # 짧은 칸 글이 넘어간 줄 하나에 더 얹
 DOT_COST = 1                 # 가운데점 뒤에서 나누는 것 하나를 줄 몇 개로 칠지(빈칸에서 나누는 것보다는 덜 좋음)
 HEAD_COST = 3                # 머리 줄 칸이 다음 줄로 넘어가면(‘남은 두 달 할 / 일’) 줄 몇 개로 칠지 — 머리 줄은 되풀이돼 더 눈에 띔
 UNIT_GAP = 2                 # 표 위 기준·단위 줄은 표 글자보다 이만큼(pt) 작게
+NOTE_SMALLER = 1             # 표 바로 밑 ※·* 설명은 표 글자보다 이만큼(pt) 작게(사용자 원칙 2026-11-02)
 BULLET_RE = re.compile(r"^[ ⎵⍽]*[○●◎◦ㅇ·•\-–※*□■◇◆▶►①-⑳][ ⎵⍽]")  # 칸 안 글머리표 줄('- 내용', '○ 내용', '① 순서')
 BULLET_PAD = 1.5 * HWPUNIT_PER_MM  # 칸 안 글머리표 줄은 왼쪽 정렬하되 왼쪽을 약간 띄움(사용자 원칙 2026-11-01)
 # 표 열의 '·' 항목(사용자 수정본·결정 2026-11-01): 이름을 늘어놓는 열(머리 칸이 '등록 후보'·'확인 사항'·'평가지표(배점)'처럼
@@ -1215,7 +1216,7 @@ class Fitter:
         nxt = p.getnext()
         while nxt is not None and nxt.tag != T("hp:p"):
             nxt = nxt.getnext()
-        if nxt is None or not para_text(nxt).lstrip().startswith("※"):
+        if nxt is None or not para_text(nxt).lstrip().startswith(("※", "*")):
             return 0
         om = tbl.find(T("hp:outMargin"))
         if om is None or int(om.get("bottom", "0")) >= NOTE_GAP:
@@ -1224,9 +1225,9 @@ class Fitter:
         return 1
 
     def _fit_notes(self, p, tbl):
-        """표 바로 밑 ※ 줄(이어지는 ※ 줄 모두)은 표 글씨로 — 글꼴은 표 글꼴(맑은 고딕), 크기는 표 글자 크기
-        (사용자 수정본 2026-11-01: 한양중고딕 12pt → 맑은 고딕 10pt). 글꼴이 바뀌어 폭이 달라지므로 둘째 줄 내어쓰기
-        (※ 뒤 또는 쌍점 뒤 첫 글자)를 다시 잰다. 바꾼 줄 수."""
+        """표 바로 밑 ※ 줄(이어지는 ※ 줄 모두)은 표 글꼴(맑은 고딕)로, 크기는 **표 글자보다 1pt 작게**
+        (사용자 원칙 2026-11-02 — 표 안 글보다 1pt 작아야 함. 2026-11-01의 '표 글자 크기 그대로'를 바꿈).
+        글꼴이 바뀌어 폭이 달라지므로 둘째 줄 내어쓰기(※ 뒤 또는 쌍점 뒤 첫 글자)를 다시 잰다. 바꾼 줄 수."""
         if not self._is_data_table(tbl):
             return 0  # 데이터 표만 — 법령 조문 상자(13pt) 밑 ※ 출처는 작게 그대로
         runs = [r for r in self._table_runs(tbl) if run_text(r).strip()]
@@ -1237,17 +1238,18 @@ class Fitter:
         if src is None or not size:
             return 0
         font = self.st.char.get(src, {}).get("font")
+        want = size - NOTE_SMALLER
         n = 0
         nxt = p.getnext()
         while nxt is not None and nxt.tag == T("hp:p") and not para_tables(nxt) \
-                and para_text(nxt).lstrip(" ⎵⍽").startswith("※"):
+                and para_text(nxt).lstrip(" ⎵⍽").startswith(("※", "*")) and not para_text(nxt).lstrip(" ⎵⍽").startswith("**"):
             changed = False
             for r in para_runs(nxt):
                 cid = r.get("charPrIDRef")
                 c = self.st.char.get(cid, {})
-                if r.find(T("hp:t")) is None or (c.get("font") == font and round(c.get("size", 0)) == size):
+                if r.find(T("hp:t")) is None or (c.get("font") == font and round(c.get("size", 0)) == want):
                     continue
-                r.set("charPrIDRef", self.b.hedit.char_like(cid, src, size))
+                r.set("charPrIDRef", self.b.hedit.char_like(cid, src, want))
                 changed = True
             if changed:
                 text = para_text(nxt)
@@ -1415,7 +1417,7 @@ class Fitter:
         if notes:
             msg.append(f"표 바로 뒤 ※가 붙는 표 {notes}개는 표 아래를 {NOTE_GAP / HWPUNIT_PER_MM:.1f}mm 띄웠습니다")
         if note_font:
-            msg.append(f"표 바로 밑 ※ {note_font}줄은 표 글씨(표 글꼴·표 글자 크기)로 맞췄습니다")
+            msg.append(f"표 바로 밑 ※ {note_font}줄은 표 글꼴로, 표 글자보다 {NOTE_SMALLER}pt 작게 맞췄습니다")
         if padded:
             msg.append(f"표 {padded}개는 칸 안 위아래 여백을 {CELL_VPAD / HWPUNIT_PER_MM:.1f}mm로 넓혔습니다(여러 줄 칸 글이 칸 선에 붙지 않게)")
         if borrowed:
