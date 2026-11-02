@@ -80,8 +80,8 @@ FIX_RE = re.compile(r"근거법령이 없|‘~으로’로 끝나는|한 열에 
 DATE_LINE_RE = re.compile(r"^[ \t⎵]*(?:[’']\s*[\d○]{2}|(?:19|20)\d{2})\.\s*[\d○]{1,2}\.\s*[\d○]{1,2}\.")
 MID_DOTS = "·ㆍ"
 NOTE_STAR_PT = 2        # * 풀이는 설명하는 글보다 이만큼(pt) 작게(사용자 원칙 2026-11-02)
-NOTE_REF_PT = 1         # ※ 참고는 1pt 작게
-NOTE_STAR_GAP = 300     # * 풀이 문단 아래 간격 하한(HWPUNIT, 3pt)
+NOTE_REF_PT = 2         # 본문 ※ 참고도 2pt 작게(사용자 원칙 2026-11-02 v1.1 — 표 밑 ※는 표 글자보다 1pt, fit)
+NOTE_STAR_GAP = 300     # 본문 *·※ 설명 문단 아래 간격 하한(HWPUNIT, 3pt)
 FLOW_PT = 11  # 투명 선 도표(flow) 상자 글 크기(pt)
 FLOW_ARROW_PT = 16  # 도표 화살표: 굵게, 이 크기(사용자 의견 2026-11-01)
 FLOW_TITLE_PT = 12  # 도표 위 제목(예: ○○○ 신청절차): 굵게
@@ -1085,8 +1085,8 @@ class Builder:
 
     # ------------------------------------------------------------ 부연설명 괄호 작게
     def small_notes(self):
-        """설명 문단은 설명하는 글(바로 위 □·○·-·· 문단)보다 작게(사용자 원칙 2026-11-02): * 풀이는 **2pt**, ※ 참고는
-        **1pt** 작게. * 문단은 아래 간격을 3pt 이상 둬 작아진 글자 뒤 줄이 붙어 보이지 않게 한다. 표 바로 뒤 ※·*는 fit이
+        """설명 문단은 설명하는 글(바로 위 □·○·-·· 문단)보다 작게(사용자 원칙 2026-11-02): * 풀이·※ 참고 모두 **2pt**
+        작게(v1.1). 설명 문단은 아래 간격을 3pt 이상 둬 작아진 글자 뒤 줄이 붙어 보이지 않게 한다. 표 바로 뒤 ※·*는 fit이
         표 글자 기준(1pt 작게)으로 맞추므로 건너뛴다. 조각마다 크기 차이(작게 한 괄호 등)는 그대로 두고 문단 전체를 같은
         만큼 옮긴다. 견본이 이미 그만큼 작으면 그대로."""
         def main_size(p):
@@ -1119,7 +1119,7 @@ class Builder:
                             continue
                         r.set("charPrIDRef", self.hedit.char_size(r.get("charPrIDRef"), delta))
                     changed += 1
-                if is_star:
+                if True:  # * 풀이·※ 참고 모두(v1.1)
                     pid = p.get("paraPrIDRef")
                     if self.styles.para.get(pid, {}).get("next", 0) < NOTE_STAR_GAP:
                         p.set("paraPrIDRef", self.hedit.para_margin(pid, "next", NOTE_STAR_GAP))
@@ -1131,7 +1131,7 @@ class Builder:
         if changed:
             self.warn(f"*·※ 설명 {changed}문단을 설명하는 글보다 작게(* {NOTE_STAR_PT}pt·※ {NOTE_REF_PT}pt) 했습니다(견본이 달랐음).")
         if gapped:
-            self.warn(f"* 설명 {gapped}문단 아래를 {NOTE_STAR_GAP // 100}pt 띄웠습니다(작은 글자 뒤 줄이 붙어 보이지 않게).")
+            self.warn(f"*·※ 설명 {gapped}문단 아래를 {NOTE_STAR_GAP // 100}pt 띄웠습니다(작은 글자 뒤 줄이 붙어 보이지 않게).")
 
     def small_parens(self, delta):
         """○·- 항목 글 속 부연설명 괄호(괄호와 그 안의 글)를 delta pt 작게 한다(사용자 원칙, 2026-10-31).
