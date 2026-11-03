@@ -1038,6 +1038,8 @@ class Builder:
                 continue  # * 설명·※ 참고는 세지 않고 지나감
             if lv == 1 and mark[0] in ROMAN:
                 close(1)
+                if BASIS_TITLE_RE.search(text):  # Ⅰ. 근거법령 아래 ○도 둘 이상(사용자 원칙 2026-11-03)
+                    open_[1] = [text[_base_head(text):].lstrip(" " + FW)[:12], 0]
                 continue
             if lv == 3:
                 lv = 4 if mark in "•∙·ㆍ" else 3  # 작대기 다음은 가운데점
@@ -1054,6 +1056,13 @@ class Builder:
             ones = [t for t, n in items if n == 1]
             many = [f"{t}({n}개)" for t, n in items if n > 5]
             msg = f"{child[lv]} 항목 수 — 셋쯤이 좋고 2~5개를 벗어나지 않게(사용자 원칙): "
+            basis = [t for t in ones if lv == 1 and BASIS_TITLE_RE.search(t)]
+            if basis:  # 근거법령도 ○ 둘 이상(사용자 원칙 2026-11-03) — 나누거나 합치지 말고 확인된 근거를 더함
+                msg += (f"○ 하나뿐인 근거법령({', '.join('‘' + t + '’' for t in basis)}) → 확인된 다른 근거(시행령·시행규칙·"
+                        "조례·훈령·지침·계획)를 ○로 더하세요(법령 검색 도구로 확인한 것만, 모르면 사용자에게 묻기)")
+                ones = [t for t in ones if t not in basis]
+                if ones or many:
+                    msg += "; "
             if ones:
                 msg += f"{child[lv]} 하나뿐인 {names[lv]} {len(ones)}개({', '.join('‘' + t + '’' for t in ones)})"
                 msg += {1: " → (추진방향)·(주요내용)처럼 둘 이상으로 나누거나 다른 □와 합치세요",
@@ -1404,9 +1413,10 @@ class Builder:
     def basis_first(self, blocks):
         """근거법령은 무조건 1번(사용자 원칙 2026-11-01 — 모든 공문·보고서·계획서에 근거법령이 옴):
         - 표지 개요 상자: 첫 □ 아래 첫 ○
-        - 본문: 로마자 장이 있으면 Ⅰ.이 근거법령 장(Ⅰ. 근거법령 → ○ 「…법」 제○조), 없으면 첫 □가 근거(□ 추진근거)이거나
-          첫 □의 첫 ○가 근거(○ (추진근거))
-        뒤에 있으면 그 장·□·○ 묶음째 맨 앞으로 옮기고, 없으면 알린다."""
+        - 본문: 로마자 장이 있으면 Ⅰ.이 근거법령 장(Ⅰ. 근거법령 → ○ 「…법」 제○조), 없으면 첫 □가 근거법령
+          (□ 근거법령 → ○ 「…법」 제○조, 사용자 원칙 2026-11-03 — 근거법령이 들어가면 첫 □가 근거법령)
+        뒤에 있으면 그 장·□ 묶음째 맨 앞으로 옮기고, 다른 □ 안의 ○ (추진근거)이면 □ 근거법령으로 떼어 첫 □로 세우며,
+        없으면 알린다."""
         moved, missing = [], []
         # 표지 개요 상자(그림으로 시작하는 계획의 첫 쪽, 한 칸 상자 글이 □·○ 줄)
         first = self._proto_of(blocks[0]) if blocks else None
@@ -1433,7 +1443,7 @@ class Builder:
                     lines = lines[:items[0]] + lines[basis:stop] + lines[items[0]:basis] + lines[stop:]
                     b["text"] = NL.join(lines)
                     moved.append("표지 개요 상자")
-        # 본문: 로마자 장이 있으면 Ⅰ.이 근거법령 장, 없으면 첫 □가 근거(□ 추진근거)이거나 첫 □의 첫 ○가 근거
+        # 본문: 로마자 장이 있으면 Ⅰ.이 근거법령 장, 없으면 첫 □가 근거법령
         start = next((n for n, b in enumerate(blocks) if (p := self._proto_of(b)) is not None
                       and p.find(".//" + T("hp:secPr")) is not None), 0)
         ref = next((n for n in range(start, len(blocks)) if self._is_ref_proto(blocks[n])), len(blocks))
@@ -1468,29 +1478,59 @@ class Builder:
                     moved.append(f"‘{blocks[first]['text'][:8]}’ 장을 Ⅰ.로")
             return self._basis_report(blocks, moved, missing)
         if BASIS_TITLE_RE.search(blocks[first]["text"]):
-            return self._basis_report(blocks, moved, missing)  # □ 추진근거처럼 □ 자체가 근거
+            return self._basis_report(blocks, moved, missing)  # □ 근거법령처럼 첫 □ 자체가 근거
         later = next((h for h in heads[1:] if level[h] == 1 and BASIS_TITLE_RE.search(blocks[h]["text"])), None)
-        end = heads[1] if len(heads) > 1 else ref
-        items = [n for n in range(first + 1, end) if level.get(n) == 2]
-        basis = next((n for n in items if self._is_basis("○ " + blocks[n]["text"])), None)
-        if basis is not None and basis != items[0]:
-            nxt = next((k for k in items if k > basis), end)
-            blocks = move(basis, nxt, items[0])
-            moved.append(f"첫 □ ‘{blocks[first]['text'][:10]}’의 근거 ○")
-        elif basis is None and later is not None:
+        if later is not None:
             nxt = next((h for h in heads if h > later), ref)
             blocks = move(later, nxt, first)
             moved.append(f"□ ‘{blocks[first]['text'][:10]}’")
-        elif basis is None:
-            missing.append(f"본문 첫 □ ‘{blocks[first]['text'][:10]}’")
+            return self._basis_report(blocks, moved, missing)
+        # 근거가 어느 □ 안의 ○ (추진근거)이면 □ 근거법령으로 떼어 첫 □로(사용자 원칙 2026-11-03: 근거법령이 들어가면 첫 □가 근거법령)
+        for h in (h for h in heads if level[h] == 1):
+            end = next((k for k in heads if k > h), ref)
+            items = [n for n in range(h + 1, end) if level.get(n) == 2]
+            basis = next((n for n in items if self._is_basis("○ " + blocks[n]["text"])), None)
+            if basis is None:
+                continue
+            stop = next((k for k in items if k > basis), end)
+            while stop - 1 > basis and "text" not in blocks[stop - 1] and level.get(stop - 1) == 0:
+                stop -= 1  # 묶음 끝의 빈 줄은 두고 감
+            group, dropped = self._basis_square(blocks, first, basis, stop, level)
+            moved.append(f"□ ‘{blocks[h]['text'][:10]}’ 안의 근거 ○를 □ 근거법령으로 떼어"
+                         + (f" — 법령 아닌 요약 ‘{dropped}’은 빼고 아래 법령 줄을 ○로" if dropped else ""))
+            blocks = blocks[:first] + group + blocks[first:basis] + blocks[stop:]
+            return self._basis_report(blocks, moved, missing)
+        missing.append(f"본문 첫 □ ‘{blocks[first]['text'][:10]}’")
         return self._basis_report(blocks, moved, missing)
+
+    def _basis_square(self, blocks, first, basis, stop, level):
+        """'○ (추진근거) …' 묶음(blocks[basis:stop])을 '□ 근거법령 + ○ 법령 하나씩'으로 바꾼다. □ 모양은 첫 □를 빌림.
+        이름표 뒤 글은 ○로 두고, 아래 줄(-·번호)이 모두 법령(「)이면 ○로 올린다. 이때 이름표 뒤 글이 법령이 아닌
+        요약(예: '행정업무 규정·조례')이면 아래 법령 줄과 겹치므로 뺀다(돌려주는 두 번째 값)."""
+        head = blocks[basis]
+        body = split_marker("○ " + head["text"])[2]
+        lm = LABEL_RE.match(body)
+        rest = body[lm.end():].strip() if lm else body.strip()
+        kids = [n for n in range(basis + 1, stop) if level.get(n) == 3]
+        lift = bool(kids) and (not rest or all("「" in blocks[n].get("text", "") for n in kids))
+        dropped = rest if rest and lift and "「" not in rest else ""
+        out = [{"like": blocks[first]["like"], "text": "근거법령", "_src": head.get("_src")}]
+        if rest and not dropped:
+            out.append(dict(head, text=rest))
+        for n in range(basis + 1, stop):
+            b = blocks[n]
+            if lift and n in kids:
+                _, mark, kbody = split_marker(b["text"])
+                b = dict(b, like=head["like"], text=kbody if mark else b["text"])
+            out.append(b)
+        return out, dropped
 
     def _basis_report(self, blocks, moved, missing):
         if moved:
             self.warn("근거법령을 맨 앞(1번)으로 옮겼습니다(" + ", ".join(moved) + ") — 근거법령은 무조건 1번(사용자 원칙).")
         if missing:
             self.warn("근거법령이 없습니다(" + ", ".join(missing) + ") — 모든 공문·보고서·계획서에 근거법령이 옵니다: "
-                      "로마자 장이 있으면 Ⅰ. 근거법령(○ 「…법」 제○조), 없으면 첫 □ 추진근거나 첫 ○ **(추진근거)**. "
+                      "로마자 장이 있으면 Ⅰ. 근거법령, 없으면 첫 □ 근거법령(아래 ○ 「…법」 제○조 하나씩). "
                       "근거를 모르면 사용자에게 묻습니다.")
         return blocks
 
@@ -1662,6 +1702,8 @@ class Builder:
             f.spread_pages()
             f.fit_refs()
             f.fit_cover()
+            if opts.get("pull_corner", True):
+                f.pull_corners()  # 맨 마지막: 내어쓰기를 다시 재는 단계들 뒤에(아랫줄은 그대로, 낫표만 당김)
             self.fit_notes = f.notes + [f.report()]
         self._finish(opts)
 
@@ -1752,8 +1794,27 @@ def main():
         print("## 알림(참고 — 도구가 한 일, 한글 없이 어림한 결과라 마지막 확인은 한글에서)")
         for w in info:
             print(" - " + w)
+    tell = margin_note(page_info(b.sec))
+    if tell:
+        print("## 사용자에게 전할 말(결과를 건넬 때마다 빠짐없이 그대로 옮길 것)")
+        print(" - " + tell)
     print_report(errors, notes, outline)
     sys.exit(1 if errors else 0)
+
+
+def margin_note(pi):
+    """만든 문서의 여백 안내 한 줄(사용자 요청 2026-11-03: 결과를 줄 때마다 여백이 몇 mm인지 알리고, 온나라 공문에
+    붙여 넣을 때는 [쪽] → [편집 용지]에서 왼쪽·오른쪽 여백을 맞추라고 — 본문 폭이 같아야 도구가 맞춘 줄 바꿈이 그대로 감).
+    한글은 위 여백 다음 머리말 칸, 그 아래부터 본문이므로 본문 칸 위·아래 = 여백 + 머리말·꼬리말."""
+    if not pi or "left" not in pi:
+        return None
+    f = lambda v: f"{v:.0f}" if abs(v - round(v)) < 0.05 else f"{v:.1f}"  # noqa: E731
+    paper = "A4" if sorted((round(pi["width"]), round(pi["height"]))) == [210, 297] else f"{f(pi['width'])}×{f(pi['height'])}mm"
+    top, bottom = pi["top"] + pi["header"], pi["bottom"] + pi["footer"]
+    return (f"여백: {paper}, 본문 칸 위 {f(top)}·아래 {f(bottom)}·왼쪽 {f(pi['left'])}·오른쪽 {f(pi['right'])}mm"
+            f"(용지 여백 위 {f(pi['top'])}·아래 {f(pi['bottom'])}mm에 머리말·꼬리말 {f(pi['header'])}·{f(pi['footer'])}mm). "
+            f"온나라 공문에 붙여 넣으실 때는 [쪽] → [편집 용지]에서 왼쪽·오른쪽 여백을 {f(pi['left'])}·{f(pi['right'])}mm로 "
+            "맞춰 주세요(그래야 줄 바꿈이 그대로 갑니다).")
 
 
 if __name__ == "__main__":

@@ -11,8 +11,8 @@
 import copy
 import re
 
-from hwpx_lib import (HWPUNIT_PER_MM, UNIT_RE, T, cell_paras, head_length, is_blank, label_colon, marker_level, page_info, para_pics,
-                      para_runs, para_tables, para_text, run_text, set_run_text, split_marker, table_grid)
+from hwpx_lib import (HWPUNIT_PER_MM, UNIT_RE, T, cell_paras, head_length, is_blank, label_colon, label_content, marker_level,
+                      page_info, para_pics, para_runs, para_tables, para_text, run_text, set_run_text, split_marker, table_grid)
 from layout import Layout, spacing_after
 
 
@@ -56,6 +56,11 @@ FW = "⎵"                     # 고정폭 빈칸(양쪽 정렬 때 늘어나지
 SPREAD_GAP = 0.04            # 다음 쪽으로 이어지는 쪽 아래가 본문 높이의 이 비율보다 비면 '끝선이 애매함' → 그 쪽 줄 간격을 넓힘
 SPREAD_ADD = 20              # 그때 쪽 전체 줄 간격을 더하는 상한(%p) — 사용자 수정본: ○ 150→170, 제목 160→180(2026-11-01)
 LINE_CAP = 190               # 줄 간격 상한(원칙 6: 140~190%)
+# 여는 낫표 표시가 시작하는 자리(글자 칸 대비): 휴먼명조는 칸 오른쪽에 찍혀 왼쪽 반 칸이 빔(글꼴 파일 HMKMM.TTF 실측 2026-11-03,
+# 60pt 한글 실측 0.53과 같음). 보통 한글은 0.055~0.12(가·지·조·사·관 …)라 그 어림 KO_INK에 맞춰 당긴다.
+CORNER_INK = {"휴먼명조": {"「": 0.535, "『": 0.547}}
+KO_INK = 0.07
+CORNER_FLOOR = -50           # 낫표 앞 글자 자간 하한(한글 자간 하한, 따옴표 붙이기와 같음)
 # 금액 열: 머리 칸에 금액·예산·사업비·○○액·(원)·백만원 등이 있거나, 칸 숫자에 원 단위가 붙은 열(오른쪽 정렬)
 AMOUNT_HEAD_RE = re.compile(r"금액|예산|사업비|비용|단가|보조금|지원금|[가-힣]액|\((천|백만|만|억)?원\)|(천|백만|만|억)원")
 AMOUNT_CELL_RE = re.compile(r"\d\s*(천|백만|만|억)?원$")
@@ -1115,10 +1120,11 @@ class Fitter:
         return n
 
     def _squeeze_near(self, tbl):
-        """칸 너비를 정한 뒤, 쓸 수 있는 폭을 NEAR 안에서만 넘는 칸 글은 '한 줄로 입력'으로(다음 줄로 내리지 않게)."""
+        """칸 너비를 정한 뒤, 쓸 수 있는 폭을 NEAR 안에서만 넘는 칸 글은 '한 줄로 입력'으로(다음 줄로 내리지 않게).
+        '항목 : 내용' 줄은 쌍점 뒤 글만 자간을 줄인다(_colon_tighten). (한 줄로 입력한 수, 쌍점 뒤만 줄인 수)."""
         if int(tbl.get("rowCnt", "1")) < 2 or int(tbl.get("colCnt", "1")) < 2:
-            return 0
-        done = 0
+            return 0, 0
+        done = colon = 0
         for r, c, rs, cs, tc in table_grid(tbl):
             w = int(tc.find(T("hp:cellSz")).get("width", "0"))
             margin = self._cell_margin(tbl, tc) + 150
@@ -1129,9 +1135,42 @@ class Fitter:
                 avail = (w - margin - pp.get("left", 0) - pp.get("right", 0)) / 1.02
                 need = max((sum(ch[1] for ch in line) for line in split_lines(self.lay.chars(cp))), default=0)
                 if avail * 0.97 < need <= avail * NEAR:  # 어림이 1~3% 모자랄 수 있어(맑은 고딕 굵게) 거의 꽉 찬 칸도
+                    if self._colon_tighten(cp, avail):
+                        colon += 1
+                        continue
                     cp.set("paraPrIDRef", self.b.hedit.para_squeeze(cp.get("paraPrIDRef")))
                     done += 1
-        return done
+        return done, colon
+
+    def _colon_tighten(self, cp, avail):
+        """'항목 : 내용' 줄을 '한 줄로 입력'으로 누르면 항목명·쌍점까지 좁아져 위아래 줄과 쌍점이 어긋난다(사용자 지적
+        2026-11-02 — 쌍점 뒤 글자 간격을 줄여 위아래 선을 맞출 것). 항목명·쌍점은 그대로 두고 쌍점 뒤 글만 자간을
+        줄여(FLOOR까지) 한 줄에 넣어 본다. 넣었으면 True, 안 되면 False(그때는 지금처럼 한 줄로 입력)."""
+        if not label_colon(para_text(cp)) or not self.checked(cp):
+            return False
+        self._split_head(cp)
+        for d in range(-1, FLOOR - 1, -1):
+            chs = self.lay.chars(cp, delta=d, floor=FLOOR)
+            if max((sum(ch[1] for ch in line) for line in split_lines(chs)), default=0) <= avail * 0.97:
+                self.set_delta(cp, d)  # 머리(기호·항목명·쌍점)는 그대로, 쌍점 뒤 조각만
+                return True
+        return False
+
+    def _split_head(self, p):
+        """머리(기호·항목명·쌍점)와 내용이 한 조각에 들어 있으면(표 칸 글은 대개 한 조각) 머리 끝에서 조각을 둘로
+        나눈다 — 자간은 조각 단위로 주므로, 나눠야 쌍점 뒤 내용에만 줄 수 있다. 보이는 글·모양은 그대로."""
+        head = head_length(para_text(p))
+        pos = 0
+        for r in para_runs(p):
+            t = run_text(r)
+            if r.find(T("hp:t")) is not None and len(r) == 1 and pos < head < pos + len(t):
+                parent = r.getparent()
+                at = list(parent).index(r)
+                parent.insert(at, self.b._mk(r, t[:head - pos]))
+                parent.insert(at + 1, self.b._mk(r, t[head - pos:]))
+                parent.remove(r)
+                return
+            pos += len(t)
 
     @staticmethod
     def _caption_content(tbl, grid):
@@ -1282,6 +1321,7 @@ class Fitter:
     def fit_tables(self):
         """끝선 맞추기·표 글자 크기(10~12pt)·칸 너비를 내용에 맞추기·숫자 칸 자간 자동 줄임·표 위 기준·단위 줄."""
         edge, cols, squeezed, wraps, near, units, notes, captions, boxes_left, images = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        colon_tight = 0
         shrunk, left, cut_words, dot_breaks, bullets, balanced, note_font = [], [], [], 0, 0, 0, 0
         name_joined, desc_dots, three_info, borrowed, padded = 0, 0, [], 0, 0
         self.pad_orig = {}
@@ -1370,7 +1410,9 @@ class Fitter:
                                 cp.set("paraPrIDRef", new_pid)
                                 squeezed += 1
                 borrowed += self._borrow_widths(tbl)
-                near += self._squeeze_near(tbl)
+                n_near, n_colon = self._squeeze_near(tbl)
+                near += n_near
+                colon_tight += n_colon
                 for r, c, rs, cs, tc in table_grid(tbl):
                     margin, words = self._cell_words(tbl, tc)
                     if self._count_lines(margin, words, int(tc.find(T("hp:cellSz")).get("width", "0")))[1]:
@@ -1398,6 +1440,9 @@ class Fitter:
             msg.append(f"표 {wraps}개는 내용이 표 폭보다 길어 표 전체 줄 수가 가장 적게 칸 너비를 나눴습니다")
         if near:
             msg.append(f"칸 글이 조금(10% 안) 넘치는 {near}곳은 한 줄로 입력(한글이 글자 간격을 줄여 한 줄에)으로 했습니다")
+        if colon_tight:
+            msg.append(f"칸 글이 조금 넘치는 '항목 : 내용' 줄 {colon_tight}곳은 쌍점 뒤 글만 자간을 줄여 한 줄에 넣었습니다"
+                       "(항목명·쌍점 자리는 위아래 줄과 같게)")
         if squeezed:
             msg.append(f"숫자 칸 {squeezed}곳은 넘칠 때 한글이 자간을 줄이도록(한 줄로 입력) 했습니다")
         if bullets:
@@ -1806,6 +1851,93 @@ class Fitter:
             self.notes.append("; ".join(msg) + ".")
 
     # ------------------------------------------------------------ 표지
+    def pull_corners(self):
+        """머리 기호(○ - □ …)·괄호 이름표·'항목 : ' 바로 뒤 내용이 여는 낫표(「 『)면, 휴먼명조에서는 표시가 칸 오른쪽에 찍혀
+        (왼쪽 반 칸이 빔) 첫 줄만 반 칸 들어가 보이고 아랫줄(내어쓰기)·옆 ○ 줄과 끝선이 안 맞는다(사용자 지적 2026-11-03:
+        '꺽쇠 줄은 한 칸 앞으로 당기고 아랫줄은 그대로'). 낫표 앞 빈칸(고정폭 빈칸)과 그 앞 한 글자(머리 기호, 이름표의 닫는
+        괄호, 쌍점)의 자간을 줄여(-50%까지) 낫표 표시가 보통 글자 첫 획 자리에 오게 당긴다. 아랫줄 내어쓰기는 그대로 둔다.
+        - 내어쓰기를 글자 폭으로 다시 재는 단계들이 앞에 있으므로 맞춤이 모두 끝난 뒤 마지막에 한다.
+        - 첫 줄이 넓어져 줄 나눔이 바뀌는 문단은 건드리지 않는다(쪽 맞춤 결과를 지킴).
+        - 이어지는 줄이 낫표로 시작하면 그 줄은 당길 수 없다(줄 첫머리는 내어쓰기 자리) — 알린다."""
+        pulled = skipped = 0
+        lead = []
+        for p, box_w in self.text_boxes():
+            text = para_text(p)
+            pre, mark, _ = split_marker(text)
+            k = next((x for x in (label_content(text), len(pre) if mark else 0, label_colon(text))
+                      if 0 < x < len(text) and text[x] in "「『"), 0)
+            if not k or not self.checked(p):
+                continue
+            runs = []  # 글자 위치마다 (조각, 글자 모양 번호)
+            for r in para_runs(p):
+                if r.find(T("hp:tbl")) is None:
+                    runs += [(r, r.get("charPrIDRef"))] * len(run_text(r))
+            c = self.st.char.get(runs[k][1], {})
+            ink = CORNER_INK.get(c.get("font"), {}).get(text[k])
+            if ink is None:
+                continue
+            chs = self.lay.chars(p)
+
+            def w0(i):
+                sp = self.st.char.get(runs[i][1], {}).get("spacing", 0)
+                return chs[i][1] / (1 + sp / 100) if sp > -100 else 0
+
+            need = (ink - KO_INK) * w0(k)
+            j = k
+            while j > 0 and text[j - 1] in " ⎵⍽":
+                j -= 1
+            order = list(range(j, k)) + ([j - 1] if j > 0 and text[j - 1] not in "\n\t" else [])
+            new = {}  # 글자 위치 → 새 자간
+            for i in order:
+                if need <= 0:
+                    break
+                base = self.st.char.get(runs[i][1], {}).get("spacing", 0)
+                full = w0(i)
+                room = full * (base - CORNER_FLOOR) / 100
+                if full <= 0 or room <= 0:
+                    continue
+                take = min(room, need)
+                new[i] = max(CORNER_FLOOR, round(base - 100 * take / full))
+                need -= take
+            if not new:
+                continue
+            pp = self.st.para.get(p.get("paraPrIDRef"), {})
+            first, rest = self.lay.widths(p, box_w)
+
+            def breaks(cs):
+                if pp.get("squeeze"):
+                    return [(s, e) for s, e, *_ in self.lay.wrap(cs, 1e12, 1e12)]
+                return [(s, e) for s, e, *_ in self.lay.wrap(cs, first, rest, pp.get("condense", 0))]
+
+            sim = list(chs)
+            for i, sp in new.items():
+                sim[i] = (sim[i][0], w0(i) * (1 + sp / 100)) + tuple(sim[i][2:])
+            lines = breaks(chs)
+            if breaks(sim) != lines:
+                skipped += 1
+                continue
+            for i in sorted(new):
+                self.b._split_run_at(p, i)
+                self.b._split_run_at(p, i + 1)
+            pos = 0
+            for r in para_runs(p):
+                if r.find(T("hp:tbl")) is not None:
+                    continue
+                n = len(run_text(r))
+                if n == 1 and pos in new:
+                    r.set("charPrIDRef", self.b.hedit.char_spacing(r.get("charPrIDRef"), new[pos]))
+                pos += n
+            pulled += 1
+            if any(text[s] in "「『" for s, _ in lines[1:] if s < len(text)):
+                lead.append(text[k:k + 15].replace("⎵", " "))
+        if pulled:
+            self.notes.append(f"머리 기호·이름표 바로 뒤가 낫표(「)인 문단 {pulled}개는 낫표 앞 자간을 줄여 낫표를 반 칸 당겼습니다"
+                              f"(휴먼명조 「는 왼쪽 반 칸이 비어 첫 줄이 들어가 보임 — 아랫줄·옆 줄과 끝선 맞춤)."
+                              + (f" 줄 나눔이 바뀌는 {skipped}개는 그대로 두었습니다." if skipped else ""))
+        if lead:
+            self.notes.append(f"이어지는 줄이 낫표(「)로 시작하는 문단 {len(lead)}개는 그 줄의 낫표만 반 칸 들어가 보입니다"
+                              f"(줄 첫머리는 당길 수 없음 — 법령은 ○ 하나에 하나씩 쓰면 맞음): " + ", ".join(lead))
+
     def fit_cover(self):
         """표지(첫 쪽: 시 슬로건 그림 + 제목 띠 + 개요 상자 + 대구시 마크·부서명)의 위아래 자리를 문단 위 간격으로 맞춘다
         (대구시 문서 표지를 본뜸, 사용자 2026-11-01): 슬로건은 쪽 맨 위, 제목 띠는 본문 높이의 COVER_TITLE_AT쯤,
