@@ -1551,6 +1551,11 @@ class Builder:
                 b.setdefault("page_break", True)
                 return
 
+    @staticmethod
+    def _first_text_para(paras):
+        """첫 쪽의 첫 글 문단(표·그림 없이 글이 있는 문단 — 날짜 줄 등). 조종 조각(쪽 번호 넣기·새 번호로 시작)을 두는 자리."""
+        return next((q for q in paras[:6] if para_text(q).strip() and not para_tables(q) and not para_pics(q)), None)
+
     def cover_numbers(self, paras):
         """표지에는 쪽 번호를 감추고(쪽 번호 감추기), 본문 첫 쪽부터 1로 다시 센다(새 번호로 시작)."""
         end = cover_end(paras)
@@ -1671,8 +1676,16 @@ class Builder:
         if opts.get("keep_groups", True):
             self.keep_groups(out)
         first = out[0]
-        for k, r in enumerate(self.struct_runs):
+        k = 0
+        for r in self.struct_runs:
+            if r.find(T("hp:secPr")) is None and self._first_text_para(out) is not None:
+                # 쪽 번호 넣기 같은 조종 조각을 제목 상자(쪽 너비 표) 앞에 두면 한글이 그 조각에 한 줄을 주고 표를
+                # 다음 줄로 밀어 제목 위에 빈 공간(10pt 한 줄 ≈ 3.5mm)이 생긴다(한글 확인 2026-11-03, 사용자 원칙 36번:
+                # 제목 위에는 공간을 두지 않는다). 쪽 설정(secPr)만 첫 문단에 두고 나머지는 첫 글 문단(날짜 줄) 맨 앞에 둔다.
+                self._first_text_para(out).insert(0, r)
+                continue
             first.insert(k, r)
+            k += 1
         if first.get("pageBreak") == "1":
             first.set("pageBreak", "0")
         self.cover_numbers(out)
