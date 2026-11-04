@@ -833,7 +833,12 @@ class TableFit:
             return 0
         text = para_text(nxt).replace("⎵", " ").strip()
         om = tbl.find(T("hp:outMargin"))
-        if not text or om is None:
+        if om is None:
+            return 0
+        if not text:  # 표 뒤 □ 사이 빈 줄: 표 아랫선과 다음 □가 붙지 않게 조금 띄움(사용자 2026-11-05)
+            if is_blank(nxt) and tbl not in self.b.flow_tables and int(om.get("bottom", "0")) < TABLE_AFTER - 1:
+                om.set("bottom", str(int(round(TABLE_AFTER))))
+                return 3
             return 0
         if text.startswith(("※", "*")):
             kind, gap = 1, NOTE_GAP
@@ -928,7 +933,12 @@ class TableFit:
         else:
             line = TITLE_LINE if title_w + unit_w + 3 * HWPUNIT_PER_MM <= width else 100
         pid = self.b.hedit.para_align(prev.get("paraPrIDRef"), "LEFT")
-        pid = self.b.hedit.para_margin(pid, "prev", TITLE_PREV)
+        above = prev.getprevious()
+        while above is not None and above.tag != T("hp:p"):
+            above = above.getprevious()
+        tight = (above is not None and not para_tables(above) and para_text(above).strip()
+                 and prev.get("pageBreak") != "1")  # 바로 위가 글 줄 — 제목이 글에 붙지 않게 조금 더 띄움
+        pid = self.b.hedit.para_margin(pid, "prev", TITLE_PREV_TEXT if tight else TITLE_PREV)
         if not has_unit:
             pid = self.b.hedit.para_margin(pid, "next", TITLE_NEXT)  # 단위 줄이 없으면 표에 너무 붙지 않게
         prev.set("paraPrIDRef", self.b.hedit.para_line(pid, line) if line else pid)

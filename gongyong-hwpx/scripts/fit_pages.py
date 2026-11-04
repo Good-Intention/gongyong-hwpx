@@ -100,6 +100,22 @@ class PageFit:
                     if self.st.para.get(pid, {}).get("line", 0) > v:
                         p.set("paraPrIDRef", self.b.hedit.para_line(pid, v))
 
+            def shrink_spacers2():
+                # 그래도 모자라면 □ 사이 빈 줄을 70%까지 — 표 위·아래 여백은 지키고 위쪽을 줄임(사용자 2026-11-05)
+                for p in spacers:
+                    pid = saved[p][0]
+                    if self.st.para.get(pid, {}).get("line_type") == "PERCENT" and \
+                            self.st.para.get(pid, {}).get("line", 0) > SPACER_LINE2:
+                        p.set("paraPrIDRef", self.b.hedit.para_line(pid, SPACER_LINE2))
+
+            def halve_prev():
+                # ○ 위 간격(묶음 구분)을 절반으로 — 표 제목·표 아래 여백보다 먼저 양보
+                for p in texts:
+                    pid = p.get("paraPrIDRef")
+                    pv = self.st.para.get(pid, {}).get("prev", 0)
+                    if pv >= 300 and marker_level(para_text(p)) == 2:  # ○ 줄만(날짜 줄·□·■ 제목은 그대로)
+                        p.set("paraPrIDRef", self.b.hedit.para_margin(pid, "prev", pv // 2))
+
             # 덜 바꾸는 것부터: 줄 간격을 5%씩 낮춰 보고(사용자 지시 '줄간 조정'), 그다음 □ 사이 빈 줄 좁히기를 더한다
             top = max((self.st.para.get(saved[p][0], {}).get("line", 0) for p in texts), default=0)
             steps = list(range(top - 5, MIN_LINE - 1, -5)) if top > MIN_LINE else []
@@ -119,12 +135,26 @@ class PageFit:
                 plans.append(("□ 사이 빈 줄 조금 좁힘", SPACER_COST, shrink_spacers))
                 plans += [(f"□ 사이 빈 줄 조금 좁힘 + 줄 간격 {v}%", SPACER_COST + top - v,
                            lambda v=v: (shrink_spacers(), line_to(v))) for v in steps]
+            low = steps[-1] if steps else None
+            extra = []  # 마지막 수단(표 위아래 여백은 지키고 위쪽을 더 줄임 — 사용자 2026-11-05): 쪽 수가 줄 때만 고른다
+            if low is not None:
+                extra.append((f"□ 사이 빈 줄 조금 좁힘 + 줄 간격 {low}% + ○ 위 간격 절반", SPACER_COST + top - low + PREV_HALF_COST,
+                              lambda v=low: (shrink_spacers(), line_to(v), halve_prev())))
+                if spacers:
+                    extra.append((f"□ 사이 빈 줄 더 좁힘 + 줄 간격 {low}% + ○ 위 간격 절반", SPACER2_COST + top - low + PREV_HALF_COST,
+                                  lambda v=low: (shrink_spacers2(), line_to(v), halve_prev())))
             best = None
             for name, cost, act in plans:
                 restore()
                 act()
                 bad, pages = self.badness(seg)
                 if best is None or bad < best[0] - 1 or (abs(bad - best[0]) <= 1 and cost < best[4]):
+                    best = (bad, name, act, pages, cost)
+            for name, cost, act in extra:
+                restore()
+                act()
+                bad, pages = self.badness(seg)
+                if pages < best[3] and (bad < best[0] - 1):
                     best = (bad, name, act, pages, cost)
             restore()
             best[2]()
