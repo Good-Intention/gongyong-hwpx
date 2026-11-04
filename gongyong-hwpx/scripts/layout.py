@@ -11,7 +11,7 @@
 import json
 import os
 
-from hwpx_lib import T, cell_paras, head_length, para_pics, para_runs, para_tables, para_text, run_text, table_grid
+from hwpx_lib import UNIT_RE, T, cell_paras, head_length, para_pics, para_runs, para_tables, para_text, run_text, table_grid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FONT_FILE = os.path.join(HERE, "..", "assets", "font_widths.json")
@@ -105,6 +105,9 @@ class Layout:
     def __init__(self, styles, metrics=None):
         self.st = styles
         self.m = metrics or Metrics()
+        # 큰 표를 통째로 다음 쪽으로 넘기는 어림(2026-11-04). 만들 때는 쪽 맞춤이 그 자리에 쪽 나눔을 박아 한글도 그렇게 되고,
+        # 검사만·다듬기는 쪽 나눔을 박지 않으므로 False — 한글이 하는 대로(빈 곳이 크면 표를 쪽 사이에서 나눔) 센다.
+        self.move_whole = True
 
     # ------------------------------------------------------------ 글자 폭
     def chars(self, p, delta=0, floor=-10):
@@ -266,7 +269,11 @@ class Layout:
             hs = [h for t in tables for h in self.table_rows(t)]
             tr = next(r for r in para_runs(p) if r.find(T("hp:tbl")) is not None)
             size = self.st.char.get(tr.get("charPrIDRef"), {}).get("size", 10) * 100
-            hs[-1] += max(0.0, self.line_pitch(p, size) - size)
+            # 표 문단 줄 간격 여분과 표 바깥 아래 여백은 겹친다 — 큰 쪽만(표 밑 글 띄움을 두 번 세어 105쪽 문서를 109쪽으로
+            # 어림하던 일, 한글 실측 2026-11-04)
+            om = tables[-1].find(T("hp:outMargin"))
+            om_b = int(om.get("bottom", "0")) if om is not None else 0
+            hs[-1] += max(0.0, self.line_pitch(p, size) - size - om_b)
             if p.find(".//" + T("hp:secPr")) is not None:
                 hs[0] += FIRST_TABLE_EXTRA
             return prev + sum(hs) + nxt, hs, prev, nxt
@@ -350,10 +357,16 @@ class Layout:
             h, hs, prev, nxt = self.para_height(p, body_w)
             pp = self.st.para.get(p.get("paraPrIDRef"), {})
             tables = para_tables(p)
+            text = para_text(p)
             items.append({"hs": hs, "prev": prev, "next": nxt, "keep": pp.get("keep_next", False),
                           "brk": p.get("pageBreak") == "1", "h": h,
                           "repeat": self.table_header(tables[0]) if tables else 0, "table": bool(tables),
-                          "blank": not tables and not para_pics(p) and not para_text(p).strip()})
+                          "blank": not tables and not para_pics(p) and not text.strip(),
+                          # 글자처럼 취급하지 않은 표: 한글은 바로 뒤 문단의 위 간격을 쓰지 않는다(실측 — 표 바깥 아래 여백만)
+                          "float": bool(tables) and all(t.find(T("hp:pos")) is None
+                                                        or t.find(T("hp:pos")).get("treatAsChar") != "1" for t in tables),
+                          # 표 바로 위 기준·단위 줄과 ■ 표 제목 줄(표와 한 몸 — 묶음을 나눌 때 표와 함께 감)
+                          "lead": not tables and bool(UNIT_RE.match(text) or text.lstrip().startswith("■"))})
         n = len(items)
         starts = {k for k, p in enumerate(paras) if heads and p in heads}
         ends, block_h = {}, {}
@@ -374,7 +387,10 @@ class Layout:
                 inner = [c for c in chains if s <= c[0] <= ends[s]]
                 cut = [k for k in range(1, len(inner)) if inner[k][2] > where[inner[k - 1][1]][1]]
                 # 나뉜 자리 뒤에 ○ 묶음이 하나뿐이고, 그 앞 묶음이 □ 제목 묶음이 아니면 앞 묶음도 넘긴다
-                if cut and len(inner) - cut[-1] == 1 and cut[-1] >= 2 and inner[cut[-1] - 1][0] not in extra:
+                # (뒤 묶음이 기준·단위·■ 제목 줄이나 표로 시작하면 — 큰 표를 다음 쪽 한 장에 넣으려고 끊은 것 — 앞 ○는 그대로)
+                last0 = inner[cut[-1]][0] if cut else None
+                if (cut and len(inner) - cut[-1] == 1 and cut[-1] >= 2 and inner[cut[-1] - 1][0] not in extra
+                        and not (self.move_whole and (items[last0]["lead"] or items[last0]["table"]))):
                     add.add(inner[cut[-1] - 1][0])
             if not add:
                 break
@@ -393,13 +409,28 @@ class Layout:
         self.moved = []  # 다음 쪽에서 시작하게 넘긴 묶음의 첫 문단 번호
         i = 0
         while i < n:
-            j, chain = i, 0.0
-            while True:
-                it = items[j]
-                chain += it["h"] if (j == i or it["keep"]) else it["prev"] + it["hs"][0]
-                if not it["keep"] or j + 1 >= n or items[j + 1]["brk"] or j + 1 in starts:
-                    break
-                j += 1
+            def chain_to(i, last):
+                j, chain = i, 0.0
+                while True:
+                    it = items[j]
+                    chain += it["h"] if (j == i or it["keep"]) else it["prev"] + it["hs"][0]
+                    if not it["keep"] or j + 1 >= n or items[j + 1]["brk"] or j + 1 in starts or j >= last:
+                        break
+                    j += 1
+                return j, chain
+
+            j, chain = chain_to(i, n)
+            if chain > body_h and self.move_whole:
+                # 한 쪽보다 긴 묶음(○ 글 + 큰 표): 표가 기준·단위·■ 제목 줄과 함께 한 쪽에 들어가면 그 앞에서 묶음을 끊어
+                # 표를 다음 쪽에서 한 장에(사용자 원칙 2026-11-04 '큰 표는 밑으로 내려 한 장에, 제목도 붙여서')
+                for k in range(i + 1, j + 1):
+                    if items[k]["table"] and len(items[k]["hs"]) > 2:
+                        u = k
+                        while u - 1 > i and items[u - 1]["lead"]:
+                            u -= 1
+                        if u > i and chain_to(u, n)[1] <= body_h:
+                            j, chain = chain_to(i, u - 1)
+                        break
             # 묶음 안의 표가 쪽 끝에서 시작하면 머리 줄과 내용 두 줄까지는 같은 쪽에 들어가야 한다
             # (머리 줄만 쪽 끝에 남고 내용이 다음 쪽으로 가는 것을 막음 — 2026-10-31 시험 문서 참고1)
             head_need, has_table = 0.0, False
@@ -427,9 +458,11 @@ class Layout:
                 used.append(0.0)
                 self.moved.append(i)
             elif (y > 0 and y + chain > body_h and chain <= body_h
-                  # 표가 든 묶음은 통째로 넘기면 쪽 아래 빈 곳이 block_gap보다 클 때 넘기지 않고 표를 나눈다(머리 줄 되풀이)
-                  and not (has_table and block_gap is not None and body_h - y > body_h * block_gap
-                           and y + head_need <= body_h)):
+                  and (self.move_whole or not (has_table and block_gap is not None and body_h - y > body_h * block_gap
+                                               and y + head_need <= body_h))):
+                # 한 쪽에 들어가는 묶음은 통째로 다음 쪽으로 — 표가 든 묶음도 쪽 아래가 많이 비더라도 두 쪽에 나누지 않는다
+                # (사용자 원칙 2026-11-04 '큰 표가 두 장에 걸치면 차라리 밑으로 내려서 한 장에 딱 들어가게, 제목도 붙여서'
+                #  — 2026-10-31의 '빈 곳이 block_gap보다 크면 표를 나눔'을 바꿈). 한 쪽보다 긴 표만 나눈다(머리 줄 되풀이).
                 page, y = page + 1, 0.0
                 used.append(0.0)
                 if j > i:
@@ -437,7 +470,8 @@ class Layout:
             chain_page = None
             for k in range(i, j + 1):
                 it = items[k]
-                y += it["prev"] if y > 0 else 0
+                # 글자처럼 취급하지 않은 표 바로 뒤 문단은 위 간격 없이(한글 실측 — 그 자리는 표 바깥 아래 여백이 맡음)
+                y += it["prev"] if y > 0 and not (k > 0 and items[k - 1]["float"]) else 0
                 start = None
                 for lh in it["hs"]:
                     if y + lh > body_h + 1 and y > 0:

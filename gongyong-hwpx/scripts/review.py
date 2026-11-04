@@ -16,7 +16,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from hwpx_lib import (T, Package, cell_paras, head_length, is_struct, marker_level, page_info, para_pics,  # noqa: E402
-                      para_runs, para_tables, para_text, run_text, split_marker, table_grid)
+                      para_runs, para_tables, para_text, run_text, split_marker, table_grid, is_table_title)
 from build import (BASIS_TITLE_RE, DATE_LINE_RE, FIX_RE, ROMAN, SUMMARY_END_RE, BuildError, Builder,  # noqa: E402
                    margin_note)
 from check import check  # noqa: E402
@@ -55,10 +55,10 @@ class Inspector:
         return end or 0
 
     def basis(self):
-        """근거법령은 늘 1번(27번): 로마자 장이면 Ⅰ., 아니면 첫 □ 근거법령(○ 둘 이상)."""
+        """근거법령은 늘 1번: 로마자 장이면 Ⅰ., 아니면 첫 □ 근거법령(○ 둘 이상)."""
         start = self.body_start()
         heads = [(i, p) for i, p in enumerate(self.paras[start:], start)
-                 if not para_tables(p) and marker_level(para_text(p)) == 1]
+                 if not para_tables(p) and marker_level(para_text(p)) == 1 and not is_table_title(p)]
         if not heads:
             self.info.append("□·Ⅰ. 제목이 없어 근거법령·항목 수 검사를 건너뜀(견본과 다른 짜임).")
             return
@@ -68,7 +68,7 @@ class Inspector:
         if BASIS_TITLE_RE.search(para_text(first)):
             n = 0
             for p in self.paras[i + 1:]:
-                if not para_tables(p) and marker_level(para_text(p)) == 1:
+                if not para_tables(p) and marker_level(para_text(p)) == 1 and not is_table_title(p):
                     break
                 if not para_tables(p) and marker_level(para_text(p)) == 2:
                     n += 1
@@ -109,27 +109,28 @@ class Inspector:
             self.polish.append("첫 쪽 제목 상자 위에 빈 공간이 생깁니다(제목 표 앞에 쪽 번호 같은 조종 조각이 있어 한글이 한 줄을 줌, "
                                "약 3.5mm) — 다듬기가 그 조각을 날짜 줄로 옮김(36번: 제목 위에는 공간을 두지 않음).")
         if title > start and any(para_text(q).strip() or para_tables(q) for q in self.paras[start:title]):
-            self.polish.append("제목 상자 앞에 글·빈 줄이 있어 제목이 쪽 맨 위에 붙지 않습니다(36번).")
+            self.polish.append("제목 상자 앞에 글·빈 줄이 있어 제목이 쪽 맨 위에 붙지 않습니다(제목 위에는 공간을 두지 않음).")
         summary = next((i for i, q in enumerate(self.paras[title + 1:title + 6], title + 1)
                         if para_tables(q) and para_tables(q)[0].get("rowCnt") == "1" and para_tables(q)[0].get("colCnt") == "1"), None)
         between = self.paras[title + 1:summary] if summary else self.paras[title + 1:title + 3]
         if not any(DATE_LINE_RE.match(para_text(q)) for q in between if not para_tables(q)):
-            self.fix.append("제목 상자 아래 날짜·부서 줄이 없습니다(21번) — ‘’26. ○. ○.(○)  ○○○○과 ○○○’ 한 줄을 두세요.")
+            self.fix.append("제목 상자 아래 날짜·부서 줄이 없습니다 — ‘’26. ○. ○.(○)  ○○○○과 ○○○’ 한 줄을 두세요.")
         if summary is None:
-            self.info.append("요약 상자(제목 아래 한 칸 상자)가 없습니다 — 결론 한 문장을 두세 줄로 두는 것이 원칙(25번).")
+            self.info.append("요약 상자(제목 아래 한 칸 상자)가 없습니다 — 결론 한 문장을 두세 줄로 두는 것이 원칙.")
             return
         tc = table_grid(para_tables(self.paras[summary])[0])[0][4]
         text = "\n".join(para_text(q) for q in cell_paras(tc)).replace("⎵", " ").strip()
         if "\n" in text or re.search(r"[①-⑳]|(^|\n)\s*(\d+[.)]|[-○·])\s", text):
             self.fix.append("요약 상자에 번호·여러 항목이 있습니다 — 한 문장으로 두세 줄(25번, 세부는 아래 □·○로).")
         if text and not SUMMARY_END_RE.search(text):
-            self.fix.append(f"요약 상자 끝맺음은 ‘~하고자 함’ 또는 ‘~에 대한 보고임’(25번) — 지금: ‘…{text[-12:]}’.")
+            self.fix.append(f"요약 상자 끝맺음은 ‘~하고자 함’ 또는 ‘~에 대한 보고임’ — 지금: ‘…{text[-12:]}’.")
 
     def rules(self):
         """항목 수·‘~으로’ 끝맺음 — build.py의 문단 검사 그대로."""
         before = len(self.b.warnings)
         self.b.lone_dashes(self.paras)
         self.b.basis_notes(self.paras)
+        self.b.table_titles(self.paras)
         self.b.check_endings(self.paras)
         self.fix += self.b.warnings[before:]
 
@@ -146,6 +147,10 @@ class Inspector:
                 out += [(ch, c.get("spacing", 0), c.get("size")) for ch in run_text(r)]
             return out
 
+        sides = {}
+        for bf in self.b.pkg.xml("Contents/header.xml").iter(T("hh:borderFill")):
+            sides[bf.get("id")] = tuple((bf.find(T("hh:" + k)).get("type") if bf.find(T("hh:" + k)) is not None else None)
+                                       for k in ("leftBorder", "rightBorder"))
         paras, tables = [], []
         for p in [x for x in self.b.sec if x.tag == T("hp:p")]:
             if para_tables(p):
@@ -158,7 +163,8 @@ class Inspector:
                         cm = tc.find(T("hp:cellMargin"))
                         cps = tuple((tuple(chars(cp)), st.para.get(cp.get("paraPrIDRef"), {}).get("squeeze"),
                                      st.para.get(cp.get("paraPrIDRef"), {}).get("align")) for cp in cell_paras(tc))
-                        cells.append((sz.get("width"), cm.get("top") if cm is not None else None, cps))
+                        cells.append((sz.get("width"), cm.get("top") if cm is not None else None, cps,
+                                      sides.get(tc.get("borderFillIDRef"))))
                     tables.append(((m.get("top") if m is not None else None), cells, cell_text_first(tbl),
                                    om.get("bottom") if om is not None else None))
             else:
@@ -194,7 +200,7 @@ class Inspector:
         line(0, "줄 바꿈 자리 조정(연결어·화살표·끝 줄 균형)", breaks)
         line(0, "줄 첫머리 낫표(「) 반 칸 당김", corners)
         kinds = {"칸 너비": 0, "칸 글자 크기": 0, "한 줄로 입력": 0, "칸 여백": 0, "칸 글 정렬·자간": 0,
-                 "표 아래 띄움(밑 글이 붙지 않게)": 0}
+                 "표 아래 띄움(밑 글이 붙지 않게)": 0, "그래프 상자 양옆 선": 0}
         names = []
         for (mx, cx, nx, ox), (my, cy, ny, oy) in zip(tb, ta):
             hit = set()
@@ -207,6 +213,8 @@ class Inspector:
                     hit.add("칸 너비")
                 if a[1] != b[1]:
                     hit.add("칸 여백")
+                if a[3] != b[3]:
+                    hit.add("그래프 상자 양옆 선")
                 for pa_, pb_ in zip(a[2], b[2]):
                     if [c[2] for c in pa_[0]] != [c[2] for c in pb_[0]]:
                         hit.add("칸 글자 크기")
@@ -232,16 +240,19 @@ class Inspector:
             b.tighten_quotes()
             b.colon_hang(colons=True, labels=True)
             f = Fitter(b)
+            f.lay.move_whole = False  # 다듬기는 쪽 나눔을 박지 않음 — 한글이 하는 대로 셈
             f.push = True
             if tables:
                 f.fit_tables()
                 f.fit_tables(again=True)
             f.fit_lines()
             if tables:
-                f.relieve_pads()  # 칸 여백을 넓혀 □ 묶음이 쪽에 걸치면 되돌림(만들 때와 같은 차례)
+                f.relieve_pads(refit=False)  # 칸 여백을 넓혀 □ 묶음이 쪽에 걸치면 되돌림(쪽 짜임은 그대로)
             f.pull_corners()
             hard = [w for w in b.warnings[before_warn:] + f.notes if FIX_RE.search(w)]
-            after_pages = Fitter(b).report()
+            fa = Fitter(b)
+            fa.lay.move_whole = False
+            after_pages = fa.report()
         except Exception as e:  # noqa: BLE001 — 다른 사람 문서라 어떤 짜임이든 올 수 있음
             self.info.append(f"다듬기 어림 중 멈춤({type(e).__name__}: {e}) — 이 문서는 다듬기 전에 짜임을 봐야 합니다.")
             return None
@@ -252,6 +263,7 @@ class Inspector:
     # ------------------------------------------------------------ 실행
     def run(self, tables=True):
         f = Fitter(self.b)
+        f.lay.move_whole = False  # 원본 쪽 수도 한글이 하는 대로
         pages = f.report()  # 바꾸기 전 어림(원본 쪽 수)
         self.fonts()
         self.basis()

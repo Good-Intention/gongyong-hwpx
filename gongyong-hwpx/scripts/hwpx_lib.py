@@ -416,6 +416,33 @@ class HeaderEdit:
             self.cache[key] = new.get("id")
         return self.cache[key]
 
+    def border_sides(self, bid, sides):
+        """bid 테두리 모양에서 몇 변만 바꾼 모양. sides = {"leftBorder": (종류, 굵기, 색) 또는 다른 테두리 번호(그 변을 옮겨 옴)}.
+        한 열 표의 오른쪽 선을 견본 끝 칸 것으로, 그래프 상자(그림 칸이 든 한 열 표) 양옆을 선으로(사용자 2026-11-04)."""
+        key = ("sides", bid, tuple(sorted((k, v if isinstance(v, tuple) else str(v)) for k, v in sides.items())))
+        if key not in self.cache:
+            new = self._clone("hh:borderFills", "hh:borderFill", bid)
+            if new is None:
+                return bid
+            for side, val in sides.items():
+                el = new.find(T("hh:" + side))
+                if el is None:
+                    continue
+                if isinstance(val, tuple):
+                    kind, width, color = val
+                else:
+                    src = next((x for x in self.h.iter(T("hh:borderFill")) if x.get("id") == str(val)), None)
+                    s_el = src.find(T("hh:" + side)) if src is not None else None
+                    if s_el is None:
+                        continue
+                    kind, width, color = s_el.get("type"), s_el.get("width"), s_el.get("color")
+                el.set("type", kind)
+                el.set("width", width)
+                el.set("color", color)
+            self.styles.border[new.get("id")] = self.styles._border(new)
+            self.cache[key] = new.get("id")
+        return self.cache[key]
+
     def para_align(self, pid, align):
         """정렬만 바꾼 문단 모양(예: 숫자 칸 오른쪽 정렬)."""
         src = self._para(pid)
@@ -561,6 +588,29 @@ def para_tables(p):
 def para_pics(p):
     """문단에 바로 든 그림(표 안 그림은 빼고)."""
     return [x for r in para_runs(p) for x in r if x.tag == T("hp:pic")]
+
+
+TABLE_TITLE_MARK = "■"  # 표 제목(사용자 원칙 2026-11-04 '표는 ■ 네모로 제목') — □ 큰 항목과 다르게 다룬다
+
+
+def is_table_title(p, after=None):
+    """표 제목 줄('■ 세부사업별 예산 현황'): ■로 시작하고, 바로 뒤(기준·단위 줄은 건너뜀)가 표 문단인 글 문단.
+    ■는 머리 기호로는 □와 같은 수준 1이라(marker_level) 항목 수 세기·쪽 맞춤 묶음에서 이 함수로 따로 가린다.
+    after: 뒤 문단 목록(아직 문서에 넣지 않은 문단을 볼 때). 없으면 문서에서 바로 뒤 문단들을 본다."""
+    if p is None or para_tables(p) or not para_text(p).lstrip().startswith(TABLE_TITLE_MARK):
+        return False
+    if after is None:
+        after, nxt = [], p.getnext()
+        while nxt is not None and len(after) < 4:
+            if nxt.tag == T("hp:p"):
+                after.append(nxt)
+            nxt = nxt.getnext()
+    for q in list(after)[:4]:
+        if para_tables(q):
+            return True
+        if not UNIT_RE.match(para_text(q)):
+            return False
+    return False
 
 
 def is_blank(p):
