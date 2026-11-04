@@ -208,6 +208,18 @@ class Fitter:
                               f"({max(done)}~{min(done)}%) 한 줄을 줄였습니다.")
         self.widen_sparse()
 
+    def _content_spacing(self, p):
+        """문단 내용(머리 뒤) 글자 수가 가장 많은 자간 — 줄 맞춤이 이미 바꾼 값을 알아보는 기준."""
+        head = head_length(para_text(p))
+        count, pos = {}, 0
+        for r in para_runs(p):
+            t = run_text(r)
+            if r.find(T("hp:t")) is not None and pos + len(t) > head:
+                sp = self.st.char.get(r.get("charPrIDRef"), {}).get("spacing", 0)
+                count[sp] = count.get(sp, 0) + len(t) - max(0, head - pos)
+            pos += len(t)
+        return max(count, key=count.get) if count else 0
+
     def widen_sparse(self):
         """다음 낱말이 넘어가 양쪽 정렬로 빈칸이 벌어질 줄(쓴 폭 < 97%)이 있으면
         1) 자간을 줄여(-18%까지) 다음 낱말을 그 줄로 당겨 본다(사용자 수정본 규칙: 넘친 글자는 자간을 줄여 한 줄에).
@@ -221,7 +233,10 @@ class Fitter:
                 continue
 
             def sparse(ls, limit):
-                return any(used / avail < limit for _, _, used, avail in ls[:-1])
+                # 강제 줄 바꿈(push_down·연결어 내리기)으로 끝나는 줄은 한글이 벌리지 않으므로 성긴 줄로 치지 않는다
+                # (만든 문서를 다시 다듬을 때 그 줄 때문에 자간을 늘리지 않게 — 되풀이해도 같게, 2026-11-04)
+                return any(used / avail < limit and "\n" not in (chs[e - 1][0], chs[e][0] if e < len(chs) else "")
+                           for _, e, used, avail in ls[:-1])
 
             def orphan(cs, ls):
                 """마지막 줄에 짧은 낱말 하나만 남는가."""
@@ -246,7 +261,8 @@ class Fitter:
                 continue
             starts = [s for s, _, _, _ in lines]
             best = 0
-            for d in range(1, WIDEN_MAX + 1):
+            # +WIDEN_MAX는 절대 상한 — 이미 늘린 문단을 다시 맞출 때 더 늘리지 않게(되풀이해도 같게, 2026-11-04)
+            for d in range(1, WIDEN_MAX - self._content_spacing(p) + 1):
                 _, l2 = self.lay.para_lines(p, box_w, delta=d, shrink=SLACK, floor=FLOOR)
                 if [s for s, _, _, _ in l2] != starts:
                     break
@@ -498,15 +514,21 @@ class Fitter:
             return 1020
         return int(cm.get("left", "510")) + int(cm.get("right", "510"))
 
-    def _natural(self, tbl, tc):
-        """칸 글을 줄 바꿈 없이 한 줄로 쓸 때 필요한 칸 너비."""
+    def _natural(self, tbl, tc, fits=None):
+        """칸 글을 줄 바꿈 없이 한 줄로 쓸 때 필요한 칸 너비. fits(지금 칸 너비)를 주면 이미 '한 줄로 입력'인 문단이
+        그 너비를 NEAR 안에서만 넘을 때는 넘치지 않는 것으로 본다(만든 문서를 다시 다듬을 때 열을 다시 나누지 않게 —
+        되풀이해도 같게, 2026-11-04)."""
         need = 0.0
+        pad = self._cell_margin(tbl, tc) + 150
         for cp in cell_paras(tc):
             pp = self.st.para.get(cp.get("paraPrIDRef"), {})
             for line in split_lines(self.lay.chars(cp)):
-                need = max(need, sum(c[1] for c in line) + pp.get("left", 0) + pp.get("right", 0))
+                w = (sum(c[1] for c in line) + pp.get("left", 0) + pp.get("right", 0)) * 1.02 + pad
+                if fits is not None and pp.get("squeeze") and fits < w <= fits * NEAR:
+                    w = fits
+                need = max(need, w)
         # 어림 오차 여유: 글 폭의 2% + 0.5mm(맑은 고딕 칸이 어림과 1~2% 달라 끝에서 줄이 넘어간 실측, 2026-10-31)
-        return need * 1.02 + self._cell_margin(tbl, tc) + 150
+        return need
 
     def _cell_words(self, tbl, tc, where=False):
         """(칸 여백 + 어림 여유, [(조각 목록, 문단 좌우 여백, 한 줄로 입력인가, 글자 수)…]) — 칸 안 줄마다.
@@ -580,14 +602,21 @@ class Fitter:
         return count, cuts, dots, breaks
 
     @classmethod
-    def _count_lines(cls, margin, paras, w):
+    def _count_lines(cls, margin, paras, w, trust_squeeze=False):
         """칸 너비 w에서 (줄 수, 낱말 가운데서 끊긴 횟수, 가운데점 뒤에서 나눈 횟수, 짧은 글이 넘어간 줄 수).
-        한 줄 폭을 NEAR 안에서만 넘는 줄은 '한 줄로 입력'(_squeeze_near)으로 한 줄에 들어가므로 한 줄로 센다."""
+        한 줄 폭을 NEAR 안에서만 넘는 줄은 '한 줄로 입력'(_squeeze_near)으로 한 줄에 들어가므로 한 줄로 센다.
+        trust_squeeze: 이번에 '한 줄로 입력'을 정한 뒤의 마지막 검사에서만 그 표시를 한 줄로 믿는다(칸 너비를 정할 때는
+        믿지 않음 — 되풀이해도 같게)."""
         total_lines, cuts, dots, short = 0, 0, 0, 0
         for pieces, extra, squeeze, nchars in paras:
+            if trust_squeeze and squeeze and pieces:
+                total_lines += 1
+                continue
             avail = (w - margin - extra) / 1.02
             one = sum(p[0] + (p[1] if k else 0) for k, p in enumerate(pieces))
-            if not pieces or squeeze or one <= avail * NEAR:
+            # '한 줄로 입력' 표시는 세지 않는다 — 이 칸 너비에서 NEAR 안일 때만 한 줄(되풀이해도 같게: 표시를 믿고 한 줄로 세면
+            # 다시 맞출 때 그 열을 더 좁혀 넘침이 커짐, 2026-11-04 실측)
+            if not pieces or one <= avail * NEAR:
                 total_lines += 1
                 continue
             count, cut, dot, _ = cls._wrap(pieces, avail)
@@ -605,7 +634,11 @@ class Fitter:
         가운데점 자리면 점 뒤에(한글은 점 뒤에서 스스로 나누지 않고 긴 이름을 글자 단위로 끊음).
         (고르게 나눈 문단 수, 가운데점 뒤에서 나눈 수)."""
         balanced, dots = 0, 0
-        for r, c, rs, cs, tc in table_grid(tbl):
+        grid = table_grid(tbl)
+        cap = self._caption_content(tbl, grid)  # 제목 걸친 상자의 인용문(조례 조문 등)은 줄을 채운 채 왼쪽 정렬(_box_left)
+        for r, c, rs, cs, tc in grid:
+            if tc is cap:
+                continue
             w = int(tc.find(T("hp:cellSz")).get("width", "0"))
             margin = self._cell_margin(tbl, tc) + 150
             for cp in cell_paras(tc):
@@ -787,49 +820,18 @@ class Fitter:
         두 열 사이에서 BORROW_STEP씩 폭을 옮겨 보며 (표 전체 줄 수, 꺾인 '· 항목'(뜻 단위 두 줄은 괜찮음)·짧은 값 수,
         모든 칸 줄 수, 자간을 줄인 칸 수 — 한 줄 더 꺾이기보다 자간을 조금 줄이는 쪽)가 좋아질 때만 옮긴다. 폭을 내준 칸은 자간을 TIGHT_SP 줄여야 줄 수가 지켜지면
         그만큼 줄인다. 옮겼으면 1."""
-        if not self._is_data_table(tbl):
+        info = self._borrow_cells(tbl)
+        if info is None:
             return 0
-        grid = table_grid(tbl)
-        n = int(tbl.get("colCnt", "1"))
-        if n < 2 or any(rs > 1 or cs > 1 for _, _, rs, cs, _ in grid):
-            return 0
-        cells = [(r, c, tc) + self._cell_words(tbl, tc) for r, c, rs, cs, tc in grid]
-        heads = {r for r, c, rs, cs, tc in grid if tc.get("header") == "1"}
+        grid, n, cells, heads = info
         ws = [0] * n
         for r, c, rs, cs, tc in grid:
             ws[c] = ws[c] or int(tc.find(T("hp:cellSz")).get("width", "0"))
         if not all(ws):
             return 0
 
-        def cell(margin, paras, w, f):
-            lines = bad = 0
-            for pieces, extra, squeeze, nchars in paras:
-                avail = (w - margin - extra) / 1.02 * f * BORROW_SAFE
-                one = sum(p[0] + (p[1] if k else 0) for k, p in enumerate(pieces))
-                if not pieces or squeeze or one <= avail * (NEAR if f == 1.0 else 1.0):
-                    lines += 1
-                    continue
-                cnt, cut, _, _ = self._wrap(pieces, avail)
-                lines += cnt + CUT_COST * cut
-                # '· 항목'이 꺾이면 나쁨(뜻 단위 자리 — 괄호·'+' 앞 — 에서 두 줄로 나뉘면 괜찮음), 짧은 값('확보 추정')이 꺾여도 나쁨
-                if nchars < 0 and not (cnt == 2 and not cut and self._unit_split(pieces, avail) is not None):
-                    bad += 1
-                elif 0 <= nchars <= SHORT_LEN:
-                    bad += 1
-            return lines, bad
-
         def score(ws):
-            rows, bad, tight, total, how = {}, 0, 0, 0, {}
-            for r, c, tc, margin, paras in cells:
-                plain = cell(margin, paras, ws[c], 1.0)
-                tighter = cell(margin, paras, ws[c], TIGHT)
-                use = tighter if tighter[:2] < plain[:2] else plain  # 줄 수가 같아도 꺾인 항목이 줄면 자간을 조금 줄임
-                how[tc] = use is tighter
-                rows[r] = max(rows.get(r, 0), use[0])
-                bad += use[1]
-                tight += use is tighter
-                total += use[0]
-            return (sum(v * (HEAD_COST if r in heads else 1) for r, v in rows.items()), bad, total, tight), how
+            return self._borrow_score(cells, heads, ws)
 
         mins = [0] * n
         for r, c, tc, margin, paras in cells:
@@ -875,6 +877,52 @@ class Fitter:
                     r.set("charPrIDRef", self.b.hedit.char_spacing(cid, max(-50, sp + TIGHT_SP)))
         return 1
 
+    def _borrow_cells(self, tbl):
+        """_borrow_widths·_borrow_score가 보는 표: 머리 줄이 있는 자료 표이고 두 열 이상이며 합친 칸이 없을 때
+        (칸 표, 열 수, 칸 목록 (줄, 열, 칸, 여백, 조각 줄들), 머리 줄 번호들). 아니면 None."""
+        if not self._is_data_table(tbl):
+            return None
+        grid = table_grid(tbl)
+        n = int(tbl.get("colCnt", "1"))
+        if n < 2 or any(rs > 1 or cs > 1 for _, _, rs, cs, _ in grid):
+            return None
+        cells = [(r, c, tc) + self._cell_words(tbl, tc) for r, c, rs, cs, tc in grid]
+        heads = {r for r, c, rs, cs, tc in grid if tc.get("header") == "1"}
+        return grid, n, cells, heads
+
+    def _borrow_score(self, cells, heads, ws):
+        """폭 빌리기의 점수 ((표 전체 줄 수, 꺾인 '· 항목'·짧은 값 수, 모든 칸 줄 수, 자간을 줄인 칸 수), 칸마다 자간을
+        줄였는가) — 작을수록 좋다. 열 나누기(_layout_widths)도 '지금 너비를 바꿀 만한가'를 이 점수로 가린다
+        (두 단계가 다른 점수를 쓰면 다듬을 때마다 번갈아 바뀜, 2026-11-04)."""
+        def cell(margin, paras, w, f):
+            lines = bad = 0
+            for pieces, extra, squeeze, nchars in paras:
+                avail = (w - margin - extra) / 1.02 * f * BORROW_SAFE
+                one = sum(p[0] + (p[1] if k else 0) for k, p in enumerate(pieces))
+                if not pieces or one <= avail * (NEAR if f == 1.0 else 1.0):  # '한 줄로 입력' 표시는 세지 않음(_count_lines와 같게)
+                    lines += 1
+                    continue
+                cnt, cut, _, _ = self._wrap(pieces, avail)
+                lines += cnt + CUT_COST * cut
+                # '· 항목'이 꺾이면 나쁨(뜻 단위 자리 — 괄호·'+' 앞 — 에서 두 줄로 나뉘면 괜찮음), 짧은 값('확보 추정')이 꺾여도 나쁨
+                if nchars < 0 and not (cnt == 2 and not cut and self._unit_split(pieces, avail) is not None):
+                    bad += 1
+                elif 0 <= nchars <= SHORT_LEN:
+                    bad += 1
+            return lines, bad
+
+        rows, bad, tight, total, how = {}, 0, 0, 0, {}
+        for r, c, tc, margin, paras in cells:
+            plain = cell(margin, paras, ws[c], 1.0)
+            tighter = cell(margin, paras, ws[c], TIGHT)
+            use = tighter if tighter[:2] < plain[:2] else plain  # 줄 수가 같아도 꺾인 항목이 줄면 자간을 조금 줄임
+            how[tc] = use is tighter
+            rows[r] = max(rows.get(r, 0), use[0])
+            bad += use[1]
+            tight += use is tighter
+            total += use[0]
+        return (sum(v * (HEAD_COST if r in heads else 1) for r, v in rows.items()), bad, total, tight), how
+
     @staticmethod
     def _fill_widths(nat, total):
         """내용이 표 폭보다 길 때 칸 너비: 짧은 칸부터 내용 너비 그대로(줄 안 넘김) 두고,
@@ -898,18 +946,26 @@ class Fitter:
         표 폭보다 길면 줄 수가 가장 적게(_balance_widths). 합친 칸이 있는 표는 그대로 둔다."""
         if merged or n <= 1 or not all(cur):
             return None, None
+        scaled = [w * total / sum(cur) for w in cur]
         nat = [0.0] * n
         for r, c, rs, cs, tc in grid:
-            nat[c] = max(nat[c], self._natural(tbl, tc))
-        scaled = [w * total / sum(cur) for w in cur]
+            nat[c] = max(nat[c], self._natural(tbl, tc, scaled[c]))
         if any(nat[k] > scaled[k] for k in range(n)) and sum(nat) <= total:
             slack = total - sum(nat)
             return [nat[k] + slack * cur[k] / sum(cur) for k in range(n)], "cols"
         if sum(nat) > total:
-            return self._balance_widths(tbl, grid, n, total) or self._fill_widths(nat, total), "wraps"
+            ws = self._balance_widths(tbl, grid, n, total) or self._fill_widths(nat, total)
+            info = self._borrow_cells(tbl)
+            if info is not None:  # 폭 빌리기와 같은 점수로(두 단계가 번갈아 바꾸지 않게)
+                now, new = self._borrow_score(info[2], info[3], scaled)[0], self._borrow_score(info[2], info[3], ws)[0]
+            else:
+                now, new = self._table_score(tbl, grid, scaled), self._table_score(tbl, grid, ws)
+            if now <= new:
+                return None, None  # 지금 너비가 이미 그만큼 좋으면 그대로(만든 문서를 다시 다듬어도 같게, 2026-11-04)
+            return ws, "wraps"
         return None, None
 
-    def _table_score(self, tbl, grid, ws=None, scale=1.0):
+    def _table_score(self, tbl, grid, ws=None, scale=1.0, trust_squeeze=False):
         """다음 줄로 넘어가는 줄 수 + 낱말 끊김 벌점. 줄마다 (가장 많은 칸의 줄 수 − 칸 안 문단 수가 가장 많은 칸의
         문단 수) — 칸에 일부러 나눠 쓴 줄(\\n)은 넘어간 것으로 치지 않는다. ws가 없으면 지금 칸 너비 × scale."""
         rows, base, cuts, dots, extra, short = {}, {}, 0, 0, 0, 0
@@ -917,7 +973,7 @@ class Fitter:
         for r, c, rs, cs, tc in grid:
             w = sum(ws[c:c + cs]) if ws else int(tc.find(T("hp:cellSz")).get("width", "0")) * scale
             margin, paras = self._cell_words(tbl, tc)
-            lines, cut, dot, sh = self._count_lines(margin, paras, w)
+            lines, cut, dot, sh = self._count_lines(margin, paras, w, trust_squeeze)
             if rs == 1:
                 rows[r] = max(rows.get(r, 1), lines)
                 base[r] = max(base.get(r, 1), len(paras))
@@ -1250,18 +1306,36 @@ class Fitter:
         return n
 
     def _note_gap(self, p, tbl):
-        """표 바로 뒤 문단이 ※면 표 바깥 여백 아래를 NOTE_GAP만큼 둔다. 글자처럼 취급하지 않은 표 바로 뒤에서는
-        한글이 문단 위 간격을 쓰지 않아(실측) ※가 표 아랫선에 붙는다."""
+        """표 바로 뒤 글 문단과 표 사이를 표 바깥 여백 아래로 띄운다. 글자처럼 취급하지 않은 표 바로 뒤에서는 한글이
+        문단 위 간격을 쓰지 않아(실측) 다음 글이 표 아랫선에 붙는다.
+        - ※·* 설명: NOTE_GAP(2mm — 표에 딸린 설명이라 가깝게)
+        - ○·- 등 글(사용자 지적 2026-11-04 '표 밑에 동그라미가 그대로 붙는 현상 제거'): 글 뒤에 올 때와 같은 간격 =
+          그 문단의 위 간격 + 줄 간격 여분(한글은 줄 간격 여분을 앞 줄 아래에 붙임 — 표에는 그 여분이 없음)
+        쪽 맨 위에서 시작하는 글(쪽 나눔)·표 위 기준·단위 줄·빈 줄·도표(따로 6mm)는 그대로. 띄웠으면 1(※)·2(글), 아니면 0."""
         nxt = p.getnext()
         while nxt is not None and nxt.tag != T("hp:p"):
             nxt = nxt.getnext()
-        if nxt is None or not para_text(nxt).lstrip().startswith(("※", "*")):
+        if nxt is None or para_tables(nxt) or nxt.get("pageBreak") == "1":
             return 0
+        text = para_text(nxt).replace("⎵", " ").strip()
         om = tbl.find(T("hp:outMargin"))
-        if om is None or int(om.get("bottom", "0")) >= NOTE_GAP:
+        if not text or om is None:
             return 0
-        om.set("bottom", str(int(NOTE_GAP)))
-        return 1
+        if text.startswith(("※", "*")):
+            kind, gap = 1, NOTE_GAP
+        else:
+            pos = tbl.find(T("hp:pos"))
+            if (UNIT_RE.match(text) or tbl in self.b.flow_tables
+                    or (pos is not None and pos.get("treatAsChar") == "1")):
+                return 0
+            pp = self.st.para.get(nxt.get("paraPrIDRef"), {})
+            size = max((self.st.char.get(r.get("charPrIDRef"), {}).get("size", 10) * 100 for r in para_runs(nxt)
+                        if run_text(r).strip()), default=1000)
+            kind, gap = 2, max(NOTE_GAP, pp.get("prev", 0) + max(0.0, self.lay.line_pitch(nxt, size) - size))
+        if int(om.get("bottom", "0")) >= gap - 1:
+            return 0
+        om.set("bottom", str(int(round(gap))))
+        return kind
 
     def _fit_notes(self, p, tbl):
         """표 바로 밑 ※ 줄(이어지는 ※ 줄 모두)은 표 글꼴(맑은 고딕)로, 크기는 **표 글자보다 1pt 작게**
@@ -1318,13 +1392,17 @@ class Fitter:
                 r.set("charPrIDRef", self.b.hedit.char_size(cid, d))
         return True
 
-    def fit_tables(self):
-        """끝선 맞추기·표 글자 크기(10~12pt)·칸 너비를 내용에 맞추기·숫자 칸 자간 자동 줄임·표 위 기준·단위 줄."""
+    def fit_tables(self, again=False):
+        """끝선 맞추기·표 글자 크기(10~12pt)·칸 너비를 내용에 맞추기·숫자 칸 자간 자동 줄임·표 위 기준·단위 줄.
+        again=True는 같은 문서에 한 번 더 거는 것(자간·한 줄로 입력·폭 빌리기 뒤 다시 재도 같은 결과가 되게 — 만든 문서가
+        다듬기의 고정점이 되게, 2026-11-04): 칸 여백 원본은 그대로 두고, 알림은 마지막 상태로 본 '남은 칸'만 다시 적는다."""
         edge, cols, squeezed, wraps, near, units, notes, captions, boxes_left, images = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
         colon_tight = 0
         shrunk, left, cut_words, dot_breaks, bullets, balanced, note_font = [], [], [], 0, 0, 0, 0
         name_joined, desc_dots, three_info, borrowed, padded = 0, 0, [], 0, 0
-        self.pad_orig = {}
+        text_gaps = 0
+        if not again:
+            self.pad_orig = {}
         for p in self.paras():
             for tbl in para_tables(p):
                 pp = self.st.para.get(p.get("paraPrIDRef"), {})
@@ -1409,16 +1487,29 @@ class Fitter:
                             if new_pid != cp.get("paraPrIDRef"):
                                 cp.set("paraPrIDRef", new_pid)
                                 squeezed += 1
-                borrowed += self._borrow_widths(tbl)
+                if self._borrow_widths(tbl):
+                    borrowed += 1
+                    self._bullet_cells(tbl)  # 자간을 줄인 칸의 '· ' 폭이 달라졌으니 둘째 줄 들여쓰기를 다시 잼
+                    # 자간을 줄인 뒤 다시 재면 열 나누기가 달라질 수 있다 — 지금 한 번 더 맞춰 두어 다듬을 때 바뀌지 않게
+                    grid2 = table_grid(tbl)
+                    cur2 = [0] * n
+                    for r, c, rs, cs, tc in grid2:
+                        if r == 0 and cs == 1:
+                            cur2[c] = int(tc.find(T("hp:cellSz")).get("width", "0"))
+                    new2, _ = self._layout_widths(tbl, grid2, n, merged, total, cur2)
+                    if new2 is not None:
+                        self._set_widths(tbl, grid2, new2, total)
+                        if self._borrow_widths(tbl):
+                            self._bullet_cells(tbl)
                 n_near, n_colon = self._squeeze_near(tbl)
                 near += n_near
                 colon_tight += n_colon
                 for r, c, rs, cs, tc in table_grid(tbl):
                     margin, words = self._cell_words(tbl, tc)
-                    if self._count_lines(margin, words, int(tc.find(T("hp:cellSz")).get("width", "0")))[1]:
+                    if self._count_lines(margin, words, int(tc.find(T("hp:cellSz")).get("width", "0")), True)[1]:
                         long = max((w for cp in cell_paras(tc) for w in para_text(cp).split()), key=len, default="")
                         cut_words.append(long[:14])
-                if self._is_data_table(tbl) and self._table_score(tbl, table_grid(tbl)) > 0:
+                if self._is_data_table(tbl) and self._table_score(tbl, table_grid(tbl), trust_squeeze=True) > 0:
                     head = next((para_text(cp).strip() for cp in cell_paras(table_grid(tbl)[0][4])), "")
                     left.append(f"{head[:8]}…({self._main_size(tbl)}pt)")
                 bal, dot = self._balance_breaks(tbl)
@@ -1426,8 +1517,22 @@ class Fitter:
                 dot_breaks += dot
                 boxes_left += self._box_left(tbl, table_grid(tbl))  # 줄 균형(가운데·왼쪽 정렬 글만) 뒤에
                 units += self._fit_unit(p, self._main_size(tbl))
-                notes += self._note_gap(p, tbl)
+                g = self._note_gap(p, tbl)
+                notes += g == 1
+                text_gaps += g == 2
                 note_font += self._fit_notes(p, tbl)
+        if again:  # 두 번째 적용: 한 일은 첫 번째 알림에 있고, '남은 칸' 알림만 마지막 상태로 바꿔 적는다
+            self.notes[:] = [m for m in self.notes if "줄여도 다음 줄로 넘어가는 칸" not in m and "칸보다 긴 낱말" not in m]
+            if shrunk:
+                self.notes.append(f"표 {len(shrunk)}개는 다시 재어 표 글자를 한 단계 더 줄였습니다("
+                                  + ", ".join(sorted({f"{a}→{b}pt" for a, b in shrunk})) + ").")
+            if left:
+                self.notes.append(f"표 {len(left)}개는 줄여도 다음 줄로 넘어가는 칸이 남았습니다 — 칸 글을 줄이거나 칸을 합치면 "
+                                  "한 줄로 들어갑니다: " + ", ".join(f"‘{t}’" for t in left))
+            if cut_words:
+                self.notes.append(f"칸보다 긴 낱말 {len(cut_words)}개는 한글이 글자 단위로 끊습니다(단어로 끊기 어긋남) — "
+                                  "띄어 쓸 수 있는 말이면 띄우거나 줄이세요: " + ", ".join(f"‘{w}’" for w in cut_words))
+            return
         msg = []
         if edge:
             msg.append(f"표 {edge}개의 왼쪽·오른쪽 끝을 본문 폭에 맞췄습니다(끝선 맞추기)")
@@ -1461,6 +1566,8 @@ class Fitter:
             msg.append(f"제목 걸친 상자 안 글 {boxes_left}문단은 왼쪽 정렬로 했습니다(인용 글 낱말 사이가 벌어지지 않게)")
         if notes:
             msg.append(f"표 바로 뒤 ※가 붙는 표 {notes}개는 표 아래를 {NOTE_GAP / HWPUNIT_PER_MM:.1f}mm 띄웠습니다")
+        if text_gaps:
+            msg.append(f"표 바로 밑에 ○·- 글이 붙던 표 {text_gaps}개는 표 아래를 글 사이 간격만큼 띄웠습니다")
         if note_font:
             msg.append(f"표 바로 밑 ※ {note_font}줄은 표 글꼴로, 표 글자보다 {NOTE_SMALLER}pt 작게 맞췄습니다")
         if padded:
@@ -1886,6 +1993,12 @@ class Fitter:
             j = k
             while j > 0 and text[j - 1] in " ⎵⍽":
                 j -= 1
+            # 이미 당긴 머리 기호 문단은 건너뜀(되풀이해도 같게, 2026-11-04): ○·-·□ 뒤 고정폭 빈칸은 낫표 붙이기·줄 맞춤이
+            # 건드리지 않으므로 그 자간이 하한이면 이 단계가 당긴 것 — 다시 당기면 머리 기호 자간만 더 줄어 낫표가 튀어나옴.
+            # 이름표 ')'·쌍점 꼴은 첫 번에 남는 폭을 다 써서 되풀이해도 그대로(쌍점 꼴 빈칸은 낫표 붙이기가 이미 -50%로 둠)
+            if mark and k == len(pre) and any(text[i] == "⎵" and self.st.char.get(runs[i][1], {}).get("spacing", 0) <= CORNER_FLOOR
+                                              for i in range(j, k)):
+                continue
             order = list(range(j, k)) + ([j - 1] if j > 0 and text[j - 1] not in "\n\t" else [])
             new = {}  # 글자 위치 → 새 자간
             for i in order:

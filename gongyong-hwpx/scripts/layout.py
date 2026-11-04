@@ -108,8 +108,9 @@ class Layout:
 
     # ------------------------------------------------------------ 글자 폭
     def chars(self, p, delta=0, floor=-10):
-        """문단의 글자 목록: [(글자, 폭, 크기, 위첨자 여부)]. delta는 모든 조각에 더해 볼 자간(%).
-        자간은 floor(겹치지 않는 한계) 밑으로 내리지 않는다. 이미 그보다 좁은 조각(따옴표 등)은 그대로 둔다."""
+        """문단의 글자 목록: [(글자, 폭, 크기, 위첨자 여부, 자간 빼기 전 폭)]. delta는 모든 조각에 더해 볼 자간(%).
+        자간은 floor(겹치지 않는 한계) 밑으로 내리지 않는다. 이미 그보다 좁은 조각(따옴표 등)은 그대로 둔다.
+        마지막 칸(자간 빼기 전 폭)은 줄 끝 글자에 쓴다 — 한글은 줄 끝 글자를 자간을 줄이기 전 제 폭으로 센다(wrap)."""
         out = []
         head = head_length(para_text(p)) if delta else 0
         pos = 0
@@ -129,21 +130,33 @@ class Layout:
             pos += len(text)
             for ch in text:
                 if ch == "\n":
-                    out.append((ch, 0, size, sup))
+                    out.append((ch, 0, size, sup, 0))
                     continue
                 # 자간 %는 글자 크기가 아니라 '그 글자 자신의 폭'에 대한 비율이다(한글 2024 실측:
                 # -20%에서 한글은 0.2글자, 빈칸(0.5)은 0.1글자, 고정폭 빈칸(0.25)은 0.05글자 줄어듦).
                 if ch == "\t":
-                    w = 4000
+                    w0 = 4000
+                    w = w0
                 elif ch == "⎵":  # 고정폭 빈칸 = 글자 크기의 1/4(한글 2024 실측)
-                    w = eff * FW_EM * ratio * (1 + sp)
+                    w0 = eff * FW_EM * ratio
+                    w = w0 * (1 + sp)
                 else:
                     base = " " if ch == "⍽" else ch
                     # 첨자 안 빈칸은 줄지 않고 보통 크기 빈칸으로 찍힌다(40pt 실측 2026-11-01: 첨자 빈칸 27.6px = 보통 27.8px)
                     k = size * c.get("rel", 100) / 100 if sup and base == " " else eff
-                    w = k * self.m.em(c.get("font"), base, c.get("bold")) * ratio * (1 + sp)
-                out.append((ch, w, size, sup))
+                    w0 = k * self.m.em(c.get("font"), base, c.get("bold")) * ratio
+                    w = w0 * (1 + sp)
+                out.append((ch, w, size, sup, w0))
         return out
+
+    @staticmethod
+    def end_extra(chs, k):
+        """줄이 글자 k에서 끝날 때 더 드는 폭: 한글은 줄 끝 글자를 자간을 줄이기 전 제 폭으로 센다(한글 2024 실측 2026-11-04 —
+        자간 -50%인 닫는 따옴표 ’로 끝나는 낱말이 남은 폭 1.2~1.5mm에 들어가야 하는데 다음 줄로 넘어감, 자간을 1% 더 줄여
+        제 폭이 들어가자 올라옴). 자간을 늘린 글자는 확인하지 않아 그대로(0)."""
+        if k < 0 or k >= len(chs) or len(chs[k]) < 5:
+            return 0.0
+        return max(0.0, chs[k][4] - chs[k][1])
 
     # ------------------------------------------------------------ 줄 나눔
     @staticmethod
@@ -187,7 +200,8 @@ class Layout:
         keep = 1 - condense / 100
         for s, e, w, trail, forced in self._units(chs):
             avail = first_w if not lines else rest_w
-            if cur is not None and not forced and cur[2] + cur[3] * keep + w <= avail + 1:
+            # 줄 끝에 놓일 덩어리는 끝 글자를 자간 빼기 전 제 폭으로(end_extra)
+            if cur is not None and not forced and cur[2] + cur[3] * keep + w + self.end_extra(chs, e - 1) <= avail + 1:
                 cur[1], cur[2] = e, cur[2] + cur[3] + w
                 cur[3] = trail
                 continue

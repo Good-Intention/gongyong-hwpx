@@ -1,0 +1,313 @@
+# -*- coding: utf-8 -*-
+"""검사만(v1.21): 이미 쓴 한글(hwpx) 문서를 읽어 서식 원칙에 비춰 고칠 곳을 알려 준다. **파일은 바꾸지 않는다.**
+
+    python scripts/review.py 문서.hwpx
+
+읽는 것: 어림 쪽 수·쪽 채움, 쓰인 글꼴(한글과 맞대어 본 글꼴인지), 근거법령 자리·개수, 항목 수, ‘~으로’ 끝맺음,
+요약 상자·날짜 줄, 제목 상자 위 빈 공간, 그리고 다듬기(v1.23)가 고칠 수 있는 줄·표 맞춤(지금은 알리기만).
+한글 없이 어림한 결과라 마지막 확인은 한글에서. 다른 사람이 만든 문서도 되지만, 견본과 다른 짜임(□○ 기호가 없는
+서술식 등)이면 알림이 뜨지 않거나 어긋날 수 있다.
+"""
+import argparse
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from hwpx_lib import (T, Package, cell_paras, head_length, is_struct, marker_level, page_info, para_pics,  # noqa: E402
+                      para_runs, para_tables, para_text, run_text, split_marker, table_grid)
+from build import (BASIS_TITLE_RE, DATE_LINE_RE, FIX_RE, ROMAN, SUMMARY_END_RE, BuildError, Builder,  # noqa: E402
+                   margin_note)
+from check import check  # noqa: E402
+from fit import Fitter, cover_end  # noqa: E402
+
+
+class Inspector:
+    def __init__(self, path):
+        self.path = path
+        self.pkg = Package(path)
+        self.b = Builder(self.pkg)
+        self.paras = [p for p in self.b.sec if p.tag == T("hp:p")]
+        self.fix, self.info, self.polish = [], [], []  # 사람이 고칠 것 / 참고 / 다듬기가 할 수 있는 것
+
+    # ------------------------------------------------------------ 읽기만 하는 검사
+    def fonts(self):
+        used = {}
+        for p in self.b.sec.iter(T("hp:p")):
+            for r in para_runs(p):
+                if r.find(T("hp:t")) is None:
+                    continue
+                c = self.b.styles.char.get(r.get("charPrIDRef"), {})
+                f = c.get("font")
+                if f:
+                    used[f] = used.get(f, 0) + 1
+        checked = [f for f in used if self.b.metrics.checked(f)]
+        other = [f for f in used if f not in checked]
+        self.info.append("쓰인 글꼴: " + ", ".join(f"{f}({n})" for f, n in sorted(used.items(), key=lambda x: -x[1]))
+                         + (f" — 한글과 맞대어 본 글꼴 {', '.join(checked)}" if checked else ""))
+        if other:
+            self.info.append(f"맞대어 보지 않은 글꼴 {', '.join(other)}: 이 글꼴 문단은 줄 맞춤(자간)을 어림할 수 없어 다듬기가 "
+                             "건드리지 않습니다(알림만). 글꼴 맞대기는 v1.22에서 넓힙니다.")
+
+    def body_start(self):
+        end = cover_end(self.paras)
+        return end or 0
+
+    def basis(self):
+        """근거법령은 늘 1번(27번): 로마자 장이면 Ⅰ., 아니면 첫 □ 근거법령(○ 둘 이상)."""
+        start = self.body_start()
+        heads = [(i, p) for i, p in enumerate(self.paras[start:], start)
+                 if not para_tables(p) and marker_level(para_text(p)) == 1]
+        if not heads:
+            self.info.append("□·Ⅰ. 제목이 없어 근거법령·항목 수 검사를 건너뜀(견본과 다른 짜임).")
+            return
+        i, first = heads[0]
+        mark = split_marker(para_text(first))[1]
+        roman = bool(mark) and mark[0] in ROMAN
+        if BASIS_TITLE_RE.search(para_text(first)):
+            n = 0
+            for p in self.paras[i + 1:]:
+                if not para_tables(p) and marker_level(para_text(p)) == 1:
+                    break
+                if not para_tables(p) and marker_level(para_text(p)) == 2:
+                    n += 1
+            if n == 1:
+                self.fix.append("근거법령이 ○ 하나뿐입니다 — 확인된 다른 근거(시행령·시행규칙·조례·훈령·지침·계획)를 ○로 더하세요"
+                                "(법령 검색 도구로 확인한 것만).")
+            return
+        where = next((f"{para_text(p).strip()[:14]}" for _, p in heads[1:] if BASIS_TITLE_RE.search(para_text(p))), None)
+        if where is None:
+            sq = ""
+            for p in self.paras[start:]:
+                if para_tables(p):
+                    continue
+                text = para_text(p).replace("⎵", " ").replace("⍽", " ")
+                if marker_level(text) == 1:
+                    sq = split_marker(text)[2].strip()[:10]
+                elif marker_level(text) == 2 and self.b._is_basis(text):
+                    where = f"□ ‘{sq}’ 안의 ○ {split_marker(text)[2].strip()[:12]}"
+                    break
+        if where:
+            self.fix.append(f"근거법령이 맨 앞이 아닙니다({where}) — {'Ⅰ. 근거법령 장' if roman else '□ 근거법령'}을 1번으로 "
+                            "옮기세요(아래 ○로 법령 하나씩, 둘 이상).")
+        else:
+            self.fix.append(f"근거법령이 없습니다 — {'Ⅰ. 근거법령 장' if roman else '첫 □ 근거법령'}(○ 「…법」 제○조, 둘 이상)을 "
+                            "맨 앞에 두세요. 근거를 모르면 작성자에게 묻습니다.")
+
+    def title_and_summary(self):
+        start = self.body_start()
+        title = next((i for i, p in enumerate(self.paras[start:], start)
+                      if para_tables(p) and para_tables(p)[0].get("rowCnt") == "1" and para_tables(p)[0].get("colCnt") == "1"), None)
+        if title is None:
+            self.info.append("제목 상자(한 칸 표)를 찾지 못해 제목·요약 상자·날짜 줄 검사를 건너뜀.")
+            return
+        p = self.paras[title]
+        runs = para_runs(p)
+        k = next((n for n, r in enumerate(runs) if r.find(T("hp:tbl")) is not None), len(runs))
+        if any(r.find(T("hp:secPr")) is None and any(is_struct(ch) for ch in r) for r in runs[:k]):
+            self.polish.append("첫 쪽 제목 상자 위에 빈 공간이 생깁니다(제목 표 앞에 쪽 번호 같은 조종 조각이 있어 한글이 한 줄을 줌, "
+                               "약 3.5mm) — 다듬기가 그 조각을 날짜 줄로 옮김(36번: 제목 위에는 공간을 두지 않음).")
+        if title > start and any(para_text(q).strip() or para_tables(q) for q in self.paras[start:title]):
+            self.polish.append("제목 상자 앞에 글·빈 줄이 있어 제목이 쪽 맨 위에 붙지 않습니다(36번).")
+        summary = next((i for i, q in enumerate(self.paras[title + 1:title + 6], title + 1)
+                        if para_tables(q) and para_tables(q)[0].get("rowCnt") == "1" and para_tables(q)[0].get("colCnt") == "1"), None)
+        between = self.paras[title + 1:summary] if summary else self.paras[title + 1:title + 3]
+        if not any(DATE_LINE_RE.match(para_text(q)) for q in between if not para_tables(q)):
+            self.fix.append("제목 상자 아래 날짜·부서 줄이 없습니다(21번) — ‘’26. ○. ○.(○)  ○○○○과 ○○○’ 한 줄을 두세요.")
+        if summary is None:
+            self.info.append("요약 상자(제목 아래 한 칸 상자)가 없습니다 — 결론 한 문장을 두세 줄로 두는 것이 원칙(25번).")
+            return
+        tc = table_grid(para_tables(self.paras[summary])[0])[0][4]
+        text = "\n".join(para_text(q) for q in cell_paras(tc)).replace("⎵", " ").strip()
+        if "\n" in text or re.search(r"[①-⑳]|(^|\n)\s*(\d+[.)]|[-○·])\s", text):
+            self.fix.append("요약 상자에 번호·여러 항목이 있습니다 — 한 문장으로 두세 줄(25번, 세부는 아래 □·○로).")
+        if text and not SUMMARY_END_RE.search(text):
+            self.fix.append(f"요약 상자 끝맺음은 ‘~하고자 함’ 또는 ‘~에 대한 보고임’(25번) — 지금: ‘…{text[-12:]}’.")
+
+    def rules(self):
+        """항목 수·‘~으로’ 끝맺음 — build.py의 문단 검사 그대로."""
+        before = len(self.b.warnings)
+        self.b.lone_dashes(self.paras)
+        self.b.basis_notes(self.paras)
+        self.b.check_endings(self.paras)
+        self.fix += self.b.warnings[before:]
+
+    # ------------------------------------------------------------ 다듬기가 할 수 있는 것(한 번 해 보고 버림 — 파일은 안 바꿈)
+    def _state(self):
+        """서식 값으로 본 문서 상태(서식 번호·조각 나눔은 무시): 글 문단마다 (내어쓰기, 글자마다 (글자, 자간)),
+        표마다 칸마다 (너비, 칸 위 여백, 칸 글 (크기, 한 줄로 입력, 정렬, 자간))."""
+        st = self.b.styles
+
+        def chars(p):
+            out = []
+            for r in para_runs(p):
+                c = st.char.get(r.get("charPrIDRef"), {})
+                out += [(ch, c.get("spacing", 0), c.get("size")) for ch in run_text(r)]
+            return out
+
+        paras, tables = [], []
+        for p in [x for x in self.b.sec if x.tag == T("hp:p")]:
+            if para_tables(p):
+                for tbl in para_tables(p):
+                    m = tbl.find(T("hp:inMargin"))
+                    om = tbl.find(T("hp:outMargin"))
+                    cells = []
+                    for _, _, _, _, tc in table_grid(tbl):
+                        sz = tc.find(T("hp:cellSz"))
+                        cm = tc.find(T("hp:cellMargin"))
+                        cps = tuple((tuple(chars(cp)), st.para.get(cp.get("paraPrIDRef"), {}).get("squeeze"),
+                                     st.para.get(cp.get("paraPrIDRef"), {}).get("align")) for cp in cell_paras(tc))
+                        cells.append((sz.get("width"), cm.get("top") if cm is not None else None, cps))
+                    tables.append(((m.get("top") if m is not None else None), cells, cell_text_first(tbl),
+                                   om.get("bottom") if om is not None else None))
+            else:
+                pp = st.para.get(p.get("paraPrIDRef"), {})
+                paras.append((para_text(p), pp.get("intent", 0), tuple(chars(p))))
+        return paras, tables
+
+    def _changes(self, before, after):
+        """다듬기 한 번이 실제로 바꾸는 것만 세어 사람 말로(되풀이해도 같은 문서는 아무것도 안 나옴)."""
+        out = []
+        (pb, tb), (pa, ta) = before, after
+        spacing, hang, breaks, corners = [], [], [], []
+        for (tx, ix, cx), (ty, iy, cy) in zip(pb, pa):
+            name = tx[head_length(tx):].replace("⎵", " ").strip()[:12]
+            if tx.replace("\n", "") != ty.replace("\n", "") or tx.count("\n") != ty.count("\n"):
+                breaks.append(name)
+            if ix != iy:
+                hang.append(name)
+            if [c[1] for c in cx] != [c[1] for c in cy] and len(cx) == len(cy):
+                k = next((i for i, c in enumerate(cy) if c[0] in "「『"), None)
+                head = head_length(tx)
+                if k is not None and k <= head + 3 and any(cx[i][1] != cy[i][1] for i in range(min(k, len(cx)))):
+                    corners.append(name)
+                if any(a[1] != b[1] for a, b in zip(cx[head:], cy[head:])):
+                    spacing.append(name)
+
+        def line(n, what, names):
+            if names:
+                out.append(f"글 문단 {len(names)}개 — {what}: " + ", ".join(f"‘{x}…’" for x in names[:3]) + (" 등" if len(names) > 3 else ""))
+
+        line(0, "자간을 조금 바꿔 끝 줄·빈칸 맞춤", spacing)
+        line(0, "둘째 줄 내어쓰기를 이름표·쌍점·화살표 뒤 첫 글자에 맞춤", hang)
+        line(0, "줄 바꿈 자리 조정(연결어·화살표·끝 줄 균형)", breaks)
+        line(0, "줄 첫머리 낫표(「) 반 칸 당김", corners)
+        kinds = {"칸 너비": 0, "칸 글자 크기": 0, "한 줄로 입력": 0, "칸 여백": 0, "칸 글 정렬·자간": 0,
+                 "표 아래 띄움(밑 글이 붙지 않게)": 0}
+        names = []
+        for (mx, cx, nx, ox), (my, cy, ny, oy) in zip(tb, ta):
+            hit = set()
+            if mx != my:
+                hit.add("칸 여백")
+            if ox != oy:
+                hit.add("표 아래 띄움(밑 글이 붙지 않게)")
+            for a, b in zip(cx, cy):
+                if a[0] != b[0]:
+                    hit.add("칸 너비")
+                if a[1] != b[1]:
+                    hit.add("칸 여백")
+                for pa_, pb_ in zip(a[2], b[2]):
+                    if [c[2] for c in pa_[0]] != [c[2] for c in pb_[0]]:
+                        hit.add("칸 글자 크기")
+                    if pa_[1] != pb_[1]:
+                        hit.add("한 줄로 입력")
+                    if pa_[2] != pb_[2] or [c[1] for c in pa_[0]] != [c[1] for c in pb_[0]]:
+                        hit.add("칸 글 정렬·자간")
+            for h in hit:
+                kinds[h] += 1
+            if hit:
+                names.append(nx)
+        if names:
+            out.append(f"표 {len(names)}개 — " + ", ".join(f"{k} {v}개" for k, v in kinds.items() if v) + ": "
+                       + ", ".join(f"‘{x}…’" for x in names[:3]) + (" 등" if len(names) > 3 else ""))
+        return out
+
+    def dry_polish(self, tables=True):
+        """다듬기를 한 번 걸어 보고(파일은 저장하지 않음) 실제로 바뀌는 것과 어림 쪽 수 변화를 적는다."""
+        b = self.b
+        before_warn = len(b.warnings)
+        before = self._state()
+        try:
+            b.tighten_quotes()
+            b.colon_hang(colons=True, labels=True)
+            f = Fitter(b)
+            f.push = True
+            if tables:
+                f.fit_tables()
+                f.fit_tables(again=True)
+            f.fit_lines()
+            if tables:
+                f.relieve_pads()  # 칸 여백을 넓혀 □ 묶음이 쪽에 걸치면 되돌림(만들 때와 같은 차례)
+            f.pull_corners()
+            hard = [w for w in b.warnings[before_warn:] + f.notes if FIX_RE.search(w)]
+            after_pages = Fitter(b).report()
+        except Exception as e:  # noqa: BLE001 — 다른 사람 문서라 어떤 짜임이든 올 수 있음
+            self.info.append(f"다듬기 어림 중 멈춤({type(e).__name__}: {e}) — 이 문서는 다듬기 전에 짜임을 봐야 합니다.")
+            return None
+        self.polish += self._changes(before, self._state())
+        self.fix += [w for w in hard if w not in self.fix]
+        return after_pages
+
+    # ------------------------------------------------------------ 실행
+    def run(self, tables=True):
+        f = Fitter(self.b)
+        pages = f.report()  # 바꾸기 전 어림(원본 쪽 수)
+        self.fonts()
+        self.basis()
+        self.title_and_summary()
+        self.rules()
+        after = self.dry_polish(tables)
+        n0, n1 = page_count(pages), page_count(after) if after else None
+        if self.polish and n1 is not None:
+            self.polish.append(f"다듬으면 어림 쪽 수 {n0}쪽 → {n1}쪽" + (" — 쪽이 늘어나는 고침은 다듬기가 하지 않습니다(원본 쪽 수 지키기)"
+                                                              if n1 > n0 else ""))
+        errors, notes, _ = check(self.path)
+        return pages, errors, notes
+
+
+def page_count(report):
+    m = re.search(r"어림 쪽 수 (\d+)쪽", report or "")
+    return int(m.group(1)) if m else None
+
+
+def cell_text_first(tbl):
+    grid = table_grid(tbl)
+    return next((para_text(cp).replace("⎵", " ").strip()[:8] for _, _, _, _, tc in grid for cp in cell_paras(tc)
+                 if para_text(cp).strip()), "")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="이미 쓴 hwpx를 검사만 한다(파일을 바꾸지 않음)")
+    ap.add_argument("hwpx")
+    ap.add_argument("--no-tables", action="store_true", help="표 맞춤 어림은 건너뜀(표가 많아 느릴 때)")
+    a = ap.parse_args()
+    sys.stdout.reconfigure(encoding="utf-8")
+    try:
+        ins = Inspector(a.hwpx)
+        pages, errors, notes = ins.run(tables=not a.no_tables)
+    except BuildError as e:
+        raise SystemExit(f"검사하지 못함 — {e}")
+    print(f"## 검사만: {os.path.basename(a.hwpx)} — 파일은 바꾸지 않았습니다")
+    print(" - " + pages)
+    tell = margin_note(page_info(ins.b.sec))
+    if tell:
+        print(" - " + tell)
+    print("## 고쳐야 함(글·짜임 — 작성자가 정할 것)")
+    for w in ins.fix or ["없음"]:
+        print(" - " + w)
+    print("## 다듬기가 고칠 것(서식 — 다듬기를 한 번 걸어 본 결과, 파일은 그대로)")
+    for w in ins.polish or ["없음"]:
+        print(" - " + w)
+    print("## 참고")
+    for w in ins.info:
+        print(" - " + w)
+    if errors or notes:
+        print("## 파일 검사")
+        for w in errors + notes:
+            print(" - " + w)
+    sys.exit(1 if errors else 0)
+
+
+if __name__ == "__main__":
+    main()

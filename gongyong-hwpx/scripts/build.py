@@ -34,7 +34,7 @@ from hwpx_lib import (HWPUNIT_PER_MM, UNIT_RE, T, HeaderEdit, Package, Styles, _
                       split_marker,
                       table_grid)
 from check import check, print_report  # noqa: E402
-from fit import Fitter, cover_end  # noqa: E402
+from fit import ARROWS, Fitter, cover_end  # noqa: E402
 from layout import FW_EM, Layout, Metrics  # noqa: E402
 
 # **굵게**, ^^위 첨자^^ 표시(견본 문단의 굵은 조각·위 첨자 조각 모양을 빌려 씀).
@@ -70,12 +70,14 @@ def _png_jpeg_size(data):
             i += 2 + size
     return 0, 0
 BASIS_TITLE_RE = re.compile(r"근\s*거|관계\s*법|관련\s*법")  # 근거법령 장·□ 제목
+# 부연설명 검사(basis_notes)는 제목이 근거법령 그 자체일 때만('산출근거'·'추진근거 및 경과'는 아님)
+BASIS_LAW_TITLE_RE = re.compile(r"^(근\s*거\s*(법\s*령|법\s*규|규\s*정)?|관\s*[계련]\s*법\s*[령규]|법\s*적\s*근\s*거)\s*$")
 BASIS_RE = re.compile(r"근\s*거|법\s*령|법\s*적|관계\s*법|관련\s*법")  # 근거법령 ○의 괄호 이름표
 # 출력 두 등급: 계획을 고쳐야 하는 알림(고쳐야 함)과 도구가 한 일의 기록(알림) — 중요한 것이 묻히지 않게(검수 2026-11-01)
 SUMMARY_END_RE = re.compile(r"(고자\s*함|보고임)\s*\.?$")  # 요약 상자 끝맺음 ~하고자 함·~줄이고자 함·~에 대한 보고임(사용자 원칙 2026-11-01)
 FIX_RE = re.compile(r"근거법령이 없|‘~으로’로 끝나는|한 열에 세 가지 정보|요약 상자에는|요약 상자 끝맺음|끝 줄에 한두 낱말만|한 줄 줄이기 후보|항목 수 —|두 쪽에 걸친|칸보다 긴 낱말|줄여도 다음 줄로 넘어가는|빈칸이 크게 벌어지는 줄이 남은|"
                     r"견본 문단은 '|굵은 조각이 없어|위 첨자 조각이 없어|넣지 못했습니다|다 들어가지 않을 수 있습니다|"
-                    r"날짜·부서 줄이 없습니다")
+                    r"날짜·부서 줄이 없습니다|근거법령에는 부연설명")
 # 날짜·부서 줄: ’26. 10. 30.(금) / 2026. 10. 30. / ’26. ○. ○.(○)로 시작하는 문단
 DATE_LINE_RE = re.compile(r"^[ \t⎵]*(?:[’']\s*[\d○]{2}|(?:19|20)\d{2})\.\s*[\d○]{1,2}\.\s*[\d○]{1,2}\.")
 MID_DOTS = "·ㆍ"
@@ -986,6 +988,18 @@ class Builder:
             self._split_run_at(p, k)  # '항목명 : '·'(이름표) '와 내용을 다른 조각으로(내용만 자간 조정되게)
             chs, lines = lay.para_lines(p, body_w)
             hang = sum(c[1] for c in chs[:k])
+            text = para_text(p)
+            cur = -self.styles.para.get(p.get("paraPrIDRef"), {}).get("intent", 0)
+            if k < len(chs) and text[k] in "「『" and -0.02 * chs[k][1] <= cur - hang <= 0.5 * chs[k][1]:
+                # 낫표를 반 칸 당긴 줄(fit.pull_corners)은 낫표 칸이 내어쓰기보다 앞에 있다 — 있던 내어쓰기를 그대로 둔다
+                # (다시 재면 둘째 줄이 당긴 만큼 앞으로 와 낫표 획과 어긋남, 되풀이해도 같게 2026-11-04)
+                continue
+            k2 = next((i + 1 for i in range(len(text) - 1, k, -1) if text[i] in ARROWS), 0)
+            while k2 and k2 < len(text) and text[k2] in " ⎵⍽":
+                k2 += 1
+            if k2 and k2 < len(chs) and abs(cur - sum(c[1] for c in chs[:k2])) <= 0.02 * chs[k2][1]:
+                # 화살표 뒤 첫 글자 밑에 맞춘 줄(fit.arrow_breaks)은 그 내어쓰기를 그대로 둔다(되풀이해도 같게 2026-11-04)
+                continue
             p.set("paraPrIDRef", self.hedit.para_hang(p.get("paraPrIDRef"), hang))
             if by_colon:
                 n_colon += 1
@@ -1091,6 +1105,41 @@ class Builder:
         if hits:
             self.warn(f"참고 머리표 바로 아래 ○ 줄 {len(hits)}개({', '.join(hits)}): 참고 쪽에는 ○ 한 줄 설명을 쓰지 않습니다 "
                       "— 표·내용을 바로 두고 설명은 표 아래 ※로 옮기세요.")
+
+    def basis_notes(self, out):
+        """근거법령에는 부연설명을 달지 않는다(사용자 원칙 2026-11-04): Ⅰ. 근거법령 장·□ 근거법령 묶음 안의 -·※·* 줄을
+        알린다 — 법령 이름·조항만 ○ 하나씩 쓰고, 설명은 빼거나 그 내용을 쓰는 □(사업개요·추진배경 등)로 옮긴다.
+        - 줄이 하위 법령(「…」)이면 ○로 올린다. 참고 쪽(참고 머리표부터)은 보지 않는다."""
+        notes, laws, inside, roman = [], [], False, False
+        for p in out:
+            if para_tables(p):
+                if self._is_ref_head(p):
+                    break
+                continue
+            text = para_text(p).replace(FW, " ").replace("⍽", " ")
+            _, mark, body = split_marker(text)
+            if not mark:
+                continue
+            lv = marker_level(text)
+            if lv == 1:
+                is_roman = mark[0] in ROMAN
+                if inside and (is_roman or not roman):
+                    inside = False
+                if BASIS_LAW_TITLE_RE.match(body.replace("**", "").strip()):
+                    inside, roman = True, is_roman
+                continue
+            if inside and lv >= 3:
+                body = body.replace("**", "").strip()
+                (laws if body.startswith("「") else notes).append(body[:16])
+        if not notes and not laws:
+            return
+        msg = "근거법령에는 부연설명을 달지 않습니다(사용자 원칙) — 법령 이름·조항만 ○ 하나씩"
+        if notes:
+            msg += (f": 설명 줄 {len(notes)}개(" + ", ".join(f"‘{t}…’" for t in notes[:3]) + (" 등" if len(notes) > 3 else "")
+                    + ")는 빼거나 그 내용을 쓰는 □(사업개요·추진배경 등)로 옮기세요")
+        if laws:
+            msg += ("; " if notes else ": ") + f"- 줄의 하위 법령 {len(laws)}개(" + ", ".join(f"‘{t}…’" for t in laws[:3]) + ")는 ○로 올리세요"
+        self.warn(msg + ".")
 
     # ------------------------------------------------------------ 부연설명 괄호 작게
     def small_notes(self):
@@ -1229,6 +1278,7 @@ class Builder:
         """따옴표(’ ”)·낫표(「」)·가운데점(·)이 한 글자 폭인 글꼴(휴먼명조)에서는 ’26.이 ’ 26.처럼, 「법」 등이 「 법」  등처럼,
         홍보·안내가 홍보 · 안내처럼 벌어져 보인다. 빈 쪽 자간을 줄여 붙인다(사용자 원칙 1: 자간은 겹치지 않는 범위에서 조정,
         낫표·가운데점은 사용자 요청 2026-11-01). 줄인 자간은 -50%를 넘지 않는다."""
+        mode = {}  # 문단 → 글자 수가 가장 많은 자간(이 단계가 줄인 조각을 알아보는 기준)
         for r in list(self.sec.iter(T("hp:run"))):
             text = run_text(r)
             if r.find(T("hp:t")) is None or len(r) != 1 or not any(q in text for q in QUOTES + "「」" + MID_DOTS):
@@ -1238,7 +1288,20 @@ class Builder:
             deltas = self._tight_deltas(text, c.get("font"))
             if not any(deltas) or base <= -50:
                 continue
-            cids = [self.hedit.char_spacing(r.get("charPrIDRef"), max(-50, base + dl)) if dl else None for dl in deltas]
+            p = r.getparent()
+            if p not in mode:
+                count = {}
+                for x in para_runs(p):
+                    if x.find(T("hp:t")) is not None:
+                        sp = self.styles.char.get(x.get("charPrIDRef"), {}).get("spacing", 0)
+                        count[sp] = count.get(sp, 0) + len(run_text(x))
+                mode[p] = max(count, key=count.get) if count else base
+            # 문단 보통 자간보다 이미 좁은 조각은 이 단계가 줄인 것 — 보통 자간에서 다시 재어 더 줄일 때만(되풀이해도 같게, 2026-11-04)
+            ref = max(base, mode[p])
+            cids = [self.hedit.char_spacing(r.get("charPrIDRef"), max(-50, ref + dl)) if dl and ref + dl < base else None
+                    for dl in deltas]
+            if not any(cids):
+                continue
             pieces = []
             for ch, cid in zip(text, cids):
                 if pieces and pieces[-1][1] == cid:
@@ -1671,6 +1734,7 @@ class Builder:
         out = [self.make_block(n, b) for n, b in enumerate(blocks)]
         self.flow_gaps(out)
         self.lone_dashes(out)
+        self.basis_notes(out)
         self.check_endings(out)
         self.ref_bullets(out)
         if opts.get("keep_groups", True):
@@ -1708,6 +1772,7 @@ class Builder:
             f = Fitter(self)
             f.push = opts.get("push_down", True)  # 끝 줄 한두 낱말 내리기(끄면 올리기만)
             f.fit_tables()
+            f.fit_tables(again=True)  # 한 번 더: 자간·한 줄로 입력·폭 빌리기 뒤 다시 재도 같은 결과가 되게(다듬기의 고정점)
             f.fit_lines()
             f.order_hints()  # 쪽 나눔을 박기 전, 같은 조건으로 순서 바꾸기를 견줌
             f.fit_pages()

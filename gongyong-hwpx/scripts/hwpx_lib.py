@@ -691,7 +691,9 @@ def label_content(text):
 def head_length(text):
     """문단 첫머리(머리 기호·빈칸 + 괄호 이름표, 또는 '항목명 : '까지)의 글자 수. 자간 조정은 이 뒤 내용에만 한다
     (그래야 같은 묶음의 괄호·쌍점과 내용 시작이 위아래로 계속 맞는다)."""
-    return max(_base_head(text), label_colon(text))
+    # 괄호 이름표 뒤 빈칸까지 머리에 넣는다 — 줄 맞춤이 그 빈칸 자간을 줄이면 첫 줄 내용 시작이 둘째 줄 내어쓰기보다
+    # 0.1~0.3mm 앞으로 와 위아래가 어긋남(2026-11-04 되풀이 시험에서 찾음). 쌍점 꼴(label_colon)은 원래 빈칸까지 넣음.
+    return max(_base_head(text), label_content(text), label_colon(text))
 
 
 def space_colons(text):
