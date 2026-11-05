@@ -61,7 +61,9 @@ class PageFit:
                         spacers.append(p)
             texts = [p for p in seg if not para_tables(p) and para_text(p).strip()
                      and self.st.para.get(p.get("paraPrIDRef"), {}).get("line_type") == "PERCENT"]
-            saved = {p: (p.get("paraPrIDRef"), [r.get("charPrIDRef") for r in para_runs(p)]) for p in spacers + texts}
+            summary_gap = self._summary_gap(seg)
+            saved = {p: (p.get("paraPrIDRef"), [r.get("charPrIDRef") for r in para_runs(p)])
+                     for p in spacers + texts + ([summary_gap] if summary_gap is not None else [])}
             figs = [(t, cells) for p in seg for t in para_tables(p) for cells in [self._figure_cells(t)] if cells]
             fig_h = {el: int(el.find(T("hp:cellSz" if el.tag == T("hp:tc") else "hp:sz")).get("height", "0"))
                      for t, cells in figs for el in [t, *cells]}
@@ -108,6 +110,13 @@ class PageFit:
                             self.st.para.get(pid, {}).get("line", 0) > SPACER_LINE2:
                         p.set("paraPrIDRef", self.b.hedit.para_line(pid, SPACER_LINE2))
 
+            def shrink_summary():
+                # 요약 상자 아래 빈 줄(근거법령 위)만 좁힌다 — 다른 □ 사이·○ 간격은 그대로(사용자 2026-11-05)
+                pid = saved[summary_gap][0]
+                if self.st.para.get(pid, {}).get("line_type") == "PERCENT" and \
+                        self.st.para.get(pid, {}).get("line", 0) > SUMMARY_GAP_LINE:
+                    summary_gap.set("paraPrIDRef", self.b.hedit.para_line(pid, SUMMARY_GAP_LINE))
+
             def halve_prev():
                 # ○ 위 간격(묶음 구분)을 절반으로 — 표 제목·표 아래 여백보다 먼저 양보
                 for p in texts:
@@ -143,6 +152,9 @@ class PageFit:
                 if spacers:
                     extra.append((f"□ 사이 빈 줄 더 좁힘 + 줄 간격 {low}% + ○ 위 간격 절반", SPACER2_COST + top - low + PREV_HALF_COST,
                                   lambda v=low: (shrink_spacers2(), line_to(v), halve_prev())))
+            if summary_gap is not None:  # 모든 안에 '요약 상자 아래 빈 줄 좁힘'을 붙인 안을 더함(가장 싸게)
+                plans += [(("" if name == "그대로" else name + " + ") + "요약 상자 아래 빈 줄 좁힘", cost + SUMMARY_GAP_COST,
+                           lambda act=act: (act(), shrink_summary())) for name, cost, act in list(plans)]
             best = None
             for name, cost, act in plans:
                 restore()
@@ -163,6 +175,20 @@ class PageFit:
         if changed:
             self.notes.append("쪽이 애매하게 넘어가지 않도록 " + ", ".join(changed) + "으로 맞췄습니다.")
         self.force_breaks()
+
+    def _summary_gap(self, seg):
+        """그 묶음(첫 쪽)에서 요약 상자 바로 아래 빈 줄 — 제목 상자(한 칸 표) → 날짜·부서 줄 → 요약 상자(한 칸 표) → 빈 줄. 없으면 None."""
+        head = seg[:6]
+        for k, p in enumerate(head):
+            if k == 0 or k + 1 >= len(head) or para_tables(p) or not DATE_HEAD_RE.match(para_text(p)):
+                continue
+            box = head[k + 1]
+            tables = para_tables(box)
+            if not tables or tables[0].get("rowCnt") != "1" or tables[0].get("colCnt") != "1":
+                return None
+            nxt = head[k + 2] if k + 2 < len(head) else None
+            return nxt if nxt is not None and is_blank(nxt) else None
+        return None
 
     def force_breaks(self):
         """묶음(□·○와 그 아래 -·*·※·표)이 쪽 끝에 다 들어가지 않아 다음 쪽으로 넘어갈 자리에는 쪽 나눔을 직접 넣는다.

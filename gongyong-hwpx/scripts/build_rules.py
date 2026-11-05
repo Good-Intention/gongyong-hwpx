@@ -259,6 +259,22 @@ class RulesPart:
                 return True
         return False
 
+    def date_gap(self):
+        """날짜·부서 줄 아래를 DATE_NEXT(1pt) 띄운다(사용자 2026-11-05 '날짜 부서 이름 들어가는 줄 아래 여백을 조금만 더') —
+        첫 날짜 줄이고 바로 아래가 표(요약 상자)일 때만. 이미 그만큼 띄웠으면 그대로. 바꿨으면 1."""
+        ps = [x for x in self.sec if x.tag == T("hp:p")]
+        for k, p in enumerate(ps[:6]):
+            if para_tables(p) or not DATE_LINE_RE.match(para_text(p)):
+                continue
+            if k + 1 >= len(ps) or not para_tables(ps[k + 1]):
+                return 0
+            pid = p.get("paraPrIDRef")
+            if self.styles.para.get(pid, {}).get("next", 0) >= DATE_NEXT:
+                return 0
+            p.set("paraPrIDRef", self.hedit.para_margin(pid, "next", DATE_NEXT))
+            return 1
+        return 0
+
     def untitled_tables(self):
         """제목 없는 본문 자료 표 문단 목록(table_titles 검사와 같은 기준·차례) — 이미 만든 문서에 ■ 제목을 달 때 쓴다.
         참고 쪽 표도 본다(참고 머리표는 쪽 제목일 뿐). 흐름 표는 뺀다."""

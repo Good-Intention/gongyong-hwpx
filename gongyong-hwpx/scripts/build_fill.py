@@ -443,6 +443,23 @@ class FillPart:
                 sz.set("height", str(int(FLOW_ROW_GAP_MM * HWPUNIT_PER_MM)))
         self.flow_tables.add(tbl)
 
+    def _find_flow_tables(self):
+        """문서에 이미 있는 투명 선 도표: 화살표(→ ⇒ ➜)만 든 칸이 있고 그 칸의 네 변이 모두 선 없음인 표.
+        (만들 때 flow_table이 그리는 모양 — 상자 칸만 실선, 사이 칸에 화살표)"""
+        fills = {bf.get("id"): bf for bf in self.pkg.xml("Contents/header.xml").iter(T("hh:borderFill"))}
+        found = set()
+        for tbl in self.sec.iter(T("hp:tbl")):
+            for *_, tc in table_grid(tbl):
+                if "".join(para_text(cp) for cp in cell_paras(tc)).strip() not in ("→", "⇒", "➜"):
+                    continue
+                bf = fills.get(tc.get("borderFillIDRef"))
+                sides = [bf.find(T("hh:" + k)) if bf is not None else None
+                         for k in ("leftBorder", "rightBorder", "topBorder", "bottomBorder")]
+                if all(x is None or x.get("type") in (None, "NONE") for x in sides):
+                    found.add(tbl)
+                    break
+        return found
+
     def flow_gaps(self, out):
         """도표 바로 뒤가 글 문단(○ 등)이면 도표 아래를 6mm 띄운다(디자인 검토 권고 2026-11-01).
         빈 줄·표가 뒤따르면 그대로 둔다(한글은 빈 줄 칸을 약 4mm보다 낮게 그리지 않음 — 실측)."""

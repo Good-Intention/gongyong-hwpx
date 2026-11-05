@@ -27,8 +27,13 @@ ALIASES = {
 }
 # 고정폭 빈칸(⎵) 폭: 글자 크기의 1/4(한글 2024 실측 — 빈칸 20개가 한글 5자 폭). 보통 빈칸은 글꼴마다 다름(휴먼명조 1/2)
 FW_EM = 0.25
-# 쪽 설정이 든 첫 문단의 표(제목 상자 등) 위에 한글이 두는 빈 공간(한글 2024 실측 약 4.7mm)
-FIRST_TABLE_EXTRA = 1330
+# 쪽 설정이 든 첫 문단의 표(제목 상자 등)에 한글이 더 두는 높이: 없음(2026-11-05 한글 PDF 글자 위치로 실측 — 1쪽 글 줄이
+# 2쪽 이후와 같은 자리가 되는 값, 시험 문서 9개). 옛 값 4.7mm는 '쪽 번호 넣기' 조각이 제목 상자 앞에 있던 때(v1.2 전)의 몫과
+# 요약 상자 줄 간격 여분(약 1.8mm, para_height)을 섞어 세던 것 — 1쪽을 실제보다 2.9mm 꽉 찼다고 어림했음
+FIRST_TABLE_EXTRA = 0
+# 그 문단에 '쪽 번호 넣기' 같은 조종 조각이 표 앞에 따로 있으면 한글이 그 조각에 한 줄을 더 준다 — 제목 상자가 4.9mm
+# 내려감(사람이 쓴 쉼터 문서 실측 2026-11-05). 도구로 만든 문서는 그 조각을 날짜 줄로 옮겨 이 몫이 없다
+CTRL_LINE_EXTRA = 1390
 SUP_SCALE = 0.64  # 위·아래 첨자 폭 = 글자 크기 × 이 값(한글 2024 실측)
 CLOSE = set(")]}>,.:;!?%’”」』】〉》、。…~°′″")
 OPEN = set("([{<‘“「『【〈《")
@@ -273,9 +278,20 @@ class Layout:
             # 어림하던 일, 한글 실측 2026-11-04)
             om = tables[-1].find(T("hp:outMargin"))
             om_b = int(om.get("bottom", "0")) if om is not None else 0
-            hs[-1] += max(0.0, self.line_pitch(p, size) - size - om_b)
+            pos = tables[-1].find(T("hp:pos"))
+            extra = max(0.0, self.line_pitch(p, size) - size)
+            if pos is not None and pos.get("treatAsChar") == "1":
+                # 글자처럼 취급한 표(제목·요약 상자): 표는 줄 안의 글자라 줄 간격 여분이 표 바깥 아래 여백과 따로 붙는다
+                # (한글 PDF 실측 2026-11-05 — 요약 상자 아래가 1.8mm 더 넓었음)
+                hs[-1] += extra
+            else:
+                hs[-1] += max(0.0, extra - om_b)
             if p.find(".//" + T("hp:secPr")) is not None:
                 hs[0] += FIRST_TABLE_EXTRA
+                runs = para_runs(p)
+                k = next((n for n, r in enumerate(runs) if r.find(T("hp:tbl")) is not None), 0)
+                if any(r.find(T("hp:ctrl")) is not None and r.find(T("hp:secPr")) is None for r in runs[:k]):
+                    hs[0] += CTRL_LINE_EXTRA
             return prev + sum(hs) + nxt, hs, prev, nxt
         pics = [x for x in para_pics(p) if x.find(T("hp:pos")) is not None
                 and x.find(T("hp:pos")).get("treatAsChar") == "1"]

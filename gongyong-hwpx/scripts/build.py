@@ -47,6 +47,7 @@ class Builder(FillPart, RulesPart):
         tab = self.sec.find(".//" + T("hp:tab"))
         self.tab_proto = copy.deepcopy(tab) if tab is not None else None
         self.struct_runs = self._collect_struct()
+        self.flow_tables |= self._find_flow_tables()  # 이미 만든 문서의 흐름도도(만들 때는 flow_table이 더함)
 
     def warn(self, msg):
         if msg not in self.warnings:
@@ -255,6 +256,8 @@ class Builder(FillPart, RulesPart):
             self.small_notes()
         if opts.get("square_small", True):
             self.small_squares()
+        if opts.get("date_gap", True):
+            self.date_gap()
         if opts.get("tighten_quotes", True):
             self.tighten_quotes()
         if self.colons or opts.get("label_hang", True):
