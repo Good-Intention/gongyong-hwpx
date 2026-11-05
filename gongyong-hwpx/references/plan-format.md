@@ -73,6 +73,7 @@
 | `label_hang` | 이름표 뒤 내어쓰기 |
 | `keep_numbers` | 숫자 꾸밈말 묶음 빈칸 |
 | `square_small` | □ 기호 2pt 작게 |
+| `date_gap` | 날짜·부서 줄 아래(요약 상자 위) 1pt |
 | `fit` | 표 맞춤·줄 맞춤·쪽 맞춤 전부 |
 
 예: `{"title": "…", "fit": false, "blocks": [ … ]}`
