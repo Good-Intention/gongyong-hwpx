@@ -275,17 +275,144 @@ class RulesPart:
             return 1
         return 0
 
+    def _ref_sole_tables(self, ps):
+        """참고 자체가 표인 곳의 그 표 문단들(사용자 2026-11-05 '참고 자체가 표이고 그 타이틀이 표의 타이틀인 경우 검은색 네모
+        제목은 없게'): 참고 머리표에서 다음 참고 머리표(없으면 끝)까지 본문 자료 표가 하나뿐이고, 그 밖의 문단이 기준·단위 줄,
+        ■ 제목 줄, 표 아래 ※·* 줄, 빈 줄뿐이면 참고 머리표의 제목이 곧 그 표의 제목이다. 다른 표·그림 상자·□·○ 글이 있으면
+        참고 머리표는 쪽 제목일 뿐이라 표마다 ■ 제목을 단다(그대로)."""
+        found = set()
+        heads = [k for k, p in enumerate(ps) if self._is_ref_head(p)]
+        for n, h in enumerate(heads):
+            end = heads[n + 1] if n + 1 < len(heads) else len(ps)
+            tables, other = [], False
+            for p in ps[h + 1:end]:
+                tbls = para_tables(p)
+                if tbls:
+                    tbl = tbls[0]
+                    if tbl in self.flow_tables or self._has_image(tbl) or not Fitter._is_data_table(tbl):
+                        other = True
+                    else:
+                        tables.append(p)
+                    continue
+                t = para_text(p).strip()
+                if not t or UNIT_RE.match(t) or t.startswith((TABLE_TITLE_MARK, "※", "*")):
+                    continue
+                other = True
+            if len(tables) == 1 and not other:
+                found.add(tables[0])
+        return found
+
+    def _heading_tables(self, ps):
+        """□(·Ⅰ.) 제목 바로 아래 표(사이에 ■ 제목·기준·단위 줄·빈 줄만): 그 ■ 제목이 □ 제목과 같거나(띄어쓰기 무시) 그 □ 묶음이
+        표 하나와 단위 줄·※·*뿐이면 □ 제목이 곧 표 제목이다 — ■ 제목을 달지 않는다(사용자 2026-11-05 '□ 추진일정' 바로 아래
+        '■ 추진일정' 사진, '이런경우엔 검은색 상자 제목은 없애는게 맞음'). □ 아래 ○ 글 뒤에 오는 표는 그대로 ■ 제목."""
+        def norm(t):
+            return re.sub(r"[\s⎵⍽　*]", "", t)
+
+        def heading(p):
+            return (not para_tables(p) and marker_level(para_text(p)) == 1
+                    and not para_text(p).lstrip().startswith(TABLE_TITLE_MARK))
+
+        def data(p):
+            tbls = para_tables(p)
+            return bool(tbls) and tbls[0] not in self.flow_tables and not self._has_image(tbls[0]) \
+                and Fitter._is_data_table(tbls[0])
+
+        found = set()
+        for h, p in enumerate(ps):
+            if not heading(p):
+                continue
+            k, titles = h + 1, []
+            while k < len(ps) and not para_tables(ps[k]) and (not para_text(ps[k]).strip() or UNIT_RE.match(para_text(ps[k]))
+                                                              or para_text(ps[k]).lstrip().startswith(TABLE_TITLE_MARK)):
+                if para_text(ps[k]).lstrip().startswith(TABLE_TITLE_MARK):
+                    titles.append(para_text(ps[k]).strip().lstrip(TABLE_TITLE_MARK))
+                k += 1
+            if k >= len(ps) or not data(ps[k]):
+                continue
+            end = next((j for j in range(k + 1, len(ps)) if heading(ps[j]) or self._is_ref_head(ps[j])), len(ps))
+            sole = all(not para_tables(q) and (not para_text(q).strip() or UNIT_RE.match(para_text(q))
+                                               or para_text(q).lstrip().startswith((TABLE_TITLE_MARK, "※", "*")))
+                       for q in ps[k + 1:end])
+            body = split_marker(para_text(p))[2]
+            if sole or any(norm(t) == norm(body) for t in titles):
+                found.add(ps[k])
+        return found
+
+    def flow_steps(self, out):
+        """도표(워크플로우 표)는 진행 단계가 FLOW_MIN_STEPS(6)개 이상일 때만 쓴다(사용자 2026-11-05 '워크플로우 표는 진행일정이
+        6개 이상일때만 쓰는걸로(좌우가 꽉차게 2단으로)'). 상자(화살표·'< 제목 >'·빈 칸이 아닌 칸)가 그보다 적은 도표를 '고쳐야 함'으로
+        알린다. 만든 도표(flow)와 이미 쓴 문서의 투명 선 도표 모두. 찾은 수."""
+        few = []
+        for p in out:
+            for tbl in para_tables(p):
+                if tbl not in self.flow_tables:
+                    continue
+                boxes = []
+                for *_, tc in table_grid(tbl):
+                    t = " ".join(para_text(cp) for cp in cell_paras(tc)).strip()
+                    if t and t not in ("→", "⇒", "➜") and not t.startswith(("<", "〈", "＜")):
+                        boxes.append(t)
+                if boxes and len(boxes) < FLOW_MIN_STEPS:
+                    few.append(f"{boxes[0][:8]}…({len(boxes)}단계)")
+        if few:
+            self.warn(f"진행 단계가 {FLOW_MIN_STEPS}개보다 적은 도표 {len(few)}개(" + ", ".join(f"‘{t}’" for t in few[:3])
+                      + f"): 도표(워크플로우 표)는 단계가 {FLOW_MIN_STEPS}개 이상일 때만 씁니다(4·5개는 한 줄, 6·7·8개는 두 줄로 "
+                      "좌우를 꽉 채움) — 그보다 적으면 표(시기·내용)나 ○ 글로 쓰세요.")
+        return len(few)
+
+    def _head_titled(self, ps):
+        """■ 제목을 달지 않는 표: 참고 자체가 표 하나인 곳 + □ 제목 바로 아래 표(□ 제목이 곧 표 제목)."""
+        return self._ref_sole_tables(ps) | self._heading_tables(ps)
+
+    def ref_sole_titles(self, out, remove=True):
+        """바로 위 제목이 곧 표 제목인 곳(_head_titled — 참고 자체가 표 하나, □ 제목 바로 아래 표)의 ■ 제목 줄을 뺀다(사용자 2026-11-05).
+        remove=False(검사만)이면 빼지 않고 '고쳐야 함'으로 알린다. 뺀(또는 찾은) 수."""
+        hits = []
+        for p in self._head_titled(out):
+            j = out.index(p) - 1
+            while j >= 0 and not para_tables(out[j]) and UNIT_RE.match(para_text(out[j])):
+                j -= 1
+            if j >= 0 and not para_tables(out[j]) and para_text(out[j]).lstrip().startswith(TABLE_TITLE_MARK):
+                hits.append(j)
+        if not hits:
+            return 0
+        names = [para_text(out[j]).strip().lstrip(TABLE_TITLE_MARK + " ")[:14] for j in hits]
+        if not remove:
+            self.warn(f"바로 위 제목과 겹치는 ■ 제목 {len(hits)}개(" + ", ".join(f"‘{t}’" for t in names[:3])
+                      + "): □ 제목·참고 머리표 제목이 곧 표 제목이라 ■ 제목 줄은 뺍니다(사용자 원칙).")
+            return len(hits)
+        for j in sorted(hits, reverse=True):
+            q = out.pop(j)
+            if q.get("pageBreak") == "1" and j < len(out):
+                out[j].set("pageBreak", "1")
+            if q.getparent() is not None:
+                q.getparent().remove(q)
+        for k, m in enumerate(self.warnings):  # 앞서 table_units가 센 '■ 줄로 넣었습니다' 수에서 뺀다
+            hit = re.match(r"표 제목 (\d+)개를 표 위 왼쪽에 ■ 줄로 넣었습니다", m)
+            if hit:
+                left = int(hit.group(1)) - len(hits)
+                if left > 0:
+                    self.warnings[k] = m.replace(f"표 제목 {hit.group(1)}개", f"표 제목 {left}개", 1)
+                else:
+                    del self.warnings[k]
+                break
+        self.warn(f"바로 위 제목이 곧 표 제목인 곳 {len(hits)}개는 ■ 제목 줄을 넣지 않았습니다(□ 제목·참고 머리표 제목과 겹침 — "
+                  + ", ".join(f"‘{t}’" for t in names[:3]) + ").")
+        return len(hits)
+
     def untitled_tables(self):
         """제목 없는 본문 자료 표 문단 목록(table_titles 검사와 같은 기준·차례) — 이미 만든 문서에 ■ 제목을 달 때 쓴다.
-        참고 쪽 표도 본다(참고 머리표는 쪽 제목일 뿐). 흐름 표는 뺀다."""
+        참고 쪽 표도 본다(참고 머리표는 쪽 제목일 뿐 — 참고 자체가 표 하나인 곳은 빼고). 흐름 표는 뺀다."""
         ps = [x for x in self.sec if x.tag == T("hp:p")]
+        sole = self._head_titled(ps)
         found = []
         for k, p in enumerate(ps):
             tables = para_tables(p)
             if not tables:
                 continue
-            if self._is_ref_head(p):
-                continue  # 참고 머리표는 쪽 제목 — 그 아래 표도 저마다 ■ 제목(사용자 2026-11-05)
+            if self._is_ref_head(p) or p in sole:
+                continue  # 참고 머리표는 쪽 제목 — 그 아래 표도 저마다 ■ 제목(사용자 2026-11-05), 참고 자체가 표면 머리표 제목이 표 제목
             tbl = tables[0]
             if tbl in self.flow_tables or not Fitter._is_data_table(tbl) or self._has_image(tbl):
                 continue  # 그림 상자(캡처·그래프)는 머리 칸·[그림 N] 줄이 제목 — ■ 제목을 묻지 않음
@@ -441,14 +568,16 @@ class RulesPart:
     def table_titles(self, out):
         """본문 자료 표(머리 줄이 있는 여러 줄·여러 칸 표)는 ■ 제목을 단다(사용자 원칙 2026-11-04 '이 표는 제목이 없군요
         앞으로는 ■ 네모로 제목을 지어줍시다'). 제목 없는 표를 '고쳐야 함'으로 알린다 — 계획의 표 블록에 "title"을 넣으면
-        표 위 왼쪽에 ■ 줄이 붙는다. 참고 쪽 표도 본다(참고 머리표는 쪽 제목일 뿐, 사용자 2026-11-05)."""
+        표 위 왼쪽에 ■ 줄이 붙는다. 참고 쪽 표도 본다(참고 머리표는 쪽 제목일 뿐, 사용자 2026-11-05) — 참고 자체가 표 하나인
+        곳은 참고 머리표 제목이 곧 표 제목이라 묻지 않는다(사용자 2026-11-05)."""
         missing = []
+        sole = self._head_titled(out)
         for k, p in enumerate(out):
             tables = para_tables(p)
             if not tables:
                 continue
-            if self._is_ref_head(p):
-                continue  # 참고 머리표는 쪽 제목 — 그 아래 표도 저마다 ■ 제목(사용자 2026-11-05)
+            if self._is_ref_head(p) or p in sole:
+                continue  # 참고 머리표는 쪽 제목 — 그 아래 표도 저마다 ■ 제목(사용자 2026-11-05), 참고 자체가 표면 머리표 제목
             tbl = tables[0]
             if tbl in self.flow_tables or not Fitter._is_data_table(tbl) or self._has_image(tbl):
                 continue  # 그림 상자(캡처·그래프)는 머리 칸·[그림 N] 줄이 제목 — ■ 제목을 묻지 않음
@@ -678,6 +807,58 @@ class RulesPart:
                     nr.set("charPrIDRef", cid)
                 parent.insert(at + 1 + k, nr)
             parent.remove(r)
+        self._tight_year_marks()
+
+    def _tight_year_marks(self):
+        """괄호·물결 바로 뒤 연도 표시 ’('(’26년 예산)', '’26.~’27.'): 휴먼명조 ’는 한 글자 폭에 점이 왼쪽에서 0.2글자 떨어져
+        '( ’26년'처럼 벌어져 보인다(사용자 2026-11-05 '괄호안에 ’26년 이런식으로 연도를 나타내면 간격이 넓다'). ’ 오른쪽 빈 곳은
+        tighten_quotes가 줄이고, 왼쪽은 앞 글자(괄호·물결)의 자간을 YEAR_MARK_PREV만큼 줄여 ’를 당긴다 — 잉크가 겹치지 않는 만큼
+        (글꼴 실측). 조각이 나뉘어 있어도 문단 글자 차례로 보고, 문단 보통 자간에서 재어 되풀이해도 같게. 바꾼 곳 수."""
+        n = 0
+        for p in self.sec.iter(T("hp:p")):
+            chars, count = [], {}
+            for r in para_runs(p):
+                if r.find(T("hp:t")) is None or len(r) != 1:
+                    chars.append((None, 0, ""))  # 조종·그림 조각은 끊김
+                    continue
+                sp = self.styles.char.get(r.get("charPrIDRef"), {}).get("spacing", 0)
+                for k, ch in enumerate(run_text(r)):
+                    chars.append((r, k, ch))
+                    count[sp] = count.get(sp, 0) + 1
+            if not count:
+                continue
+            mode = max(count, key=count.get)
+            hits = {}
+            for j in range(len(chars) - 2):
+                r, k, ch = chars[j]
+                r2, _, ch2 = chars[j + 1]
+                if r is None or r2 is None or ch not in YEAR_MARK_PREV or ch2 != "’" or not chars[j + 2][2].isdigit():
+                    continue
+                c = self.styles.char.get(r.get("charPrIDRef"), {})
+                if c.get("font") not in TIGHT_FONTS or self.metrics.em(self.styles.char.get(r2.get("charPrIDRef"), {}).get("font"), "’") < 0.9:
+                    continue
+                want = max(-50, mode + YEAR_MARK_PREV[ch])
+                if c.get("spacing", 0) > want:
+                    hits.setdefault(r, {})[k] = want
+            for r, ks in hits.items():
+                text = run_text(r)
+                pieces = []
+                for k, ch in enumerate(text):
+                    cid = self.hedit.char_spacing(r.get("charPrIDRef"), ks[k]) if k in ks else None
+                    if pieces and pieces[-1][1] == cid:
+                        pieces[-1] = (pieces[-1][0] + ch, cid)
+                    else:
+                        pieces.append((ch, cid))
+                parent = r.getparent()
+                at = list(parent).index(r)
+                for k, (t, cid) in enumerate(pieces):
+                    nr = self._mk(r, t)
+                    if cid:
+                        nr.set("charPrIDRef", cid)
+                    parent.insert(at + 1 + k, nr)
+                parent.remove(r)
+                n += len(ks)
+        return n
 
     # ------------------------------------------------------------ 번호·빈 줄
     def _proto_of(self, b):

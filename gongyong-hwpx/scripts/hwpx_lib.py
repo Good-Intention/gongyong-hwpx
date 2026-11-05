@@ -674,11 +674,15 @@ _MARK_RE = re.compile(
 
 
 def split_marker(text):
-    """'  ○ 내용' → ('  ○ ', '○', '내용'). 머리 기호가 없으면 ('', '', text)."""
+    """' ○ 내용' → (' ○ ', '○', '내용'). 머리 기호가 없으면 ('', '', text)."""
     m = _MARK_RE.match(text)
     if not m:
         return "", "", text
     mark = m.group("mark")
+    # '○○○ 추진계획(안)'처럼 같은 기호가 빈칸 없이 잇달아 오면 채울 자리를 보인 자리표시이지 머리 기호가 아니다
+    # (기본 양식 제목 상자 — 제목 '1. 업무용 차량 운영'의 번호를 견본 기호 '○'와 다르다며 빼던 것, 2026-11-05 사용자 요청).
+    if mark in _SYM and not m.group("gap") and text[m.end(): m.end() + 1] == mark:
+        return "", "", text
     # '**굵게**' 표시의 별표는 머리 기호가 아니다.
     if mark in "*＊" and text[m.start("mark") + 1: m.start("mark") + 2] in ("*", "＊"):
         return "", "", text

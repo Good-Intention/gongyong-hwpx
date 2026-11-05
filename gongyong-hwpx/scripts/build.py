@@ -10,7 +10,7 @@
         {"like": 0, "text": "○○ 추진 계획(안)"},                 # 견본 0번 문단 모양으로 글 넣기
         {"like": 5, "text": "추진 배경"},                        # 머리 기호(□ 등)는 견본 것을 그대로 붙임
         {"like": 6, "text": "**(현황)** 안내판 노후화 심화"},    # **…**는 견본 문단의 굵은 조각 모양
-        {"like": 6, "runs": [["  ○ ", 0], ["(현황)", 1], [" 내용", 2]]},  # 조각 모양을 직접 고름
+        {"like": 6, "runs": [[" ○ ", 0], ["(현황)", 1], [" 내용", 2]]},  # 조각 모양을 직접 고름
         {"like": 12, "table": [["구분", "현행"], ["대상", "100곳"]]},      # 표: 줄을 늘리거나 줄임
         {"like": 15, "cells": {"0,0": "참고1", "0,2": "세부 현황"}, "page_break": true},
         {"like": 2}                                              # 견본 문단 그대로(빈 줄 등)
@@ -207,6 +207,10 @@ class Builder(FillPart, RulesPart):
         if opts.get("basis_first", True):
             blocks = self.basis_first(blocks)
         self.keep_numbers = opts.get("keep_numbers", True)
+        body_pt = opts.get("body_pt")  # 표 글자의 기준 본문 크기(따로 지시가 있을 때만, 없으면 14pt — 사용자 2026-11-05)
+        if body_pt is not None and (not isinstance(body_pt, (int, float)) or not 8 <= body_pt <= 30):
+            raise BuildError(f"\"body_pt\"는 본문 글자 크기(pt) 숫자여야 합니다(받은 값: {body_pt!r}).")
+        self.body_pt = body_pt
         self.colons = opts.get("colons", True)
         if opts.get("join_titles", True):
             self.join_titles(blocks)
@@ -225,7 +229,9 @@ class Builder(FillPart, RulesPart):
         self.flow_gaps(out)
         self.lone_dashes(out)
         self.basis_notes(out)
+        self.ref_sole_titles(out)  # 참고 자체가 표 하나면 ■ 제목 줄을 빼고(머리표 제목이 표 제목) 검사
         self.table_titles(out)
+        self.flow_steps(out)
         self.check_endings(out)
         self.ref_bullets(out)
         if opts.get("keep_groups", True):

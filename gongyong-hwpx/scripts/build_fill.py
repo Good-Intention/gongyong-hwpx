@@ -12,10 +12,21 @@ class FillPart:
             r.remove(ch)
         return set_run_text(r, text, self.tab_proto)
 
+    def _nbsp(self, text, where):
+        """글 속 U+00A0·U+202F(줄 바꿈 안 되는 빈칸 글자)를 한글 묶음 빈칸(⍽ → hp:nbSpace)으로 바꾼다 — HY헤드라인M 같은
+        옛 글꼴에는 그 글자가 없어 한글이 네모로 보인다(사용자 제보 2026-11-05 '번호 뒤에 네모')."""
+        n = text.count(" ") + text.count(" ")
+        if not n:
+            return text
+        self.warn(f"{where}: 줄 바꿈 안 되는 빈칸 글자(U+00A0) {n}개는 한글 묶음 빈칸으로 바꿨습니다"
+                  "(HY헤드라인M 등에 그 글자가 없어 네모로 보임 — 계획에는 보통 빈칸이나 ⍽를 쓰세요).")
+        return text.replace(" ", "⍽").replace(" ", "⍽")
+
     def fill_text(self, p, text, where, marker=True, cell=False):
         """견본 문단 p(복사본)의 글을 text로 바꾼다. 머리 기호와 조각 모양은 견본 것을 쓴다."""
         if not isinstance(text, str):
             raise BuildError(f"{where}: text는 글(문자열)이어야 합니다.")
+        text = self._nbsp(text, where)
         runs = indexed_runs(p)
         lost = sorted({o for r in runs for o in run_objects(r)} - {"tbl"})
         if lost:
@@ -104,6 +115,7 @@ class FillPart:
             if not (isinstance(item, list) and len(item) == 2 and isinstance(item[0], str) and isinstance(item[1], int)):
                 raise BuildError(f"{where}: runs의 각 항목은 [글, 조각 번호] 모양이어야 합니다: {item!r}")
             text, k = item
+            text = self._nbsp(text, where)
             if not 0 <= k < len(src_runs):
                 raise BuildError(f"{where}: 조각 번호 {k}가 없습니다(견본 문단 {proto_idx}의 조각은 0~{len(src_runs) - 1}).")
             new_runs.append(self._mk(src_runs[k], text))
@@ -119,7 +131,8 @@ class FillPart:
             p.insert(at + k, r)
 
     # ------------------------------------------------------------ 표
-    def fill_cell(self, tc, value, where):
+    def fill_cell(self, tc, value, where, marker=True):
+        """칸 글 넣기. marker=False(블록의 "marker": false)면 글의 '1.'·'Ⅰ.'·'○' 등을 머리 기호로 보지 않고 글자 그대로 넣는다."""
         if value is None:  # 견본 글을 그대로 둠
             return
         if isinstance(value, dict):
@@ -132,9 +145,10 @@ class FillPart:
             raise BuildError(f"{where}: 표 칸 안에 문단이 없습니다.")
         sub = tc.find(T("hp:subList"))
         new_ps = []
+        use = marker
         for line in lines:
-            _, umark, _ = split_marker(line)
-            chosen, marker = None, True
+            _, umark, _ = split_marker(line) if use else ("", "", line)
+            chosen, marker = None, use
             for cp in protos:
                 _, m, _ = split_marker(para_text(cp))
                 if umark and m == umark:
@@ -143,7 +157,7 @@ class FillPart:
             if chosen is None and not umark:
                 chosen = next((cp for cp in protos if not split_marker(para_text(cp))[1]), None)
             if chosen is None:
-                chosen, marker = protos[0], bool(umark)
+                chosen, marker = protos[0], use and bool(umark)
             np = copy.deepcopy(chosen)
             drop_linesegs(np)
             self.fill_text(np, line, where, marker=marker, cell=True)
@@ -247,12 +261,12 @@ class FillPart:
                     raise BuildError(f"{where}: cells의 열쇠 '{key}'는 '줄,칸'(예: \"0,2\") 모양이어야 합니다.")
                 if (r, c) not in at:
                     raise BuildError(f"{where}: 칸({r},{c})이 없습니다. 있는 칸: {sorted(at)}")
-                self.fill_cell(at[(r, c)], val, f"{where} 칸({r},{c})")
+                self.fill_cell(at[(r, c)], val, f"{where} 칸({r},{c})", marker=block.get("marker", True))
         elif "text" in block:
             if len(grid) != 1:
                 raise BuildError(f"{where}: 칸이 {len(grid)}개인 표입니다. \"table\"(줄 목록)이나 "
                                  "\"cells\"({\"줄,칸\": 글})로 채우세요.")
-            self.fill_cell(grid[0][4], block["text"], where)
+            self.fill_cell(grid[0][4], block["text"], where, marker=block.get("marker", True))
 
     def flow_table(self, tbl, block, where):
         """도표(단계·흐름)는 그림 도형 대신 표로: 표 선은 모두 투명, 상자 칸만 실선, 상자 사이 칸에 화살표
@@ -270,8 +284,8 @@ class FillPart:
             raise BuildError(f"{where}: flow의 rows는 1 또는 2(상자 셋 이상일 때)여야 합니다.")
         trs = [tr for tr in tbl if tr.tag == T("hp:tr")]
         total = sum(int(tc.find(T("hp:cellSz")).get("width", "0")) for tc in trs[0] if tc.tag == T("hp:tc"))
-        # 상자 모양은 디자인 검토 권고(2026-11-01): 가로로 긴 상자(약 2.5:1) — 높이는 본문 두 줄(14mm) 공통,
-        # 너비는 (본문 폭 − 화살표 칸) ÷ 상자 수를 42mm까지. 42mm에 걸리면 가운데, 아니면 본문 폭에 꽉 채움.
+        # 상자 모양은 디자인 검토 권고(2026-11-01): 가로로 긴 상자 — 높이는 본문 두 줄(14mm) 공통, 너비는
+        # (본문 폭 − 화살표 칸) ÷ 상자 수로 본문 폭에 꽉 채움(한 줄은 42mm까지 — 상자가 셋 이하일 때만 걸려 가운데).
         gap, inner = FLOW_GAP_MM * HWPUNIT_PER_MM, 2 * FLOW_PAD_MM * HWPUNIT_PER_MM
         font = next((self.styles.char.get(r.get("charPrIDRef"), {}).get("font") for tc in trs[-1].iter(T("hp:tc"))
                      for cp in cell_paras(tc) for r in para_runs(cp)), None)
@@ -279,15 +293,12 @@ class FillPart:
         def text_w(line):  # 상자 글 한 줄의 폭(HWPUNIT, FLOW_PT 어림)
             return sum(self.metrics.em(font, ch) for ch in line) * FLOW_PT * 100
 
-        longest = max(text_w(line) for s in steps for line in str(s).split("\n"))
-
-        def box_w(k, lead=0):
-            return min((total - (k - 1 + lead) * gap) / k, FLOW_BOX_MAX_MM * HWPUNIT_PER_MM)
-
-        lines = forced or (2 if n > FLOW_ROW_MAX else 1)
-        if not forced and lines == 1 and n >= 4 and (
-                box_w(n) < FLOW_BOX_MIN_MM * HWPUNIT_PER_MM or longest > box_w(n) - inner):
-            lines = 2  # 한 줄이면 상자가 너무 좁거나 상자 글 한 줄이 넘침 → 두 줄
+        # 줄 수는 단계 수로 정한다(사용자 2026-11-05 '4, 5 한줄 6,7,8두줄'): 5개까지 한 줄, 6개부터 두 줄 — 좌우를 꽉 채움.
+        # (옛 판의 '상자가 좁거나 글이 넘치면 두 줄로'는 없앰 — 상자 글은 상자 안에서 줄을 바꿈)
+        lines = 2 if n > FLOW_ROW_MAX else 1
+        if forced and forced != lines:
+            self.warn(f"{where}: 도표 줄 수는 단계 수로 정합니다(4·5단계 한 줄, 6단계부터 두 줄 — 사용자 원칙) — "
+                      f"rows {forced} 대신 {lines}줄로 했습니다.")
         k = (n + 1) // 2 if lines == 2 else n  # 첫 줄 상자 수
         if lines == 2 and block.get("widths"):
             raise BuildError(f"{where}: 두 줄 도표에는 widths를 쓸 수 없습니다(칸 너비는 도구가 맞춤).")
@@ -297,16 +308,41 @@ class FillPart:
         # (빈 칸은 줄마다 이어 합쳐 좁은 칸이 따로 남지 않게 — 한글은 좁은 칸을 저절로 넓힘).
         glyph = sum(self.metrics.em(font, ch) for ch in arrow) * FLOW_ARROW_PT * 100
         ind = min(gap - HWPUNIT_PER_MM, (gap + glyph) / 2)
-        extra = ind if lines == 2 and n - k == k else 0  # 아랫줄 상자 수가 윗줄과 같으면 아랫줄이 ind만큼 더 김
+        cells2, bounds = None, None
         if block.get("widths"):
             widths, w, pad = list(block["widths"]), None, 0
+        elif lines == 2:
+            # 두 줄 도표는 두 줄 모두 좌우를 꽉 채운다(사용자 2026-11-05 '좌우가 꽉차게 2단으로' — 옛 판은 상자 너비를 두 줄
+            # 같게 두어 윗줄이 아랫줄 첫 → 폭만큼 짧았음). 윗줄 상자 너비 wt, 아랫줄은 첫 →(ind) 뒤라 wb를 따로 정하고, 두 줄의
+            # 칸 경계를 모아 잘게 나눈 뒤 상자·화살표 칸을 합친다(좁은 칸은 늘 합친 칸의 일부 — 따로 남지 않음).
+            m = n - k
+            wt = (total - (k - 1) * gap) / k
+            # 아랫줄 상자 수가 윗줄과 같으면(6·8단계) 첫 → 뒤를 꽉 채우는 너비, 하나 적으면(7단계) 윗줄 상자와 같은 너비로 두고
+            # 오른쪽 끝을 비운다(사용자 2026-11-05 '2번' — 상자 너비를 위아래 같게)
+            wb = (total - ind - (m - 1) * gap) / m if m == k else wt
+            cells2 = [[], []]
+            for j in range(k):
+                x0 = j * (wt + gap)
+                cells2[0].append((x0, x0 + wt, steps[j], True))
+                if j:
+                    cells2[0].append((x0 - gap, x0, arrow, False))
+            cells2[1].append((0.0, ind, arrow, False))  # 첫 상자 앞 →: 왼쪽 끝 = 윗줄 첫 상자 왼쪽 선
+            for j in range(m):
+                x0 = ind + j * (wb + gap)
+                cells2[1].append((x0, x0 + wb, steps[k + j], True))
+                if j:
+                    cells2[1].append((x0 - gap, x0, arrow, False))
+            bounds = []
+            for x in sorted({x for row in cells2 for c in row for x in c[:2]} | {0.0, float(total)}):
+                if not bounds or x - bounds[-1] > 50:  # 0.2mm 안의 경계는 하나로
+                    bounds.append(x)
+            bounds[-1] = float(total)
+            widths = [b1 - b0 for b0, b1 in zip(bounds, bounds[1:])]
+            w, pad = min(wt, wb), 0
         else:
-            w = min((total - (k - 1) * gap - extra) / k, FLOW_BOX_MAX_MM * HWPUNIT_PER_MM)
-            pad = (total - k * w - (k - 1) * gap - extra) / 2  # 남는 폭은 양옆 빈 칸으로(도표를 가운데에)
-            if lines == 1:
-                widths = [w if j % 2 == 0 else gap for j in range(2 * k - 1)]
-            else:
-                widths = ([ind, w - ind, ind, gap - ind] * k)[:4 * k - 2 + (1 if extra else 0)]
+            w = min((total - (k - 1) * gap) / k, FLOW_BOX_MAX_MM * HWPUNIT_PER_MM)  # 한 줄은 상한(늘어져 보이지 않게 가운데)
+            pad = (total - k * w - (k - 1) * gap) / 2  # 남는 폭은 양옆 빈 칸으로(도표를 가운데에)
+            widths = [w if j % 2 == 0 else gap for j in range(2 * k - 1)]
             if pad >= HWPUNIT_PER_MM:
                 widths = [pad] + widths + [pad]
             else:
@@ -342,17 +378,15 @@ class FillPart:
                     put(len(rows) - 1, 2 * j - 1, arrow, False)
             lead_arrow = None
         else:  # 둘째 줄도 왼쪽 → 오른쪽(아래로 가는 화살표는 쓰지 않음 — 사용자 의견 2026-11-01)
-            for j in range(k):  # 윗줄: 상자 = 칸 4j·4j+1, 화살표 = 칸 4j+2·4j+3
-                put(len(rows) - 1, 4 * j, steps[j], True, 2)
-                if j:
-                    put(len(rows) - 1, 4 * j - 2, arrow, False, 2)
+            def col(x):
+                return min(range(len(bounds)), key=lambda i: abs(bounds[i] - x))
+
+            for x0, x1, s, is_box in cells2[0]:  # 윗줄: 상자·화살표 칸을 경계에 맞춰 합침
+                put(len(rows) - 1, col(x0), s, is_box, col(x1) - col(x0))
             rows.append([""] * width_n)  # 줄 사이
             rows.append([""] * width_n)
-            put(len(rows) - 1, 0, arrow, False)  # 첫 상자 앞 →: 왼쪽 끝 = 윗줄 첫 상자 왼쪽 선(칸 왼쪽에 붙임)
-            for j, s in enumerate(steps[k:]):  # 아랫줄: 상자 = 칸 4j+1·4j+2, 그 앞 화살표 = 칸 4j−1·4j
-                put(len(rows) - 1, 4 * j + 1, s, True, 2)
-                if j:
-                    put(len(rows) - 1, 4 * j - 1, arrow, False, 2)
+            for x0, x1, s, is_box in cells2[1]:  # 아랫줄: 첫 → 칸(왼쪽에 붙임) + 상자·화살표
+                put(len(rows) - 1, col(x0), s, is_box, col(x1) - col(x0))
             lead_arrow = (len(rows) - 1, off)
         rows.append([""] * width_n)  # 아래 빈 줄
         for r, row in enumerate(rows):  # 빈 칸은 줄마다 이어 합친다(좁은 칸이 따로 남지 않게)

@@ -130,7 +130,9 @@ class Inspector:
         before = len(self.b.warnings)
         self.b.lone_dashes(self.paras)
         self.b.basis_notes(self.paras)
+        self.b.ref_sole_titles(self.paras, remove=False)
         self.b.table_titles(self.paras)
+        self.b.flow_steps(self.paras)
         self.b.check_endings(self.paras)
         self.fix += self.b.warnings[before:]
 

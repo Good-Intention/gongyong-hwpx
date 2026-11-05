@@ -500,31 +500,26 @@ class TableFit:
                  if run_text(r).strip()]
         return max(set(sizes), key=sizes.count) if sizes else 0
 
+    def _body_size(self):
+        """표 글자의 기준인 본문 글자 크기(pt): 계획의 "body_pt"(사용자가 따로 정했을 때), 없으면 BODY_PT(14pt) — 견본 글자
+        크기와 상관없이(사용자 2026-11-05 '별도의 지시가 없을시 기준은 14pt'). 표 글자는 여기서 TABLE_BODY_GAP만큼 작게."""
+        return int(getattr(self.b, "body_pt", None) or BODY_PT)
+
     def _fit_font(self, tbl, grid, n, merged, total, cur, width):
-        """표 글자 크기: 견본 크기(기본 양식 12pt)에서 1pt씩 TABLE_MIN_PT(10pt)까지 줄여 보며, 다음 줄로 넘어가는 줄이
-        가장 적은 크기를 쓴다(같으면 큰 글자). 머리 줄·내용 줄을 같은 만큼 줄인다. (이전 크기, 고른 크기) 또는 None."""
+        """표 글자 크기(사용자 원칙 2026-11-05 '표 안의 글씨는 본문보다 3포인트 작다 … 표를 한장에 넣기위해 줄이는 경우말고는
+        유지'): 본문 글자(_body_size)보다 TABLE_BODY_GAP(3pt) 작게 고정한다 — 칸 글이 다음 줄로 넘어간다고 줄이지 않고
+        칸 너비·한 줄로 입력으로 맞춘다(옛 '10pt까지 줄여 보기'는 없앰). 한 장에 넣으려고 줄이는 만큼은 fit_long_tables가
+        page_shrink에 적는다. 머리 줄·내용 줄을 같은 만큼 바꾼다. (이전 크기, 고른 크기) 또는 None."""
         if not self._is_data_table(tbl):
             return None
         main = self._main_size(tbl)
-        if main <= TABLE_MIN_PT:
+        if not main:
             return None
-        orig = [(r, r.get("charPrIDRef")) for r in self._table_runs(tbl)]
-
-        def resize(d):
-            for r, cid in orig:
-                r.set("charPrIDRef", cid if d == 0 else self.b.hedit.char_size(cid, d))
-
-        best = None
-        for s in range(main, TABLE_MIN_PT - 1, -1):
-            resize(s - main)
-            ws, _ = self._layout_widths(tbl, grid, n, merged, total, cur)
-            sc = self._table_score(tbl, grid, ws, total / width if width else 1.0)
-            if best is None or sc < best[0]:
-                best = (sc, s)
-            if sc == 0:
-                break
-        resize(best[1] - main)
-        return main, best[1]
+        want = self._body_size() - TABLE_BODY_GAP - getattr(self, "page_shrink", {}).get(tbl, 0)
+        if want != main:
+            for r in self._table_runs(tbl):
+                r.set("charPrIDRef", self.b.hedit.char_size(r.get("charPrIDRef"), want - main))
+        return main, want
 
     def _bullet_cells(self, tbl):
         """칸 안 글머리표 줄('· 항목' — 한 칸에 여러 내용을 넣을 때, 사용자 원칙 2026-11-01): 왼쪽 정렬, 왼쪽을 BULLET_PAD
@@ -805,6 +800,20 @@ class TableFit:
         self._set_widths(tbl, grid, [cur[0], need, total - cur[0] - need], total)
         return 1
 
+    def _box_blanks(self, tbl, grid):
+        """제목 걸친 상자 본문 칸(법령 조문 발췌 등)의 빈 줄을 뺀다(사용자 2026-11-05 참고1 근거법령 사진 '그림에 빈줄도 필요없애자'
+        — 조문과 ⑪ 항 사이 빈 줄). 글이 든 문단은 그대로, 문단 하나는 남긴다. 뺀 빈 줄 수."""
+        cap = self._caption_content(tbl, grid)
+        if cap is None:
+            return 0
+        paras = cell_paras(cap)
+        empty = [cp for cp in paras if not para_text(cp).strip() and not para_tables(cp) and not para_pics(cp)]
+        if len(empty) == len(paras):
+            empty = empty[1:]
+        for cp in empty:
+            cp.getparent().remove(cp)
+        return len(empty)
+
     def _box_left(self, tbl, grid):
         """제목 걸친 상자 본문 칸 글(법령 조문 등 인용)은 왼쪽 정렬: 글을 고칠 수 없는 인용이라 양쪽 정렬로 낱말 사이가
         벌어지지 않게(맑은 고딕은 어림 폭이 한글과 조금 달라 자간 당기기로는 못 맞춤, 2026-11-01 실측). 바꾼 문단 수."""
@@ -991,6 +1000,15 @@ class TableFit:
             done = 1
         return done
 
+    def _unit_money(self, p):
+        """표 문단 p 바로 위 기준·단위 줄이 금액 단위('(단위 : 천원)'·'백만원'·'억원'·'원')인가."""
+        prev = p.getprevious()
+        while prev is not None and (prev.tag != T("hp:p") or (not para_tables(prev) and UNIT_RE.match(para_text(prev)))):
+            if prev.tag == T("hp:p") and MONEY_UNIT_RE.search(para_text(prev)):
+                return True
+            prev = prev.getprevious()
+        return False
+
     def _fit_unit(self, p, size):
         """표 바로 위 기준·단위 줄 '(기준 : ’26.9월) (단위 : 백만원)'을 표 글자보다 UNIT_GAP(2pt) 작게."""
         prev = p.getprevious()
@@ -1015,7 +1033,7 @@ class TableFit:
         colon_tight = 0
         shrunk, left, cut_words, dot_breaks, bullets, balanced, note_font = [], [], [], 0, 0, 0, 0
         name_joined, desc_dots, three_info, borrowed, padded = 0, 0, [], 0, 0
-        text_gaps = titles = figures = 0
+        text_gaps = titles = figures = box_blanks = 0
         self.long_titles = []
         if not again:
             self.pad_orig = {}
@@ -1037,6 +1055,8 @@ class TableFit:
                         cur[c] = int(tc.find(T("hp:cellSz")).get("width", "0"))
                 if self._is_data_table(tbl) and tbl.get("pageBreak") == "CELL":
                     tbl.set("pageBreak", "TABLE")  # 쪽 경계에서 줄 사이로만 나눔('CELL'은 한 줄이 두 쪽으로 갈라짐, 한글 실측)
+                box_blanks += self._box_blanks(tbl, grid)
+                grid = table_grid(tbl)
                 padded += self._cell_pad(tbl)
                 figures += self._figure_sides(tbl)
                 self._tight_dates(tbl)
@@ -1067,21 +1087,26 @@ class TableFit:
                     tbl.find(T("hp:sz")).set("width", str(int(total)))
                 captions += self._caption_box(tbl, table_grid(tbl), self.lay.table_width(tbl))
                 images += self._image_layout(tbl, table_grid(tbl), self.lay.table_width(tbl))
-                # 숫자 열(내용 칸 대부분이 숫자·날짜)의 숫자 칸: 금액은 오른쪽 정렬(자릿수가 위아래로 맞게), 금액이 아닌 숫자
-                # (쪽 수·건수·대수, 시기·기간 같은 날짜)는 가운데 정렬(사용자 의견 2026-10-31). 글이 섞인 열의 숫자 하나는 그대로.
+                # 숫자 열(내용 칸 대부분이 숫자·날짜)의 숫자 칸: 금액과 수량 숫자(대수·건수·명·%·쪽 수 등)는 오른쪽 정렬 + 오른쪽
+                # 1.5mm(자릿수가 위아래로 맞게 — 사용자 2026-11-05 '대수·건수·명·%도 오른쪽', 옛 2026-10-31 '금액 아닌 숫자는 가운데'를
+                # 바꿈). 날짜·기간(시기·기한) 열과 연번·연도 같은 번호 열은 가운데. 글이 섞인 열의 숫자 하나는 그대로.
                 cols_cells, heads = {}, {}
                 for r, c, rs, cs, tc in grid:
-                    if r > 0 and cs == 1:
-                        cols_cells.setdefault(c, []).append(tc)
-                    elif r == 0:
+                    if r == 0 or tc.get("header") == "1":  # 머리 칸(두 줄 머리면 아랫줄 '국비·시비'도)은 열 이름으로
                         for k in range(c, c + cs):
-                            heads[k] = " ".join(para_text(cp) for cp in cell_paras(tc))
+                            heads[k] = (heads.get(k, "") + " " + " ".join(para_text(cp) for cp in cell_paras(tc))).strip()
+                    elif cs == 1:
+                        cols_cells.setdefault(c, []).append(tc)
+                unit_money = self._unit_money(p)
                 money_cols = set()
                 for c, tcs in cols_cells.items():
                     texts = [para_text(cp).strip() for tc in tcs for cp in cell_paras(tc)]
                     nums = [t for t in texts if t and (NUMERIC_RE.match(t) or DATE_RE.match(t))]
-                    if (bool(AMOUNT_HEAD_RE.search(heads.get(c, "").replace(" ", "")))
-                            or any(AMOUNT_CELL_RE.search(t) for t in nums)):
+                    head = re.sub(r"[\s⎵⍽]", "", heads.get(c, ""))
+                    bare = [t for t in texts if t and BARE_NUM_RE.match(t)]
+                    if (bool(AMOUNT_HEAD_RE.search(head)) or any(AMOUNT_CELL_RE.search(t) for t in nums)
+                            or (unit_money and bare and len(bare) >= 0.6 * len(nums) and not ID_HEAD_RE.search(head)
+                                and not RATE_HEAD_RE.search(head))):
                         money_cols.add(c)
                 for c, tcs in cols_cells.items():
                     texts = [para_text(cp).strip() for tc in tcs for cp in cell_paras(tc)]
@@ -1094,16 +1119,18 @@ class TableFit:
                              or (bool(money_cols) and bool(CHANGE_HEAD_RE.search(head)) and not RATE_HEAD_RE.search(head)))
                     if money:
                         self._neg_triangles(tcs)
+                    qty = [t for t in filled if NUMERIC_RE.match(t)]  # 날짜·기간('’26년'·'11월'·'12. 24.')이 아닌 수량 숫자
+                    right = money or (len(qty) >= 0.6 * len(filled) and not ID_HEAD_RE.search(head))
                     for tc in tcs:
                         for cp in cell_paras(tc):
                             t = para_text(cp).strip()
-                            # 숫자 칸의 '-'도 같은 쪽으로. 금액이 아닌 숫자·날짜 열의 짧은 말('상시'·'확인')도 가운데로 맞춰 열을 가지런히
+                            # 숫자 칸의 '-'도 같은 쪽으로. 가운데 열(날짜·번호)의 짧은 말('상시'·'확인')도 가운데로 맞춰 열을 가지런히
                             if BULLET_RE.match(t):
                                 continue  # 글머리표 줄은 왼쪽 정렬 그대로(_bullet_cells)
                             if (NUMERIC_RE.match(t) or DATE_RE.match(t) or t in ("-", "–", "―")
-                                    or (not money and t and len(t) <= 6)):
-                                pid = self.b.hedit.para_align(cp.get("paraPrIDRef"), "RIGHT" if money else "CENTER")
-                                if money:  # 금액은 오른쪽 정렬, 오른쪽 끝에 약간 띄움(사용자 원칙 2026-11-01)
+                                    or (not right and t and len(t) <= 6)):
+                                pid = self.b.hedit.para_align(cp.get("paraPrIDRef"), "RIGHT" if right else "CENTER")
+                                if right:  # 금액·수량은 오른쪽 정렬, 오른쪽 끝에 약간 띄움(사용자 원칙 2026-11-01·2026-11-05)
                                     pid = self.b.hedit.para_margin(pid, "right", MONEY_PAD)
                                 cp.set("paraPrIDRef", pid)
                 for _, _, _, _, tc in grid:
@@ -1154,13 +1181,10 @@ class TableFit:
             self.notes.append(f"표 제목이 한 줄을 넘습니다 — {len(self.long_titles)}개(" + ", ".join(f"‘{t}…’" for t in self.long_titles[:3])
                               + "): ■ 제목은 표 폭 안 한 줄로 줄이세요(기준일·출처는 단위 줄이나 표 아래 ※로).")
         if again:  # 두 번째 적용: 한 일은 첫 번째 알림에 있고, '남은 칸' 알림만 마지막 상태로 바꿔 적는다
-            self.notes[:] = [m for m in self.notes if "줄여도 다음 줄로 넘어가는 칸" not in m and "칸보다 긴 낱말" not in m]
-            if shrunk:
-                self.notes.append(f"표 {len(shrunk)}개는 다시 재어 표 글자를 한 단계 더 줄였습니다("
-                                  + ", ".join(sorted({f"{a}→{b}pt" for a, b in shrunk})) + ").")
-            if left:
-                self.notes.append(f"표 {len(left)}개는 줄여도 다음 줄로 넘어가는 칸이 남았습니다 — 칸 글을 줄이거나 칸을 합치면 "
-                                  "한 줄로 들어갑니다: " + ", ".join(f"‘{t}’" for t in left))
+            self.notes[:] = [m for m in self.notes if "다음 줄로 넘어가는 칸이 남았습니다" not in m and "칸보다 긴 낱말" not in m]
+            if left:  # (한 장에 넣으려고 표 글자를 줄인 것은 fit_long_tables가 알림)
+                self.notes.append(f"표 {len(left)}개는 다음 줄로 넘어가는 칸이 남았습니다(표 글자는 본문보다 {TABLE_BODY_GAP}pt 작게 "
+                                  "그대로) — 칸 글을 줄이거나 칸을 합치면 한 줄로 들어갑니다: " + ", ".join(f"‘{t}’" for t in left))
             if cut_words:
                 self.notes.append(f"칸보다 긴 낱말 {len(cut_words)}개는 한글이 글자 단위로 끊습니다(단어로 끊기 어긋남) — "
                                   "띄어 쓸 수 있는 말이면 띄우거나 줄이세요: " + ", ".join(f"‘{w}’" for w in cut_words))
@@ -1169,8 +1193,8 @@ class TableFit:
         if edge:
             msg.append(f"표 {edge}개의 왼쪽·오른쪽 끝을 본문 폭에 맞췄습니다(끝선 맞추기)")
         if shrunk:
-            msg.append(f"표 {len(shrunk)}개는 칸 글이 다음 줄로 덜 넘어가게 표 글자를 줄였습니다("
-                       + ", ".join(sorted({f"{a}→{b}pt" for a, b in shrunk})) + f", {TABLE_MIN_PT}pt까지)")
+            msg.append(f"표 {len(shrunk)}개는 표 글자를 본문보다 {TABLE_BODY_GAP}pt 작게 맞췄습니다("
+                       + ", ".join(sorted({f"{a}→{b}pt" for a, b in shrunk})) + ")")
         if cols:
             msg.append(f"표 {cols}개는 칸 글이 줄을 넘지 않게 칸 너비를 내용에 맞춰 나눴습니다")
         if wraps:
@@ -1196,6 +1220,8 @@ class TableFit:
             msg.append(f"배경 그림이 든 표 {images}개는 칸 너비·줄 높이를 그림 비율에 맞췄습니다(한 줄에 그림이 여럿이면 높이가 같게)")
         if boxes_left:
             msg.append(f"제목 걸친 상자 안 글 {boxes_left}문단은 왼쪽 정렬로 했습니다(인용 글 낱말 사이가 벌어지지 않게)")
+        if box_blanks:
+            msg.append(f"제목 걸친 상자(조문 발췌 등) 안 빈 줄 {box_blanks}개를 뺐습니다")
         if notes:
             msg.append(f"표 바로 뒤 ※가 붙는 표 {notes}개는 표 아래를 {NOTE_GAP / HWPUNIT_PER_MM:.1f}mm 띄웠습니다")
         if titles:
@@ -1221,8 +1247,8 @@ class TableFit:
         if msg:
             self.notes.append("; ".join(msg) + ".")
         if left:
-            self.notes.append(f"표 {len(left)}개는 줄여도 다음 줄로 넘어가는 칸이 남았습니다 — 칸 글을 줄이거나 칸을 합치면 "
-                              "한 줄로 들어갑니다: " + ", ".join(f"‘{t}’" for t in left))
+            self.notes.append(f"표 {len(left)}개는 다음 줄로 넘어가는 칸이 남았습니다(표 글자는 본문보다 {TABLE_BODY_GAP}pt 작게 "
+                              "그대로) — 칸 글을 줄이거나 칸을 합치면 한 줄로 들어갑니다: " + ", ".join(f"‘{t}’" for t in left))
         if cut_words:
             self.notes.append(f"칸보다 긴 낱말 {len(cut_words)}개는 한글이 글자 단위로 끊습니다(단어로 끊기 어긋남) — "
                               "띄어 쓸 수 있는 말이면 띄우거나 줄이세요: " + ", ".join(f"‘{w}’" for w in cut_words))

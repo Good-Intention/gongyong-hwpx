@@ -315,12 +315,78 @@ class PageFit:
             hs[-1] -= int(om.get("top", "0")) + int(om.get("bottom", "0"))
         return hs
 
-    def fit_long_tables(self):
+    def _table_group(self, paras, i, with_head=False):
+        """표 문단 i와 한 몸인 문단 번호들: 바로 위 기준·단위·■ 제목 줄(with_head면 그 위 참고 머리표까지) + 바로 아래 ※·* 줄."""
+        group = [i]
+        k = i - 1
+        while k >= 0 and not para_tables(paras[k]) and (UNIT_RE.match(para_text(paras[k]))
+                                                        or para_text(paras[k]).lstrip().startswith("■")):
+            group.insert(0, k)
+            k -= 1
+        if with_head and k >= 0 and self._is_ref_head(paras[k]):
+            group.insert(0, k)
+        k = i + 1
+        while k < len(paras) and not para_tables(paras[k]) and para_text(paras[k]).lstrip().startswith(("※", "*")):
+            group.append(k)
+            k += 1
+        return group
+
+    def _page_fonts(self):
+        """줄 높이를 글자 높이 + ROW_TIGHT까지 줄여도 한 장보다 긴 자료 표는 표 글자를 1pt씩(TABLE_MIN_PT까지) 줄여 한 장에
+        들어가는 가장 큰 크기를 page_shrink에 적는다(사용자 원칙 2026-11-05 '표 안의 글씨는 본문보다 3포인트 작다 … 표를
+        한장에 넣기위해 줄이는 경우말고는 유지'). 참고 쪽 표는 참고 머리표와 함께 잰다. 줄여도 안 들어가면 그대로(쪽 경계에서
+        줄 사이로 나뉨). 칸 너비는 지금 것으로 재므로(작은 글자에 맞춰 다시 나누면 더 줄어듦) 조심하는 쪽이다. 줄인 표 수."""
+        paras = self.paras()
+        lim = self.body_h - SAFETY
+        self.page_shrink = getattr(self, "page_shrink", {})
+        found = []
+        for i, p in enumerate(paras):
+            tbls = [t for t in para_tables(p) if self._is_data_table(t)]
+            if not tbls or self._is_ref_head(p):
+                continue
+            tbl = tbls[0]
+            group = self._table_group(paras, i, with_head=True)
+            base = self._row_heights(tbl)
+            runs = [(r, r.get("charPrIDRef")) for r in self._table_runs(tbl)]
+            size = self._main_size(tbl)
+
+            def tight_height():
+                self._set_rows(tbl, [1] * len(base))
+                floor = [max(n, self._main_size(tbl) * 100 + ROW_TIGHT) for n in self._row_heights(tbl)]
+                self._set_rows(tbl, floor)
+                return sum(self.lay.para_height(paras[g], self.body_w)[0] for g in group)
+
+            if tight_height() <= lim:
+                self._set_rows(tbl, base)
+                continue
+            pick = 0
+            for d in range(1, size - TABLE_MIN_PT + 1):
+                for r, cid in runs:
+                    r.set("charPrIDRef", self.b.hedit.char_size(cid, -d))
+                if tight_height() <= lim:
+                    pick = d
+                    break
+            for r, cid in runs:
+                r.set("charPrIDRef", cid)
+            self._set_rows(tbl, base)
+            if pick:
+                self.page_shrink[tbl] = self.page_shrink.get(tbl, 0) + pick
+                found.append(f"{size}→{size - pick}pt")
+        if found:
+            self.notes.append(f"줄 높이를 줄여도 한 장보다 긴 표 {len(found)}개는 한 장에 들어가게 표 글자를 줄였습니다("
+                              + ", ".join(sorted(set(found))) + " — ■ 제목·단위 줄·※도 함께, 사용자 원칙 '한 장에 넣을 때만 줄임').")
+        return len(found)
+
+    def fit_long_tables(self, again=False):
         """한 쪽을 조금 넘는 본문 표는 줄 높이를 줄여 한 쪽에 넣는다(사용자 원칙 2026-11-04 — '큰 표가 두 장에 걸치면 차라리
         밑으로 내려서 한 장에 딱 들어가게', '세부사업 예산 현황 행의 줄간격을 줄여야'). 표 + 바로 위 기준·단위·■ 제목 줄 +
         바로 아래 ※·* 줄의 높이가 쪽 높이를 넘으면, 줄마다 같은 만큼(글자 높이 + ROW_TIGHT 밑으로는 안 내림) 줄여 들어가는
         가장 작은 만큼만 줄인다. 그래도 안 들어가는 긴 표는 그대로(쪽 경계에서 줄 사이로 나뉨). 그러면 쪽 맞춤이 묶음째 다음 쪽으로
-        넘긴다(layout.paginate). 참고 쪽은 fit_refs가 따로 맞춘다. 줄인 표 수."""
+        넘긴다(layout.paginate). 참고 쪽은 fit_refs가 따로 맞춘다. 줄인 표 수.
+        줄 높이만으로 안 들어가는 표는 글자를 줄여 본다(_page_fonts — 사용자 2026-11-05 '표를 한장에 넣기위해 줄이는 경우')."""
+        if not again and self._page_fonts():
+            self.fit_tables(again=True)  # 줄인 글자에 맞춰 칸 너비·■ 제목·단위 줄·※를 다시(되풀이해도 같게 두 번)
+            self.fit_tables(again=True)
         paras = self.paras()
         lim = self.body_h - SAFETY
         stop = next((i for i, p in enumerate(paras) if self._is_ref_head(p)), len(paras))
