@@ -345,6 +345,8 @@ def main():
     ap.add_argument("--template", required=True, help="견본 hwpx")
     ap.add_argument("--plan", required=True, help="계획 파일(JSON)")
     ap.add_argument("--out", required=True, help="만들 hwpx")
+    ap.add_argument("--brief", action="store_true",
+                    help="글 차례를 빼고 보임(고쳐야 함을 고치며 다시 만들 때 — 전하기 전 마지막 판은 빼지 않음)")
     a = ap.parse_args()
     if os.path.abspath(a.template) == os.path.abspath(a.out):
         raise SystemExit("견본 파일에 덮어쓰지 않습니다. --out에 다른 이름을 주세요.")
@@ -366,6 +368,9 @@ def main():
     errors, notes, outline = check(a.out)
     fix = [w for w in b.warnings + b.fit_notes if FIX_RE.search(w)]
     info = [w for w in b.warnings + b.fit_notes if not FIX_RE.search(w)]
+    pages = next((w for w in info if w.startswith("어림 쪽 수")), "")
+    print(f"## 한눈에: 고쳐야 함 {len(fix) + len(notes)}건, 구조 검사 {'문제 있음' if errors else '통과'}"
+          + (f", {pages}" if pages else ""))
     if fix or errors or notes:
         print("## 고쳐야 함(전하기 전에 계획을 고쳐 다시 만들 것)")
         for w in fix:
@@ -378,8 +383,9 @@ def main():
     if tell:
         print("## 사용자에게 전할 말(결과를 건넬 때마다 빠짐없이 그대로 옮길 것)")
         print(" - " + tell)
-    print_report(errors, notes, outline)
-    sys.exit(1 if errors else 0)
+    print_report(errors, notes, None if a.brief else outline)
+    # 끝 번호: 0 = 고칠 것 없음, 1 = 구조 검사 문제(파일을 쓰면 안 됨), 3 = 파일은 만들었고 '고쳐야 함'이 남음
+    sys.exit(1 if errors else 3 if (fix or notes) else 0)
 
 
 def margin_note(pi):
