@@ -83,4 +83,8 @@
 | `scripts/` | 양식 읽기·문서 작성·검사·자동 맞춤 도구(인터넷 접속 없음) |
 | `assets/` | 기본 보고서 양식, 줄 바꿈 어림용 글꼴 폭 표 |
 
+- 저장소 맨 위의 `tests/`(시험)·`tools/`(스킬 파일 묶기)·`CLAUDE.md`(고치는 사람·AI용 안내)는 스킬 파일에 들어가지 않음
+- 시험: `pip install lxml pdfplumber` 뒤 `python -m unittest discover -s tests -v` — 문서 속 예시 검사, 출력 스냅숏, 예시 보고서를 한글 2024 PDF와 맞대기(쪽 수·본문 줄 바꿈)
+- 묶기: `python tools/package_skill.py` ⇒ `dist/gongyong-hwpx.skill`
+
 </details>
