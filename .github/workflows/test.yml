@@ -1,0 +1,32 @@
+# 올릴 때마다 시험을 돌리고, 스킬 파일을 묶어 받아 볼 수 있게 남긴다(Actions → 실행 → Artifacts).
+name: 시험
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 필요한 것 설치
+        run: pip install lxml
+      - name: 시험
+        run: python -m unittest discover -s tests -v
+      - name: 스킬 파일 묶기
+        run: python tools/package_skill.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gongyong-hwpx-skill
+          path: dist/gongyong-hwpx.skill
