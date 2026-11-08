@@ -17,20 +17,22 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from hwpx_lib import (T, Package, cell_paras, head_length, is_struct, marker_level, page_info, para_pics,  # noqa: E402
                       para_runs, para_tables, para_text, run_text, split_marker, table_grid, is_table_title)
-from build import (BASIS_TITLE_RE, DATE_LINE_RE, FIX_RE, ROMAN, SUMMARY_END_RE, BuildError, Builder,  # noqa: E402
-                   basis_exempt, margin_note, read_doc_meta)
+from build import (BASIS_TITLE_RE, DATE_LINE_RE, FIX_RE, OMIT_KEYS, ROMAN, SUMMARY_END_RE, BuildError, Builder,  # noqa: E402
+                   basis_exempt, margin_note, omit_hit, read_doc_meta)
 
-# 제목 상자 글이 이 말로 끝나면 근거법령 없이 시작하는 문서로 본다(style-guide 3-2 — 계획의 doc_type을 모를 때)
+# 제목 상자 글이 이 말로 끝나면 근거법령 없이 시작하는 문서로 본다(doc-types.md — 계획의 doc_type을 모를 때)
 TITLE_EXEMPT_RE = re.compile(r"(회의\s*자료|보도\s*자료|답변서?|주간\s*업무\s*보고|사업\s*설명서|보도\s*(관련\s*)?대응\s*보고)\s*(\(안\))?\s*$")
 from check import check  # noqa: E402
 from fit import Fitter, cover_end  # noqa: E402
 
 
 class Inspector:
-    def __init__(self, path, doc_type=None, basis=True, basis_searched=False):
+    def __init__(self, path, doc_type=None, basis=True, basis_searched=False, omit=()):
         self.path = path
         self.pkg = Package(path)
         self.b = Builder(self.pkg)
+        # 일부러 뺀 요소: --omit 또는 만들 때 남긴 표시(omit=date,summary …)
+        self.omit = set(omit) | {k for k in read_doc_meta(self.pkg).get("omit", "").split(",") if k in OMIT_KEYS}
         self.doc_type = doc_type  # 계획의 doc_type과 같은 뜻(--doc-type)
         self.basis_on = basis     # False면 근거법령 검사를 건너뜀(계획의 "basis_first": false와 같음, --no-basis)
         self.basis_searched = basis_searched  # 둘째 근거를 찾아봤지만 없음(계획의 basis_searched, --basis-searched)
@@ -67,6 +69,8 @@ class Inspector:
             return "--no-basis"
         if basis_exempt(self.doc_type):
             return f"문서 종류 ‘{self.doc_type}’"
+        if "basis" in self.omit:
+            return "근거법령을 일부러 뺀 문서(omit)"
         if meta.get("basis") == "off":
             return "만들 때 근거법령 검사를 끈 문서" + (f"(문서 종류 ‘{meta['doc_type']}’)" if meta.get("doc_type") else "")
         start = self.body_start()
@@ -82,7 +86,7 @@ class Inspector:
         """근거법령은 늘 1번: 로마자 장이면 Ⅰ., 아니면 첫 □ 근거법령(○ 둘 이상). 3-2 표의 예외 문서는 건너뜀."""
         why = self._basis_skip()
         if why:
-            self.info.append(f"{why} — 근거법령 없이 시작하는 문서라(style-guide 3-2) 근거법령 검사를 건너뜀.")
+            self.info.append(f"{why} — 근거법령 없이 시작하는 문서라(doc-types.md) 근거법령 검사를 건너뜀.")
             return
         start = self.body_start()
         heads = [(i, p) for i, p in enumerate(self.paras[start:], start)
@@ -294,6 +298,10 @@ class Inspector:
         self.title_and_summary()
         self.rules()
         after = self.dry_polish(tables)
+        if self.omit:  # 만들 때(또는 --omit) 일부러 뺀다고 한 요소의 지적은 알림으로
+            moved = [w for w in self.fix if omit_hit(w, self.omit)]
+            self.fix = [w for w in self.fix if w not in moved]
+            self.info += [f"(일부러 뺌 — omit) {w}" for w in moved]
         n0, n1 = page_count(pages), page_count(after) if after else None
         if self.polish and n1 is not None:
             self.polish.append(f"다듬으면 어림 쪽 수 {n0}쪽 → {n1}쪽" + (" — 쪽이 늘어나는 고침은 다듬기가 하지 않습니다(원본 쪽 수 지키기)"
@@ -322,10 +330,14 @@ def main():
     ap.add_argument("--no-basis", action="store_true", help="근거법령 검사를 건너뜀(계획의 \"basis_first\": false와 같음)")
     ap.add_argument("--basis-searched", action="store_true",
                     help="둘째 근거를 찾아봤지만 없음 — 근거법령 ○ 하나를 알림으로만(계획의 \"basis_searched\": true와 같음)")
+    ap.add_argument("--omit", default="", help="일부러 뺀 요소(쉼표로: date,summary,basis,table_title — 계획의 \"omit\"과 같음)")
     a = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
+    omit = [k.strip() for k in a.omit.split(",") if k.strip()]
+    if any(k not in OMIT_KEYS for k in omit):
+        raise SystemExit(f"--omit에는 {', '.join(OMIT_KEYS)} 가운데서만 쓸 수 있습니다(받은 값: {a.omit}).")
     try:
-        ins = Inspector(a.hwpx, doc_type=a.doc_type, basis=not a.no_basis, basis_searched=a.basis_searched)
+        ins = Inspector(a.hwpx, doc_type=a.doc_type, basis=not a.no_basis, basis_searched=a.basis_searched, omit=omit)
         pages, errors, notes = ins.run(tables=not a.no_tables)
     except BuildError as e:
         raise SystemExit(f"검사하지 못함 — {e}")

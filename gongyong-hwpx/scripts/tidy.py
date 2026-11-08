@@ -27,11 +27,13 @@ from collections import Counter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+from style_profile import P as PROFILE  # noqa: E402 — 기준값(assets/profile.json)
 from hwpx_lib import (HWPUNIT_PER_MM, T, HeaderEdit, Package, Styles, cell_paras, drop_linesegs,  # noqa: E402
                       head_length, is_blank, label_colon, label_content, marker_level, page_info, para_pics, para_runs,
                       para_tables, para_text, run_text, set_run_text, split_marker, table_grid)
 from layout import FIT_FLOOR, FW_EM, Layout, Metrics, spacing_after  # noqa: E402
 from spaces import compact_fw, lead_to_margin  # noqa: E402
+from build_base import DATE_LINE_RE, read_doc_meta  # noqa: E402
 
 FW = "⎵"  # 고정폭 빈칸(1/4 글자, 양쪽 정렬 때 늘어나지 않음)
 O_GAP_DEFAULT = 600  # ○ 위 간격 기본(6pt) — 문서에 ○ 위 간격을 쓴 곳이 없을 때(기본 양식 값)
@@ -40,7 +42,7 @@ HANG_MAX = 0.4  # 내어쓰기가 본문 폭의 이 비율을 넘으면(이름�
 NEAR_WRAP = 0.88  # 한 줄로 어림했어도 이만큼 차면 둘째 줄 맞춤을 걸어 둠(어림 오차로 한글이 줄을 넘길 수 있음)
 SHORT_LAST = 4  # 끝 줄에 이 글자 수 이하(빈칸 빼고)만 남으면 자간을 줄여 윗줄로 올림 — 사용자 원칙 '두서너 자'
 PUSH_LO, PUSH_HI = 5, 10  # 올리면 겹칠 때 끝 줄을 이만큼(빈칸 뺀 글자 수) 되게 내림 — 사용자 '다섯 글자 넘게'(작성 모드 7~10자). 가장 적게 내리는 자리를 골라 윗줄 빈 곳을 작게
-WIDEN_MAX = 5  # 자간을 늘릴 때 상한(%) — 사용자 원칙 '늘리는 것은 +5%까지'
+WIDEN_MAX = PROFILE["spacing_max_pct"]  # 자간을 늘릴 때 상한(%) — 사용자 원칙 '늘리는 것은 +5%까지'
 FULL = 0.95  # 윗줄을 이만큼 채우면 '빈 곳 없음'으로 봄
 PULL = 0.97  # 줄이 이보다 덜 차면(다음 낱말이 넘어가 빈칸이 벌어짐) 자간을 줄여 다음 낱말을 당김 — 사용자 원칙(작성 모드와 같음)
 SPARSE = 0.85  # 당기지 못하고 이보다 덜 차면 자간을 조금 늘려(+5%p까지) 빈칸이 덜 벌어지게
@@ -70,8 +72,9 @@ def flat(text):
 
 
 class Tidier:
-    def __init__(self, path, keep_o=True, gaps=None, blank_mm=None):
+    def __init__(self, path, keep_o=True, gaps=None, blank_mm=None, all_rules=False):
         self.path = path
+        self.all_rules = all_rules  # 작성 모드로 만든 문서도 모두 다시 맞춤(--all)
         self.blank_mm = blank_mm  # □ 앞 빈 줄을 이 높이(mm)에 가장 가까운 것으로(사용자가 고를 때)
         # ○ 줄에 '다음 문단과 함께'(○ 위 간격을 넣은 ○ 줄 전용 모양에만) — 사용자 결정 2026-11-08 "1"
         self.keep_o = keep_o
@@ -94,6 +97,10 @@ class Tidier:
         # 문단은 요소 자체를 열쇠로(lxml 요소의 id()는 다시 쓰일 수 있어 열쇠로 못 씀 — 첫 시험에서 '글자 바뀜' 오판)
         self.orig_text = {p: flat(para_text(p)) for p in self.all_paras()}
         self.page_of = self._orig_pages()
+        # 이 스킬의 작성 모드로 만든 문서(content.hpf 표시 made=판) — 작성 규칙이 맞춘 내어쓰기(낫표 당김·화살표 줄 포함)·
+        # 끝 줄·이름표·칸·간격을 정돈의 어림으로 다시 만지면 되돌리게 된다(평가 2026-11-08: 낫표 줄 내어쓰기 5.4 → 3.1mm,
+        # 화살표 줄 61.7 → 35.7mm). 그래서 내어쓰기가 아예 없는 문단(만든 뒤 사람이 더한 줄)·글자 단위 줄 나눔·빈칸만 손봄
+        self.made = "" if all_rules else read_doc_meta(self.pkg).get("made", "")
 
     # ------------------------------------------------------------ 바탕
     def all_paras(self):
@@ -332,6 +339,8 @@ class Tidier:
         pp = self.styles.para.get(p.get("paraPrIDRef"), {})
         if pp.get("align") in ("CENTER", "RIGHT"):
             return None
+        if self.made and pp.get("intent", 0) < 0:
+            return None  # 작성 모드가 이미 내어쓰기를 맞춘 문단(낫표 당김·화살표 줄 등 작성 규칙의 자리) — 그대로
         if re.search(r"\n[ ⎵⍽　]+", text):
             # 줄 바꿈(Shift+Enter) 뒤 빈칸으로 둘째 줄을 맞춘 문단 — 내어쓰기를 걸면 빈칸만큼 두 번 들어감. 글을 바꿔야 해서 그대로.
             # (줄 바꿈 뒤가 바로 글이면 한글은 그 줄도 둘째 줄로 내어쓰므로 아래에서 보통대로 맞춤 — 실험: 작성 도구가 끝 줄
@@ -1216,6 +1225,8 @@ class Tidier:
             text = para_text(p)
             if "  " not in text or re.fullmatch(r"\s*[가-힣](?: +[가-힣]){1,3}\s*", text):
                 continue
+            if DATE_LINE_RE.match(text):
+                continue  # 날짜·부서 줄('’26. 11. 2.(월)  ○○과')은 두 칸으로 갈라 둔 것
             k = head_length(text) if self.split(text)[1] else 0
             m0 = re.match(r"^[ ⎵⍽　]*", text)
             k = max(k, m0.end() if m0 else 0)
@@ -1300,19 +1311,29 @@ class Tidier:
         lines0 = self.line_counts()
         # 높이가 바뀌지 않는 것 먼저, 높이를 늘릴 수 있는 것(빈 줄·○ 위 간격)은 쪽 수를 재 보며 나중에
         self.word_wrap()
-        self.double_spaces()
-        self.sizes()
-        self.labels()
-        self.leading()  # 머리 자간을 같은 수준 값으로 맞춘 뒤에 — 그래야 줄머리 폭(여백)도 위아래 같은 값(○ 자리 한 줄로)
-        self.hangs()
-        self.sparse_lines()
-        self.short_lines()
-        self.fill_broken()
-        self.harmonize()
-        self.cell_middle()
-        self.blank_heights()
-        self.o_gaps()
-        self.one_space()
+        if not self.made:
+            self.double_spaces()  # 작성 문서의 글 속 빈칸은 계획에 적은 그대로(날짜·부서 줄 '…(월)  ○○과' 등)
+        if self.made:
+            # 작성 모드로 만든 문서: 작성 규칙이 맞춘 것은 그대로, 사람이 더한 줄(내어쓰기 없음)·줄 나눔·빈칸만
+            self.leading()
+            self.hangs()
+            self.one_space()
+            self.notes.insert(0, f"이 스킬의 작성 모드로 만든 문서(판 {self.made})라 작성 규칙이 맞춘 끝 줄·이름표·내어쓰기·칸·간격은 "
+                                 "그대로 두고, 내어쓰기가 없는 문단(만든 뒤 더한 줄)·글자 단위 줄 나눔·빈칸만 손봤습니다 — "
+                                 "글을 크게 고쳤으면 계획을 고쳐 다시 만드는 것이 정확합니다(모두 다시 맞추려면 --all).")
+        else:
+            self.sizes()
+            self.labels()
+            self.leading()  # 머리 자간을 같은 수준 값으로 맞춘 뒤에 — 그래야 줄머리 폭(여백)도 위아래 같은 값(○ 자리 한 줄로)
+            self.hangs()
+            self.sparse_lines()
+            self.short_lines()
+            self.fill_broken()
+            self.harmonize()
+            self.cell_middle()
+            self.blank_heights()
+            self.o_gaps()
+            self.one_space()
         now = self.line_counts()
         grown = [p for p, k in lines0.items() if now.get(p, k) > k]
         if grown:
@@ -1359,6 +1380,8 @@ def main():
                     help="○ 줄에 '다음 문단과 함께'를 넣지 않음(기본은 넣음 — ○ 제목이 쪽 끝에 홀로 남지 않게)")
     ap.add_argument("--gap", type=float, help="○ 위 간격(pt)을 이 값 하나로만 해 봄(시험용)")
     ap.add_argument("--blank-mm", type=float, help="□ 앞 빈 줄 높이가 제각각일 때 이 높이(mm)에 가장 가까운 빈 줄로 모두 맞춤")
+    ap.add_argument("--all", action="store_true",
+                    help="이 스킬의 작성 모드로 만든 문서도 정돈 규칙으로 모두 다시 맞춤(기본은 작성 규칙이 맞춘 것을 그대로 둠)")
     a = ap.parse_args()
     if not a.path.lower().endswith(".hwpx"):
         raise SystemExit("정돈은 한글(HWPX) 파일만 받습니다. PDF·그림 문서는 '옮겨 쓰기'(내용 그대로 새로 만들기)로 하세요."
@@ -1366,7 +1389,8 @@ def main():
     out = a.out or re.sub(r"\.hwpx$", "", a.path, flags=re.I) + "_정돈.hwpx"
     if os.path.abspath(out) == os.path.abspath(a.path):
         raise SystemExit("결과를 원본과 같은 이름으로 저장하지 않습니다 — 다른 이름을 주세요.")
-    t = Tidier(a.path, keep_o=not a.no_keep_o, gaps=[int(round(a.gap * 100))] if a.gap else None, blank_mm=a.blank_mm)
+    t = Tidier(a.path, keep_o=not a.no_keep_o, gaps=[int(round(a.gap * 100))] if a.gap else None, blank_mm=a.blank_mm,
+               all_rules=a.all)
     before, after, bad = t.run(out)
     t.report(before, after, bad, out)
 

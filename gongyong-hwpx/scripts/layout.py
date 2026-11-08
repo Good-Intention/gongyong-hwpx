@@ -11,6 +11,7 @@
 import json
 import os
 
+from style_profile import P as PROFILE  # noqa: E402 — 기준값(assets/profile.json)
 from hwpx_lib import UNIT_RE, T, cell_paras, head_length, para_pics, para_runs, para_tables, para_text, run_text, table_grid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -40,7 +41,7 @@ OPEN = set("([{<‘“「『【〈《")
 SPACES = {" ", "　", "⍽"}  # 빈칸, 전각 빈칸, 묶음 빈칸(⍽ — 끊지 않음)
 
 
-FIT_FLOOR = -18  # 줄 맞춤이 자간을 줄이는 하한(fit_base.FLOOR와 같게). 어림의 기본 바닥값도 이것 — 옛 기본 -10이면 자간을
+FIT_FLOOR = PROFILE["spacing_min_pct"]  # 줄 맞춤이 자간을 줄이는 하한(fit_base.FLOOR와 같게). 어림의 기본 바닥값도 이것 — 옛 기본 -10이면 자간을
                  # 더 줄여 보며 잴 때 -10%보다 이미 줄인 조각을 더 줄이지 않는 것으로 세어 맞춤 단계(-18%)와 어긋났음(사용자 작업 2026-11-06)
 
 

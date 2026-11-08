@@ -41,6 +41,7 @@ class Builder(FillPart, RulesPart):
         self.metrics = Metrics()
         self.keep_numbers = True
         self.colons = True
+        self.omit = set()  # 계획 "omit"(사용자가 일부러 뺀 요소)
         self.sec_names = pkg.sections()
         self.sec = pkg.xml(self.sec_names[0])
         self.protos = [p for p in self.sec if p.tag == T("hp:p")]
@@ -206,12 +207,19 @@ class Builder(FillPart, RulesPart):
         blocks = [dict(b, _src=n + 1) if isinstance(b, dict) else b for n, b in enumerate(blocks)]
         blocks = self.table_units(blocks)  # 이름표 맞추기 등이 '(기준 : …)'을 괄호 이름표로 다루기 전에
         self.doc_type = str(opts.get("doc_type") or "").strip()
+        omit = opts.get("omit") or []
+        omit = [omit] if isinstance(omit, str) else omit
+        unknown = [x for x in omit if x not in OMIT_KEYS]
+        if not isinstance(omit, list) or unknown:
+            raise BuildError(f"\"omit\"에는 {', '.join(OMIT_KEYS)} 가운데서만 쓸 수 있습니다(받은 값: {unknown or omit!r}) — "
+                             + ", ".join(f"{k} = {v[0]}" for k, v in OMIT_KEYS.items()) + ".")
+        self.omit = set(omit)
         self.basis_searched = bool(opts.get("basis_searched"))  # 둘째 근거를 찾아봤지만 없음 → ○ 하나여도 알림만
-        self.basis_off = not opts.get("basis_first", True) or basis_exempt(self.doc_type)
+        self.basis_off = not opts.get("basis_first", True) or basis_exempt(self.doc_type) or "basis" in self.omit
         if not self.basis_off:
             blocks = self.basis_first(blocks)
         elif basis_exempt(self.doc_type):
-            self.warn(f"문서 종류 ‘{self.doc_type}’는 근거법령 없이 시작하는 문서라(style-guide 3-2) 근거법령 검사를 건너뛰었습니다.")
+            self.warn(f"문서 종류 ‘{self.doc_type}’는 근거법령 없이 시작하는 문서라(doc-types.md) 근거법령 검사를 건너뛰었습니다.")
         self.keep_numbers = opts.get("keep_numbers", True)
         body_pt = opts.get("body_pt")  # 표 글자의 기준 본문 크기(따로 지시가 있을 때만, 없으면 14pt — 사용자 2026-11-05)
         if body_pt is not None and (not isinstance(body_pt, (int, float)) or not 8 <= body_pt <= 30):
@@ -229,14 +237,20 @@ class Builder(FillPart, RulesPart):
         if opts.get("table_notes", True):
             self.table_notes(blocks)
         self.cover_break(blocks)
-        self.check_summary(blocks)
-        self.check_date_line(blocks)
+        if "summary" not in self.omit:
+            self.check_summary(blocks)
+        if "date" not in self.omit:
+            self.check_date_line(blocks)
+        if self.omit:
+            self.warn("계획에서 일부러 뺀다고 한 것(omit — " + "·".join(OMIT_KEYS[k][0] for k in sorted(self.omit))
+                      + ")은 검사하지 않고, 그에 대한 지적은 알림으로만 둡니다(만든 문서에 표시가 남아 검사만도 같음).")
         out = [self.make_block(n, b) for n, b in enumerate(blocks)]
         self.flow_gaps(out)
         self.lone_dashes(out)
         self.basis_notes(out)
         self.ref_sole_titles(out)  # 참고 자체가 표 하나면 ■ 제목 줄을 빼고(머리표 제목이 표 제목) 검사
-        self.table_titles(out)
+        if "table_title" not in self.omit:
+            self.table_titles(out)
         self.flow_steps(out)
         self.check_endings(out)
         self.ref_bullets(out)
@@ -262,8 +276,8 @@ class Builder(FillPart, RulesPart):
             self.sec.append(p)
         if opts.get("word_wrap", True):
             self.word_wrap()
-        if opts.get("paren_small", 2):
-            self.small_parens(opts.get("paren_small", 2))
+        if opts.get("paren_small", PROFILE["paren_smaller_pt"]):
+            self.small_parens(opts.get("paren_small", PROFILE["paren_smaller_pt"]))
         if opts.get("note_small", True):
             self.small_notes()
         if opts.get("square_small", True):
@@ -362,7 +376,11 @@ class Builder(FillPart, RulesPart):
             t = hpf.find(".//{http://www.idpf.org/2007/opf/}title")
             if t is not None:
                 t.text = plan["title"]
-        meta = {}  # 검사만(review)이 같은 판단을 하게 표시를 남김
+        # 검사만(review)·정돈(tidy)이 같은 판단을 하게 표시를 남김 — made=판: 이 스킬의 작성 모드로 만든 문서(정돈이 작성 규칙이
+        # 맞춘 내어쓰기·끝 줄·이름표·칸·간격을 다시 만지지 않게, 평가 2026-11-08 '정돈이 작성 결과를 되돌린다')
+        meta = {"made": SKILL_VERSION}
+        if getattr(self, "omit", None):
+            meta["omit"] = ",".join(sorted(self.omit))
         if getattr(self, "basis_off", False):
             meta.update({k: v for k, v in (("doc_type", self.doc_type), ("basis", "off")) if v})
         if getattr(self, "basis_searched", False):
@@ -401,8 +419,9 @@ def main():
     if b.image_notes:
         b.warnings.append(f"표 칸 배경 그림 {len(b.image_notes)}개를 넣었습니다({', '.join(b.image_notes)}) — 칸 높이를 그림 비율에 맞춤.")
     errors, notes, outline = check(a.out)
-    fix = [w for w in b.warnings + b.fit_notes if FIX_RE.search(w)]
-    info = [w for w in b.warnings + b.fit_notes if not FIX_RE.search(w)]
+    is_fix = lambda w: FIX_RE.search(w) and not omit_hit(w, b.omit)  # noqa: E731 — 뺀다고 한 요소의 지적은 알림으로
+    fix = [w for w in b.warnings + b.fit_notes if is_fix(w)]
+    info = [w for w in b.warnings + b.fit_notes if not is_fix(w)]
     pages = next((w for w in info if w.startswith("어림 쪽 수")), "")
     print(f"## 한눈에: 고쳐야 함 {len(fix) + len(notes)}건, 구조 검사 {'문제 있음' if errors else '통과'}"
           + (f", {pages}" if pages else ""))
