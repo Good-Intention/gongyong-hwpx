@@ -195,7 +195,15 @@ class LineFit:
                 continue
             s1, e1, _, _ = lines[0]
             head = head_length(para_text(p))
-            arrows = [i for i in range(s1, e1) if chs[i][0] in ARROWS and i > head]
+            depth, inside = 0, set()  # 괄호 안 글자 자리 — '(’25년 316대 → ’26년 336대)'처럼 괄호 안 화살표는 범위·변화 표시라
+            for i, c in enumerate(chs):  # 글의 갈래가 아니다(둘째 줄을 그 뒤 82mm에 맞추던 것, 사용자 작업 2026-11-06)
+                if c[0] in "(（[〔":
+                    depth += 1
+                elif c[0] in ")）]〕":
+                    depth = max(0, depth - 1)
+                elif depth:
+                    inside.add(i)
+            arrows = [i for i in range(s1, e1) if chs[i][0] in ARROWS and i > head and i not in inside]
             if not arrows:
                 continue
             a = arrows[-1]  # 첫 줄의 마지막 화살표 — 그 뒤 내용이 둘째 줄로 갈라짐
@@ -278,8 +286,17 @@ class LineFit:
             new = t[:cut].replace(" ", FW * self.b._fw_per_space(r)) + t[cut:]
             if new != t and len(r) == 1:
                 set_run_text(r, new, self.b.tab_proto)
+        # 내어쓰기 = 맞춤 기준으로 고른 화살표 a 뒤 첫 글자까지의 폭(옛 판은 문단의 마지막 화살표로 재어, 괄호 안 화살표 등
+        # 기준과 다른 화살표에 맞출 수 있었음). 빈칸이 고정폭 빈칸 여럿으로 바뀌어 글자 번호가 밀렸으니 a번째 화살표를 다시 찾는다
+        nth = sum(1 for c in chs[:a + 1] if c[0] in ARROWS)
         text = para_text(p)
-        k2 = next((i + 1 for i in range(len(text) - 1, -1, -1) if text[i] in ARROWS), 0)
+        seen, k2 = 0, 0
+        for i, ch in enumerate(text):
+            if ch in ARROWS:
+                seen += 1
+                if seen == nth:
+                    k2 = i + 1
+                    break
         while k2 < len(text) and text[k2] in " ⎵⍽":
             k2 += 1
         hang = sum(c[1] for c in self.lay.chars(p)[:k2])

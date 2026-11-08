@@ -23,6 +23,7 @@ from build_base import *  # noqa: F401,F403
 from hwpx_lib import _base_head  # noqa: E402,F401 — 밑줄 이름은 *로 안 넘어옴
 from build_fill import FillPart  # noqa: E402
 from build_rules import RulesPart  # noqa: E402
+from spaces import compact_fw, lead_to_margin  # noqa: E402
 
 
 class Builder(FillPart, RulesPart):
@@ -204,8 +205,13 @@ class Builder(FillPart, RulesPart):
         opts = plan if isinstance(plan, dict) else {}
         blocks = [dict(b, _src=n + 1) if isinstance(b, dict) else b for n, b in enumerate(blocks)]
         blocks = self.table_units(blocks)  # 이름표 맞추기 등이 '(기준 : …)'을 괄호 이름표로 다루기 전에
-        if opts.get("basis_first", True):
+        self.doc_type = str(opts.get("doc_type") or "").strip()
+        self.basis_searched = bool(opts.get("basis_searched"))  # 둘째 근거를 찾아봤지만 없음 → ○ 하나여도 알림만
+        self.basis_off = not opts.get("basis_first", True) or basis_exempt(self.doc_type)
+        if not self.basis_off:
             blocks = self.basis_first(blocks)
+        elif basis_exempt(self.doc_type):
+            self.warn(f"문서 종류 ‘{self.doc_type}’는 근거법령 없이 시작하는 문서라(style-guide 3-2) 근거법령 검사를 건너뛰었습니다.")
         self.keep_numbers = opts.get("keep_numbers", True)
         body_pt = opts.get("body_pt")  # 표 글자의 기준 본문 크기(따로 지시가 있을 때만, 없으면 14pt — 사용자 2026-11-05)
         if body_pt is not None and (not isinstance(body_pt, (int, float)) or not 8 <= body_pt <= 30):
@@ -282,10 +288,33 @@ class Builder(FillPart, RulesPart):
             f.spread_pages()
             f.fit_refs()
             f.fit_cover()
+            if opts.get("one_space", True):
+                self.one_space()  # 낫표 당기기 앞에: 당기기가 빈칸 한 개(장평 두 배)의 자간을 줄여 '당김' 표시가 남게
             if opts.get("pull_corner", True):
                 f.pull_corners()  # 맨 마지막: 내어쓰기를 다시 재는 단계들 뒤에(아랫줄은 그대로, 낫표만 당김)
             self.fit_notes = f.notes + [f.report()]
+        elif opts.get("one_space", True):
+            self.one_space()
         self._finish(opts)
+
+    def one_space(self):
+        """빈칸 한 칸(spaces.py — 정돈과 같은 규칙, 사용자 2026-11-08 '작성도 바꾸기'): 맞춤을 다 끝낸 뒤 머리의 고정폭 빈칸
+        두 개(보통 빈칸 한 칸 폭)를 장평 두 배 고정폭 빈칸 한 개로, 머리 기호 앞 줄머리 빈칸을 문단 여백으로. 폭이 같아 줄·쪽
+        나눔과 둘째 줄 맞춤은 그대로이고, 조판 부호를 켜면 한 칸에 빈칸 부호가 하나만 보인다."""
+        lay = Layout(self.styles, self.metrics)
+        split = lambda t: split_marker(t)  # noqa: E731
+        ham = {"함초롬바탕", "함초롬돋움"}
+
+        def fonts_ok(p):
+            fonts = {self.styles.char.get(r.get("charPrIDRef"), {}).get("font") for r in para_runs(p)
+                     if r.find(T("hp:t")) is not None and run_text(r).strip()}
+            return all(self.metrics.checked(f) or f in ham for f in fonts if f)
+
+        paras = [p for p in self.sec.iter(T("hp:p")) if not (para_tables(p) or para_pics(p))]
+        for p in paras:
+            lead_to_margin(p, self.styles, self.hedit, lay, split, fonts_ok, self.tab_proto, 10 ** 6)
+        for p in paras:
+            compact_fw(p, self.styles, self.hedit, split, self.tab_proto)
 
     # ------------------------------------------------------------ 마무리
     def _drop_unused_images(self):
@@ -333,6 +362,12 @@ class Builder(FillPart, RulesPart):
             t = hpf.find(".//{http://www.idpf.org/2007/opf/}title")
             if t is not None:
                 t.text = plan["title"]
+        meta = {}  # 검사만(review)이 같은 판단을 하게 표시를 남김
+        if getattr(self, "basis_off", False):
+            meta.update({k: v for k, v in (("doc_type", self.doc_type), ("basis", "off")) if v})
+        if getattr(self, "basis_searched", False):
+            meta["basis_searched"] = "yes"
+        write_doc_meta(self.pkg, meta)
         text = "\r\n".join(para_text(p) for p in self.sec if p.tag == T("hp:p"))
         if "Preview/PrvText.txt" in self.pkg.data:
             self.pkg.data["Preview/PrvText.txt"] = text[:1000].encode("utf-16-le")
@@ -345,6 +380,8 @@ def main():
     ap.add_argument("--template", required=True, help="견본 hwpx")
     ap.add_argument("--plan", required=True, help="계획 파일(JSON)")
     ap.add_argument("--out", required=True, help="만들 hwpx")
+    ap.add_argument("--brief", action="store_true",
+                    help="글 차례를 빼고 보임(고쳐야 함을 고치며 다시 만들 때 — 전하기 전 마지막 판은 빼지 않음)")
     a = ap.parse_args()
     if os.path.abspath(a.template) == os.path.abspath(a.out):
         raise SystemExit("견본 파일에 덮어쓰지 않습니다. --out에 다른 이름을 주세요.")
@@ -366,6 +403,9 @@ def main():
     errors, notes, outline = check(a.out)
     fix = [w for w in b.warnings + b.fit_notes if FIX_RE.search(w)]
     info = [w for w in b.warnings + b.fit_notes if not FIX_RE.search(w)]
+    pages = next((w for w in info if w.startswith("어림 쪽 수")), "")
+    print(f"## 한눈에: 고쳐야 함 {len(fix) + len(notes)}건, 구조 검사 {'문제 있음' if errors else '통과'}"
+          + (f", {pages}" if pages else ""))
     if fix or errors or notes:
         print("## 고쳐야 함(전하기 전에 계획을 고쳐 다시 만들 것)")
         for w in fix:
@@ -378,8 +418,9 @@ def main():
     if tell:
         print("## 사용자에게 전할 말(결과를 건넬 때마다 빠짐없이 그대로 옮길 것)")
         print(" - " + tell)
-    print_report(errors, notes, outline)
-    sys.exit(1 if errors else 0)
+    print_report(errors, notes, None if a.brief else outline)
+    # 끝 번호: 0 = 고칠 것 없음, 1 = 구조 검사 문제(파일을 쓰면 안 됨), 3 = 파일은 만들었고 '고쳐야 함'이 남음
+    sys.exit(1 if errors else 3 if (fix or notes) else 0)
 
 
 def margin_note(pi):

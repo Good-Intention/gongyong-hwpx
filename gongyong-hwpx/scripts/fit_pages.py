@@ -97,10 +97,15 @@ class PageFit:
                         p.set("paraPrIDRef", self.b.hedit.para_line(pid, SPACER_LINE))
 
             def line_to(v):
+                # 본문 줄 간격(가장 많이 쓴 값)을 v로 낮추고, 그보다 넓은 줄(제목 250·190·170% 등)은 같은 폭(본문 − v)만큼만
+                # 낮춰 위계를 지킨다 — 옛 판은 v보다 넓은 줄을 모두 v로 맞춰 제목이 본문과 같아졌음(사용자 작업 2026-11-06)
+                d = body - v
                 for p in texts:
                     pid = saved[p][0]
-                    if self.st.para.get(pid, {}).get("line", 0) > v:
-                        p.set("paraPrIDRef", self.b.hedit.para_line(pid, v))
+                    cur = self.st.para.get(pid, {}).get("line", 0)
+                    new = cur - d if cur >= body else (v if cur > v else cur)
+                    if new != cur:
+                        p.set("paraPrIDRef", self.b.hedit.para_line(pid, new))
 
             def shrink_spacers2():
                 # 그래도 모자라면 □ 사이 빈 줄을 70%까지 — 표 위·아래 여백은 지키고 위쪽을 줄임(사용자 2026-11-05)
@@ -126,7 +131,9 @@ class PageFit:
                         p.set("paraPrIDRef", self.b.hedit.para_margin(pid, "prev", pv // 2))
 
             # 덜 바꾸는 것부터: 줄 간격을 5%씩 낮춰 보고(사용자 지시 '줄간 조정'), 그다음 □ 사이 빈 줄 좁히기를 더한다
-            top = max((self.st.para.get(saved[p][0], {}).get("line", 0) for p in texts), default=0)
+            lines_now = [self.st.para.get(saved[p][0], {}).get("line", 0) for p in texts]
+            body = max(set(lines_now), key=lines_now.count) if lines_now else 0  # 본문 줄 간격(가장 많이 쓴 값)
+            top = body  # 비용·단계는 본문 줄 간격 기준(제목 줄은 같은 폭만큼만 따라 낮춤 — line_to)
             steps = list(range(top - 5, MIN_LINE - 1, -5)) if top > MIN_LINE else []
             # 바꾸는 정도(덜 바꿀수록 좋음): 줄 간격은 낮춘 %만큼, □ 사이 빈 줄 좁히기는 줄 간격 10%쯤으로 친다
             # — 같은 쪽 수라면 본문 140%보다 '빈 줄 좁힘 + 155%'가 덜 답답하다(2026-10-31)

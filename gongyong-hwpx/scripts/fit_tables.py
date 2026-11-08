@@ -1225,7 +1225,7 @@ class TableFit:
         if notes:
             msg.append(f"표 바로 뒤 ※가 붙는 표 {notes}개는 표 아래를 {NOTE_GAP / HWPUNIT_PER_MM:.1f}mm 띄웠습니다")
         if titles:
-            msg.append(f"■ 표 제목 {titles}줄은 표 글꼴 굵게·표 글자 크기로, 단위 줄이 제목 쪽으로 붙게 맞췄습니다")
+            msg.append(f"■ 표 제목 {titles}줄은 표 글꼴 굵게·표 글자보다 {TITLE_UP}pt 크게, 단위 줄이 제목 쪽으로 붙게 맞췄습니다")
         if figures:
             msg.append(f"그래프 상자(그림 칸이 든 한 열 표) {figures}개는 양옆에 선을 둘렀습니다")
         if text_gaps:

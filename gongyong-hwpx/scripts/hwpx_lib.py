@@ -498,6 +498,20 @@ class HeaderEdit:
             self.cache[key] = new.get("id")
         return self.cache[key]
 
+    def char_ratio(self, cid, ratio):
+        """장평(%)만 바꾼 글자 모양. 고정폭 빈칸(글자 크기 1/4) 하나에 장평 200%를 주면 보통 빈칸 한 칸 폭(0.5글자)이 된다
+        (한글 2024 실측 0.498) — 고정폭 빈칸 두 개 대신 한 개로(조판 부호 한 칸, 사용자 2026-11-08)."""
+        key = ("ratio", cid, ratio)
+        if key not in self.cache:
+            new = self._clone("hh:charProperties", "hh:charPr", cid)
+            rt = new.find(T("hh:ratio"))
+            if rt is not None:
+                for k in list(rt.attrib):
+                    rt.set(k, str(ratio))
+            self.styles.char[new.get("id")] = self.styles._char(new)
+            self.cache[key] = new.get("id")
+        return self.cache[key]
+
     def char_spacing(self, cid, spacing):
         """자간(%)만 바꾼 글자 모양."""
         key = ("spacing", cid, spacing)

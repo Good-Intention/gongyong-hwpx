@@ -85,6 +85,43 @@ FIX_RE = re.compile(r"근거법령이 없|‘~으로’로 끝나는|한 열에 
 DATE_NEXT = 1 * 100  # 날짜·부서 줄 아래(요약 상자 위) 간격 1pt(사용자 2026-11-05 '부서 이름 행의 아래에 공간을 조금 1pt 정도')
 DATE_LINE_RE = re.compile(r"^[ \t⎵]*(?:[’']\s*[\d○]{2}|(?:19|20)\d{2})\.\s*[\d○]{1,2}\.\s*[\d○]{1,2}\.")
 MID_DOTS = "·ㆍ"
+# 근거법령 없이 시작하는 문서 종류(style-guide 3-2 표: 회의자료·사업설명서·언론보도 대응 보고·보도자료·의회 답변서·주간업무 보고)
+# — 계획의 "doc_type"이 이 꼴이면 근거법령 검사(맨 앞으로 옮기기·'근거법령이 없습니다')를 건너뛴다(사용자 2026-11-07 '충돌이 있는
+# 근거법령부분은 특정 보고에서는 빼도록 조정합시다'). 검사만(review)은 만든 문서에 남긴 표시나 제목 상자 글로도 알아본다.
+BASIS_EXEMPT_RE = re.compile(r"회의\s*자료|보도\s*자료|보도\s*(관련\s*)?대응|언론|답변서?|주간\s*(업무)?\s*보고|사업\s*설명서")
+DOC_META = "gongyong-hwpx"  # 만든 문서 content.hpf의 opf:meta 이름 — 'doc_type=…;basis=off'(검사만이 읽음)
+OPF_NS = "http://www.idpf.org/2007/opf/"
+
+
+def basis_exempt(doc_type):
+    """문서 종류가 근거법령 없이 시작하는 종류인가(style-guide 3-2)."""
+    return bool(doc_type) and bool(BASIS_EXEMPT_RE.search(str(doc_type)))
+
+
+def read_doc_meta(pkg):
+    """만든 문서에 남긴 표시 {'doc_type': …, 'basis': 'off'} — 없으면 {}."""
+    if "Contents/content.hpf" not in pkg.data:
+        return {}
+    hpf = pkg.xml("Contents/content.hpf")
+    for m in hpf.iter("{%s}meta" % OPF_NS):
+        if m.get("name") == DOC_META and m.text:
+            return dict(kv.split("=", 1) for kv in m.text.split(";") if "=" in kv)
+    return {}
+
+
+def write_doc_meta(pkg, info):
+    """만든 문서 content.hpf에 표시를 남긴다(한글 문서 정보 창에는 보이지 않는 이름) — 검사만이 같은 판단을 하게."""
+    if "Contents/content.hpf" not in pkg.data or not info:
+        return
+    hpf = pkg.xml("Contents/content.hpf")
+    meta = hpf.find(".//{%s}metadata" % OPF_NS)
+    if meta is None:
+        return
+    for m in list(meta.iter("{%s}meta" % OPF_NS)):
+        if m.get("name") == DOC_META:
+            meta.remove(m)
+    el = etree.SubElement(meta, "{%s}meta" % OPF_NS, name=DOC_META, content="text")
+    el.text = ";".join(f"{k}={v}" for k, v in info.items())
 NOTE_STAR_PT = 2        # * 풀이는 설명하는 글보다 이만큼(pt) 작게(사용자 원칙 2026-11-02)
 SQUARE_DOWN = 2         # □ 큰 항목 기호만 뒤 글자보다 이만큼(pt) 작게(사용자 2026-11-04 '□도 줄이기')
 NOTE_REF_PT = 2         # 본문 ※ 참고도 2pt 작게(사용자 원칙 2026-11-02 v1.1 — 표 밑 ※는 표 글자보다 1pt, fit)

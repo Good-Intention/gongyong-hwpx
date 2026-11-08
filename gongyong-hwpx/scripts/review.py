@@ -4,7 +4,7 @@
     python scripts/review.py 문서.hwpx
 
 읽는 것: 어림 쪽 수·쪽 채움, 쓰인 글꼴(한글과 맞대어 본 글꼴인지), 근거법령 자리·개수, 항목 수, ‘~으로’ 끝맺음,
-요약 상자·날짜 줄, 제목 상자 위 빈 공간, 그리고 다듬기(v1.23)가 고칠 수 있는 줄·표 맞춤(지금은 알리기만).
+요약 상자·날짜 줄, 제목 상자 위 빈 공간, 그리고 다듬기(다음 판)가 고칠 수 있는 줄·표 맞춤(지금은 알리기만).
 한글 없이 어림한 결과라 마지막 확인은 한글에서. 다른 사람이 만든 문서도 되지만, 견본과 다른 짜임(□○ 기호가 없는
 서술식 등)이면 알림이 뜨지 않거나 어긋날 수 있다.
 """
@@ -18,16 +18,22 @@ sys.path.insert(0, HERE)
 from hwpx_lib import (T, Package, cell_paras, head_length, is_struct, marker_level, page_info, para_pics,  # noqa: E402
                       para_runs, para_tables, para_text, run_text, split_marker, table_grid, is_table_title)
 from build import (BASIS_TITLE_RE, DATE_LINE_RE, FIX_RE, ROMAN, SUMMARY_END_RE, BuildError, Builder,  # noqa: E402
-                   margin_note)
+                   basis_exempt, margin_note, read_doc_meta)
+
+# 제목 상자 글이 이 말로 끝나면 근거법령 없이 시작하는 문서로 본다(style-guide 3-2 — 계획의 doc_type을 모를 때)
+TITLE_EXEMPT_RE = re.compile(r"(회의\s*자료|보도\s*자료|답변서?|주간\s*업무\s*보고|사업\s*설명서|보도\s*(관련\s*)?대응\s*보고)\s*(\(안\))?\s*$")
 from check import check  # noqa: E402
 from fit import Fitter, cover_end  # noqa: E402
 
 
 class Inspector:
-    def __init__(self, path):
+    def __init__(self, path, doc_type=None, basis=True, basis_searched=False):
         self.path = path
         self.pkg = Package(path)
         self.b = Builder(self.pkg)
+        self.doc_type = doc_type  # 계획의 doc_type과 같은 뜻(--doc-type)
+        self.basis_on = basis     # False면 근거법령 검사를 건너뜀(계획의 "basis_first": false와 같음, --no-basis)
+        self.basis_searched = basis_searched  # 둘째 근거를 찾아봤지만 없음(계획의 basis_searched, --basis-searched)
         self.paras = [p for p in self.b.sec if p.tag == T("hp:p")]
         self.fix, self.info, self.polish = [], [], []  # 사람이 고칠 것 / 참고 / 다듬기가 할 수 있는 것
 
@@ -48,14 +54,36 @@ class Inspector:
                          + (f" — 한글과 맞대어 본 글꼴 {', '.join(checked)}" if checked else ""))
         if other:
             self.info.append(f"맞대어 보지 않은 글꼴 {', '.join(other)}: 이 글꼴 문단은 줄 맞춤(자간)을 어림할 수 없어 다듬기가 "
-                             "건드리지 않습니다(알림만). 글꼴 맞대기는 v1.22에서 넓힙니다.")
+                             "건드리지 않습니다(알림만). 한글과 맞대어 본 글꼴은 판마다 늘려 갑니다.")
 
     def body_start(self):
         end = cover_end(self.paras)
         return end or 0
 
+    def _basis_skip(self):
+        """근거법령 검사를 건너뛸 까닭(없으면 None): --no-basis·--doc-type, 만든 문서에 남긴 표시, 제목 상자 글(3-2 예외 문서)."""
+        meta = read_doc_meta(self.pkg)
+        if not self.basis_on:
+            return "--no-basis"
+        if basis_exempt(self.doc_type):
+            return f"문서 종류 ‘{self.doc_type}’"
+        if meta.get("basis") == "off":
+            return "만들 때 근거법령 검사를 끈 문서" + (f"(문서 종류 ‘{meta['doc_type']}’)" if meta.get("doc_type") else "")
+        start = self.body_start()
+        title = next((p for p in self.paras[start:start + 4] if para_tables(p) and para_tables(p)[0].get("rowCnt") == "1"
+                      and para_tables(p)[0].get("colCnt") == "1"), None)
+        if title is not None:
+            text = " ".join(para_text(cp) for cp in cell_paras(table_grid(para_tables(title)[0])[0][4])).strip()
+            if TITLE_EXEMPT_RE.search(text):
+                return f"제목 ‘{text[:20]}’"
+        return None
+
     def basis(self):
-        """근거법령은 늘 1번: 로마자 장이면 Ⅰ., 아니면 첫 □ 근거법령(○ 둘 이상)."""
+        """근거법령은 늘 1번: 로마자 장이면 Ⅰ., 아니면 첫 □ 근거법령(○ 둘 이상). 3-2 표의 예외 문서는 건너뜀."""
+        why = self._basis_skip()
+        if why:
+            self.info.append(f"{why} — 근거법령 없이 시작하는 문서라(style-guide 3-2) 근거법령 검사를 건너뜀.")
+            return
         start = self.body_start()
         heads = [(i, p) for i, p in enumerate(self.paras[start:], start)
                  if not para_tables(p) and marker_level(para_text(p)) == 1 and not is_table_title(p)]
@@ -66,16 +94,7 @@ class Inspector:
         mark = split_marker(para_text(first))[1]
         roman = bool(mark) and mark[0] in ROMAN
         if BASIS_TITLE_RE.search(para_text(first)):
-            n = 0
-            for p in self.paras[i + 1:]:
-                if not para_tables(p) and marker_level(para_text(p)) == 1 and not is_table_title(p):
-                    break
-                if not para_tables(p) and marker_level(para_text(p)) == 2:
-                    n += 1
-            if n == 1:
-                self.fix.append("근거법령이 ○ 하나뿐입니다 — 확인된 다른 근거(시행령·시행규칙·조례·훈령·지침·계획)를 ○로 더하세요"
-                                "(법령 검색 도구로 확인한 것만).")
-            return
+            return  # 근거법령 ○ 개수는 rules()의 항목 수 검사(lone_dashes)가 한 번만 알림 — 옛 판은 같은 지적을 두 번 냈음
         where = next((f"{para_text(p).strip()[:14]}" for _, p in heads[1:] if BASIS_TITLE_RE.search(para_text(p))), None)
         if where is None:
             sq = ""
@@ -128,13 +147,16 @@ class Inspector:
     def rules(self):
         """항목 수·‘~으로’ 끝맺음 — build.py의 문단 검사 그대로."""
         before = len(self.b.warnings)
+        # 둘째 근거를 찾아봤지만 없음(만들 때 basis_searched, 또는 --basis-searched) → ○ 하나여도 알림만
+        self.b.basis_searched = self.basis_searched or read_doc_meta(self.pkg).get("basis_searched") == "yes"
         self.b.lone_dashes(self.paras)
         self.b.basis_notes(self.paras)
         self.b.ref_sole_titles(self.paras, remove=False)
         self.b.table_titles(self.paras)
         self.b.flow_steps(self.paras)
         self.b.check_endings(self.paras)
-        self.fix += self.b.warnings[before:]
+        for w in self.b.warnings[before:]:  # 등급은 만들기와 같게(FIX_RE) — 알림 등급 문장이 '고쳐야 함'에 섞이지 않게
+            (self.fix if FIX_RE.search(w) else self.info).append(w)
 
     # ------------------------------------------------------------ 다듬기가 할 수 있는 것(한 번 해 보고 버림 — 파일은 안 바꿈)
     def _state(self):
@@ -295,10 +317,15 @@ def main():
     ap = argparse.ArgumentParser(description="이미 쓴 hwpx를 검사만 한다(파일을 바꾸지 않음)")
     ap.add_argument("hwpx")
     ap.add_argument("--no-tables", action="store_true", help="표 맞춤 어림은 건너뜀(표가 많아 느릴 때)")
+    ap.add_argument("--doc-type", default=None, help="문서 종류(회의자료·보도자료·답변서·주간업무 보고·사업설명서 등 — "
+                    "근거법령 없이 시작하는 종류면 근거법령 검사를 건너뜀, 계획의 doc_type과 같음)")
+    ap.add_argument("--no-basis", action="store_true", help="근거법령 검사를 건너뜀(계획의 \"basis_first\": false와 같음)")
+    ap.add_argument("--basis-searched", action="store_true",
+                    help="둘째 근거를 찾아봤지만 없음 — 근거법령 ○ 하나를 알림으로만(계획의 \"basis_searched\": true와 같음)")
     a = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
     try:
-        ins = Inspector(a.hwpx)
+        ins = Inspector(a.hwpx, doc_type=a.doc_type, basis=not a.no_basis, basis_searched=a.basis_searched)
         pages, errors, notes = ins.run(tables=not a.no_tables)
     except BuildError as e:
         raise SystemExit(f"검사하지 못함 — {e}")

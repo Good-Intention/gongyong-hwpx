@@ -40,7 +40,11 @@ OPEN = set("([{<‘“「『【〈《")
 SPACES = {" ", "　", "⍽"}  # 빈칸, 전각 빈칸, 묶음 빈칸(⍽ — 끊지 않음)
 
 
-def spacing_after(base, delta, floor=-10, ceil=10):
+FIT_FLOOR = -18  # 줄 맞춤이 자간을 줄이는 하한(fit_base.FLOOR와 같게). 어림의 기본 바닥값도 이것 — 옛 기본 -10이면 자간을
+                 # 더 줄여 보며 잴 때 -10%보다 이미 줄인 조각을 더 줄이지 않는 것으로 세어 맞춤 단계(-18%)와 어긋났음(사용자 작업 2026-11-06)
+
+
+def spacing_after(base, delta, floor=FIT_FLOOR, ceil=10):
     """자간 base에 delta를 더한 값. 겹치지 않게 floor~ceil 안에서만 바꾸고, 이미 범위 밖인 조각은 그대로 둔다."""
     if not delta or base < floor or base > ceil:
         return base
@@ -115,7 +119,7 @@ class Layout:
         self.move_whole = True
 
     # ------------------------------------------------------------ 글자 폭
-    def chars(self, p, delta=0, floor=-10):
+    def chars(self, p, delta=0, floor=FIT_FLOOR):
         """문단의 글자 목록: [(글자, 폭, 크기, 위첨자 여부, 자간 빼기 전 폭)]. delta는 모든 조각에 더해 볼 자간(%).
         자간은 floor(겹치지 않는 한계) 밑으로 내리지 않는다. 이미 그보다 좁은 조각(따옴표 등)은 그대로 둔다.
         마지막 칸(자간 빼기 전 폭)은 줄 끝 글자에 쓴다 — 한글은 줄 끝 글자를 자간을 줄이기 전 제 폭으로 센다(wrap)."""
@@ -239,7 +243,7 @@ class Layout:
             return base, base + intent
         return base - intent, base
 
-    def para_lines(self, p, box_w, delta=0, shrink=1.0, floor=-10):
+    def para_lines(self, p, box_w, delta=0, shrink=1.0, floor=FIT_FLOOR):
         """shrink<1이면 쓸 수 있는 폭을 그만큼 줄여 본다(자간으로 당길 때 어림 오차 여유).
         floor는 자간을 줄여 볼 때의 하한 — 실제로 바꿀 하한(fit.FLOOR)과 같게 넘겨야 어림이 맞다."""
         chs = self.chars(p, delta, floor)

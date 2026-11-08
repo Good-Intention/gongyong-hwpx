@@ -530,9 +530,19 @@ class RulesPart:
             many = [f"{t}({n}개)" for t, n in items if n > 5]
             msg = f"{child[lv]} 항목 수 — 셋쯤이 좋고 2~5개를 벗어나지 않게(사용자 원칙): "
             basis = [t for t in ones if lv == 1 and BASIS_TITLE_RE.search(t)]
+            if basis and getattr(self, "basis_searched", False):
+                # 찾아봤지만 더 없음(계획 "basis_searched": true) — 하나로 두고 알림만(사용자 2026-11-07 '훈령이나 지침, 매뉴얼,
+                # 유권해석 등을 찾아봐도 없으면', '1번') — 지어내지 않는다
+                self.warn("근거법령은 ○ 하나로 두었습니다 — 시행령·시행규칙·자치법규·행정규칙(훈령·예규·고시·지침)·매뉴얼·"
+                          "법령해석례(유권해석)까지 찾아봤지만 확인된 것이 없음(계획 basis_searched).")
+                ones = [t for t in ones if t not in basis]
+                basis = []
+                if not ones and not many:
+                    continue
             if basis:  # 근거법령도 ○ 둘 이상(사용자 원칙 2026-11-03) — 나누거나 합치지 말고 확인된 근거를 더함
-                msg += (f"○ 하나뿐인 근거법령({', '.join('‘' + t + '’' for t in basis)}) → 확인된 다른 근거(시행령·시행규칙·"
-                        "조례·훈령·지침·계획)를 ○로 더하세요(법령 검색 도구로 확인한 것만, 모르면 사용자에게 묻기)")
+                msg += (f"○ 하나뿐인 근거법령({', '.join('‘' + t + '’' for t in basis)}) → 확인된 다른 근거(같은 법령의 시행령·"
+                        "시행규칙, 조례·규칙, 훈령·예규·고시·지침, 매뉴얼·계획, 법령해석례(유권해석))를 법령 검색 도구로 찾아 ○로 "
+                        "더하세요(확인한 것만). 찾아봐도 없으면 계획에 \"basis_searched\": true — 하나로 두고 알림으로 낮춤")
                 ones = [t for t in ones if t not in basis]
                 if ones or many:
                     msg += "; "

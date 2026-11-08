@@ -49,6 +49,8 @@ def guess_role(p, styles, idx, text, tables):
     if para_pics(p) and not text.strip():
         return "그림(표지 슬로건·마크 등)"
     pre, mark, body = split_marker(text)
+    if mark == "■":  # ■ 표 제목 줄 — 머리 기호 수준은 □와 같지만 큰 항목이 아니다(이 문단을 □ 자리에 고르지 않게, 2026-11-07)
+        return "표 제목(■)"
     if mark:
         return marker_kind(mark)
     if not text.strip():
