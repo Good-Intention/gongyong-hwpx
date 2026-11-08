@@ -18,7 +18,9 @@ EXAMPLE_DIR = os.path.join(ROOT, "예시_보고서")
 GOLDEN = os.path.join(ROOT, "tests", "golden")
 
 # 문서마다 들어 있는 계획 파일 예시(```json … ```)를 찾을 곳
-DOCS = ["SKILL.md", "references/basic-report-map.md", "references/plan-format.md", "references/style-guide.md"]
+DOCS = ["SKILL.md", "references/write.md", "references/basic-report-map.md", "references/plan-format.md",
+        "references/plan-format-advanced.md", "references/style-guide.md", "references/doc-types.md",
+        "references/cover.md", "references/boxes-figures.md"]
 
 sys.dont_write_bytecode = True  # 스킬 폴더(scripts/)에 __pycache__를 남기지 않음
 if SCRIPTS not in sys.path:

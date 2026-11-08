@@ -10,12 +10,14 @@ import unittest
 
 from common import ROOT, SCRIPTS, SKILL, read
 
-# SKILL.md + style-guide.md + plan-format.md: 계획 파일을 쓸 때마다 읽는 문서(바이트, UTF-8)
+# SKILL.md + write.md + style-guide.md + plan-format.md: 작성 모드에서 늘 읽는 문서(바이트, UTF-8)
 # v1.24(51,081B)보다 늘지 않게 51,000이었다가 v1.25에서 올림(53,474B): 근거법령 예외(doc_type)·근거 하나 찾아보기(basis_searched)
 # 규칙 두 줄과 계획 문법 두 줄, v2 모드 갈림길(SKILL.md 0절 — 작성·정돈·검사만)이 더해짐. 더 늘리기 전에 겹치는 설명부터 덜 것
-BUDGET = 54_000
+BUDGET = 27_500
+# v2.0(2026-11-08)에서 낮춤: style-guide 3-2·7절을 style-guide-types.md로, SKILL.md 7절을 references/review.md로 옮김(47,9xxB)
+# v2.1(2026-11-08)에서 낮춤: SKILL.md를 모드 길잡이로, 작성 순서는 write.md, 표지·도표·덜 쓰는 계획 항목은 따로(26,3xxB)
 # 견본이 없을 때 더 읽는 기본 양식 번호표까지
-BUDGET_WITH_MAP = 61_500
+BUDGET_WITH_MAP = 32_000
 
 
 def _frontmatter():
@@ -58,7 +60,7 @@ class Frontmatter(unittest.TestCase):
 class ContextBudget(unittest.TestCase):
     def test_always_read_size(self):
         size = lambda rel: os.path.getsize(os.path.join(SKILL, rel))
-        core = sum(size(r) for r in ["SKILL.md", "references/style-guide.md", "references/plan-format.md"])
+        core = sum(size(r) for r in ["SKILL.md", "references/write.md", "references/style-guide.md", "references/plan-format.md"])
         self.assertLessEqual(core, BUDGET, f"늘 읽는 분량 {core:,}B > 상한 {BUDGET:,}B")
         self.assertLessEqual(core + size("references/basic-report-map.md"), BUDGET_WITH_MAP)
 
@@ -67,6 +69,10 @@ class ContextBudget(unittest.TestCase):
         for rel in sorted(set(re.findall(r"`((?:scripts|references|assets)/[^`\s]+)`", body))):
             with self.subTest(path=rel):
                 self.assertTrue(os.path.exists(os.path.join(SKILL, rel)), f"SKILL.md가 가리키는 {rel}이 없음")
+        # 이름만 적은 참고 파일(`write.md`)은 references/ 안에 있어야 함
+        for name in sorted(set(re.findall(r"`([a-z][a-z-]*\.md)`", body))):
+            with self.subTest(path=name):
+                self.assertTrue(os.path.exists(os.path.join(SKILL, "references", name)), f"SKILL.md가 가리키는 references/{name}이 없음")
 
 
 class StalePromises(unittest.TestCase):
