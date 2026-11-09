@@ -43,7 +43,7 @@ class FillPart:
                 swap = (mark, umark)
             elif umark != mark:
                 self.warn(f"{where}: 견본 문단은 '{mark}'로 시작하는데 글이 '{umark}'로 시작합니다. "
-                          f"견본 기호 '{mark}'를 쓰고 글의 '{umark}'는 뺐습니다. 다른 기호를 원하면 like를 바꾸세요.")
+                          f"견본 기호 '{mark}'를 쓰고 글의 '{umark}'는 뺐습니다. 다른 기호를 원하면 like를 바꾸세요.", level="fix")
             body = ubody
         plen = len(pre) if use_marker else 0
 
@@ -85,6 +85,8 @@ class FillPart:
             body = NUMWORD_RE.sub("\\1\u237d", body)
         if self.colons:
             body = space_colons(body)
+        if len(re.findall(r"\*\*", body)) % 2 or len(re.findall(r"\^\^", body)) % 2:
+            self.warn(f"{where}: 짝이 없는 **(또는 ^^)가 있어 글자 그대로 찍힙니다 — 짝을 맞추거나 지우세요: ‘{body[:24]}…’", level="fix")
         for part in MARKUP_RE.split(body):
             if not part:
                 continue
@@ -94,13 +96,13 @@ class FillPart:
                 if bold is not None:
                     src = bold
                 else:
-                    self.warn(f"{where}: 견본 문단에 굵은 조각이 없어 **…** 부분을 보통 글씨로 넣었습니다.")
+                    self.warn(f"{where}: 견본 문단에 굵은 조각이 없어 **…** 부분을 보통 글씨로 넣었습니다.", level="fix")
             elif part.startswith("^^") and part.endswith("^^") and len(part) > 4:
                 part = part[2:-2]
                 if sup is not None:
                     src = sup
                 else:
-                    self.warn(f"{where}: 견본 문단에 위 첨자 조각이 없어 ^^…^^ 부분을 보통 글씨로 넣었습니다.")
+                    self.warn(f"{where}: 견본 문단에 위 첨자 조각이 없어 ^^…^^ 부분을 보통 글씨로 넣었습니다.", level="fix")
             new_runs.append(self._mk(src, part))
         if not new_runs:
             new_runs.append(self._mk(normal, ""))
@@ -172,9 +174,11 @@ class FillPart:
         """그림 파일을 읽어 (바이트, 확장자, 화소 가로, 세로). Pillow가 있으면 긴 변 IMAGE_MAX_PX로 줄이고 용량을 줄인다(사용자
         원칙 2026-11-01): 투명 칸은 흰 바탕(종이색)에 합친 뒤 JPEG와 PNG를 둘 다 만들어 작은 쪽을 쓴다 — 사진은 JPEG,
         색이 단순한 로고·도표는 PNG가 대개 작다(투명 채널만 붙은 8MB 사진 PNG가 PNG로 남아 1.9MB가 되던 것, 실측). 없으면 원본 그대로 넣고 알린다."""
+        if not path.strip():
+            raise BuildError(f"{where}: 그림 파일 이름이 비었습니다(\"image\": \"사진.jpg\" 꼴로 쓰세요).")
         if not os.path.isabs(path) and self.base_dir:
             path = os.path.join(self.base_dir, path)
-        if not os.path.exists(path):
+        if not os.path.isfile(path):
             raise BuildError(f"{where}: 그림 파일을 찾지 못했습니다: {path}")
         try:
             from PIL import Image
@@ -186,24 +190,14 @@ class FillPart:
             w, h = _png_jpeg_size(data)
             self.warn(f"{where}: 그림 라이브러리(Pillow)가 없어 그림을 줄이지 못하고 원본({len(data) // 1024}KB) 그대로 넣었습니다.")
             return data, os.path.splitext(path)[1].lstrip(".").lower() or "png", w, h
-        import io
-        im = Image.open(path)
-        im.load()
-        if im.mode in ("RGBA", "LA", "P"):
-            rgba = im.convert("RGBA")
-            flat = Image.new("RGB", rgba.size, (255, 255, 255))
-            flat.paste(rgba, mask=rgba.getchannel("A"))
-            im = flat
-        else:
-            im = im.convert("RGB")
-        if max(im.size) > IMAGE_MAX_PX:
-            f = IMAGE_MAX_PX / max(im.size)
-            im = im.resize((max(1, round(im.size[0] * f)), max(1, round(im.size[1] * f))), Image.LANCZOS)
-        jpg, png = io.BytesIO(), io.BytesIO()
-        im.save(jpg, "JPEG", quality=IMAGE_JPEG_QUALITY, optimize=True)
-        im.save(png, "PNG", optimize=True)
-        data, ext = (png.getvalue(), "png") if png.tell() < jpg.tell() else (jpg.getvalue(), "jpg")
-        return data, ext, im.size[0], im.size[1]
+        from PIL import ImageOps, UnidentifiedImageError
+        try:
+            im = Image.open(path)
+            im.load()
+        except (UnidentifiedImageError, OSError) as e:
+            raise BuildError(f"{where}: 그림 파일이 아니거나 깨져 읽지 못했습니다(PNG·JPEG만 됩니다): {path}") from e
+        im = ImageOps.exif_transpose(im)  # 휴대전화 사진의 회전 정보대로 세워서(옛 판은 세로 사진이 눕혀 들어감, 평가 2026-11-09)
+        return encode_image(im)
 
     def cell_image(self, tc, value, where):
         """칸 바탕을 그림으로 채운다(글자처럼 넣는 그림이 아니라 '셀 배경' — 사용자 원칙 2026-11-01). 칸 높이를 칸 너비 × 그림
@@ -211,12 +205,15 @@ class FillPart:
         data, ext, w, h = self._image_bytes(str(value["image"]), where)
         if not w or not h:
             raise BuildError(f"{where}: 그림 크기를 읽지 못했습니다(PNG·JPEG만 됩니다).")
+        hpf = self.pkg.xml("Contents/content.hpf")
+        man = hpf.find(".//" + T("opf:manifest"))
+        have = {it.get("id") for it in man}
         self.image_seq += 1
+        while f"cellimg{self.image_seq}" in have:  # 결과 문서를 견본으로 쓸 때 옛 그림 이름을 피함 — 같은 이름이면 새 그림이 옛 그림을 덮음(평가 2026-11-09)
+            self.image_seq += 1
         item_id = f"cellimg{self.image_seq}"
         href = f"BinData/{item_id}.{ext}"
         self.pkg.data[href] = data
-        hpf = self.pkg.xml("Contents/content.hpf")
-        man = hpf.find(".//" + T("opf:manifest"))
         it = etree.SubElement(man, T("opf:item"))
         for k, v in (("id", item_id), ("href", href), ("media-type", "image/png" if ext == "png" else "image/jpg"),
                      ("isEmbeded", "1")):
@@ -296,6 +293,9 @@ class FillPart:
         # 줄 수는 단계 수로 정한다(사용자 2026-11-05 '4, 5 한줄 6,7,8두줄'): 5개까지 한 줄, 6개부터 두 줄 — 좌우를 꽉 채움.
         # (옛 판의 '상자가 좁거나 글이 넘치면 두 줄로'는 없앰 — 상자 글은 상자 안에서 줄을 바꿈)
         lines = 2 if n > FLOW_ROW_MAX else 1
+        k0 = (n + 1) // 2 if lines == 2 else n
+        if (total - (k0 - 1) * gap) / k0 < FLOW_BOX_MIN_MM * HWPUNIT_PER_MM:
+            raise BuildError(f"{where}: 도표 단계가 {n}개라 상자가 너무 좁습니다 — 단계를 묶어 줄이거나 표로 쓰세요(6~8단계는 두 줄로 맞춤).")
         if forced and forced != lines:
             self.warn(f"{where}: 도표 줄 수는 단계 수로 정합니다(4·5단계 한 줄, 6단계부터 두 줄 — 사용자 원칙) — "
                       f"rows {forced} 대신 {lines}줄로 했습니다.")
@@ -511,10 +511,19 @@ class FillPart:
         want = block.get("cols") or max((len(r) for r in data), default=tcols)
         if want != tcols or block.get("widths"):
             self.reshape_cols(tbl, want, block.get("widths"), where)
+        if block.get("widths"):
+            self.fixed_widths.add(tbl)  # 사용자가 준 칸 너비 — 표 맞춤이 다시 나누지 않음(옛 판: [1,8,1]이 26·102·42mm, 평가 2026-11-09)
         trs = [tr for tr in tbl if tr.tag == T("hp:tr")]
         h = block.get("header_rows", 1 if len(trs) > 1 else 0)
         if not isinstance(h, int) or not 0 <= h <= len(trs):
             raise BuildError(f"{where}: header_rows는 0~{len(trs)} 사이 숫자여야 합니다.")
+        # 머리 줄 밖까지 세로로 합친 칸이 있으면 줄을 다시 짜지 못한다 — 파일을 만들기 전에 알림(옛 판은 깨진 표를 만든 뒤 구조 검사에서 걸림)
+        for r, tr in enumerate(trs):
+            for tc in tr:
+                span = tc.find(T("hp:cellSpan")) if tc.tag == T("hp:tc") else None
+                if span is not None and r + int(span.get("rowSpan", "1")) > h and span.get("rowSpan", "1") != "1":
+                    raise BuildError(f"{where}: 견본 표에 세로로 합친 칸이 있어 줄을 다시 짤 수 없습니다. "
+                                     "\"cells\"로 칸만 채우세요.")
         body_like = block.get("body_like", min(h, len(trs) - 1))
         last_like = block.get("last_like")
         for name, v in (("body_like", body_like), ("last_like", last_like)):

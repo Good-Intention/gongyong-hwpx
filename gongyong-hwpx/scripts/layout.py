@@ -12,7 +12,7 @@ import json
 import os
 
 from style_profile import P as PROFILE  # noqa: E402 — 기준값(assets/profile.json)
-from hwpx_lib import UNIT_RE, T, cell_paras, head_length, para_pics, para_runs, para_tables, para_text, run_text, table_grid
+from hwpx_lib import UNIT_RE, T, cell_paras, head_length, is_num_char, para_pics, para_runs, para_tables, para_text, run_text, table_grid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FONT_FILE = os.path.join(HERE, "..", "assets", "font_widths.json")
@@ -45,11 +45,14 @@ FIT_FLOOR = PROFILE["spacing_min_pct"]  # 줄 맞춤이 자간을 줄이는 하�
                  # 더 줄여 보며 잴 때 -10%보다 이미 줄인 조각을 더 줄이지 않는 것으로 세어 맞춤 단계(-18%)와 어긋났음(사용자 작업 2026-11-06)
 
 
-def spacing_after(base, delta, floor=FIT_FLOOR, ceil=10):
-    """자간 base에 delta를 더한 값. 겹치지 않게 floor~ceil 안에서만 바꾸고, 이미 범위 밖인 조각은 그대로 둔다."""
-    if not delta or base < floor or base > ceil:
+def spacing_after(base, delta, floor=FIT_FLOOR, ceil=PROFILE["spacing_max_pct"]):
+    """자간 base에 delta를 더한 값. 늘릴 때는 ceil(사용자 원칙 +5%)까지만 — 이미 그 위인 조각은 더 늘리지 않음(옛 상한 +10%, 평가 2026-11-09).
+    줄일 때는 floor까지. floor 밑(따옴표 붙이기 등)과 +10% 위 조각은 그대로."""
+    if not delta or base < floor or base > 10:
         return base
-    return max(floor, min(ceil, base + delta))
+    if delta > 0:
+        return base if base >= ceil else min(ceil, base + delta)
+    return max(floor, base + delta)
 
 
 def is_hangul(ch):
@@ -83,6 +86,12 @@ class Metrics:
         """한글로 줄 바꿈 자리를 맞대어 본 글꼴인가(어림 오차가 작음)."""
         return face in self.checked_fonts or ALIASES.get(face) in self.checked_fonts
 
+    def known(self, face, bold=False):
+        """폭 표에 있는 글꼴인가('없는 글꼴' 알림에 올리지 않고 봄)."""
+        if bold and face == "맑은 고딕":
+            face = "맑은 고딕 굵게"
+        return bool(self.fonts.get(face) or self.fonts.get(ALIASES.get(face, "")))
+
     def font(self, face, bold=False):
         if bold and face == "맑은 고딕":
             face = "맑은 고딕 굵게"
@@ -93,12 +102,14 @@ class Metrics:
 
     def em(self, face, ch, bold=False):
         """글자 하나의 폭(글자 크기 1에 대한 비율)."""
+        if ch in "\u20e3\u200b\u200c\u200d":
+            return 0.0  # 키캡(1⃣의 네모)은 앞 글자에 겹침, U+200B~D는 찍히지 않음 — 폭이 없음(한글 2024 실측 2026-11-09)
         f = self.font(face, bold)
         if f is not None:
             w = f["chars"].get(ch)
             if w is not None:
                 return w / 1000
-            if is_hangul(ch):
+            if is_hangul(ch) or is_num_char(ch):  # 번호 글자 폭은 글꼴의 한글 폭과 같음(한글 2024로 10개 글꼴 실측 2026-11-09 — 차이 0.03글자 안, tools/num_char_probe.py)
                 return f["hangul"] / 1000
             if is_cjk(ch):
                 return f["hanja"] / 1000
@@ -118,6 +129,11 @@ class Layout:
         # 큰 표를 통째로 다음 쪽으로 넘기는 어림(2026-11-04). 만들 때는 쪽 맞춤이 그 자리에 쪽 나눔을 박아 한글도 그렇게 되고,
         # 검사만·다듬기는 쪽 나눔을 박지 않으므로 False — 한글이 하는 대로(빈 곳이 크면 표를 쪽 사이에서 나눔) 센다.
         self.move_whole = True
+        self.head_of = head_length  # 자간을 더해 볼 때 뺄 머리 글자 수(정돈은 더한 기호 ‣▸✓까지 봄)
+        # 쪽 맞춤이 안을 찾는 동안만 쓰는 표 줄 높이 저장소 — 안마다 표 글은 그대로라 다시 재지 않음(안이 31개면 표 줄 높이를 62번 쟀음).
+        # row_nocache: 안이 높이를 바꾸는 표(그래프 상자)
+        self.row_cache = None
+        self.row_nocache = set()
 
     # ------------------------------------------------------------ 글자 폭
     def chars(self, p, delta=0, floor=FIT_FLOOR):
@@ -125,7 +141,7 @@ class Layout:
         자간은 floor(겹치지 않는 한계) 밑으로 내리지 않는다. 이미 그보다 좁은 조각(따옴표 등)은 그대로 둔다.
         마지막 칸(자간 빼기 전 폭)은 줄 끝 글자에 쓴다 — 한글은 줄 끝 글자를 자간을 줄이기 전 제 폭으로 센다(wrap)."""
         out = []
-        head = head_length(para_text(p)) if delta else 0
+        head = self.head_of(para_text(p)) if delta else 0
         pos = 0
         for r in para_runs(p):
             if r.find(T("hp:tbl")) is not None:
@@ -140,6 +156,11 @@ class Layout:
             text = run_text(r)
             # 머리 기호·괄호 이름표 조각에는 자간 조정을 하지 않는다(fit.py set_delta와 같은 규칙)
             sp = spacing_after(c.get("spacing", 0), delta if pos >= head else 0, floor) / 100
+            en_sp = spacing_after(c.get("latin_spacing", c.get("spacing", 0)), delta if pos >= head else 0, floor) / 100
+            en_ratio = c.get("latin_ratio", c.get("ratio", 100)) / 100
+            en_face = c.get("latin_font")
+            if not (en_face and self.m.known(en_face, c.get("bold"))):
+                en_face = c.get("font")  # 폭 표에 없는 글꼴은 한글 글꼴 폭으로(모르는 글꼴은 0.55로 어림해 더 어긋남)
             pos += len(text)
             for ch in text:
                 if ch == "\n":
@@ -157,8 +178,12 @@ class Layout:
                     base = " " if ch == "⍽" else ch
                     # 첨자 안 빈칸은 줄지 않고 보통 크기 빈칸으로 찍힌다(40pt 실측 2026-11-01: 첨자 빈칸 27.6px = 보통 27.8px)
                     k = size * c.get("rel", 100) / 100 if sup and base == " " else eff
-                    w0 = k * self.m.em(c.get("font"), base, c.get("bold")) * ratio
-                    w = w0 * (1 + sp)
+                    if base.isascii() and base.isalnum():
+                        w0 = k * self.m.em(en_face, base, c.get("bold")) * en_ratio
+                        w = w0 * (1 + en_sp)
+                    else:
+                        w0 = k * self.m.em(c.get("font"), base, c.get("bold")) * ratio
+                        w = w0 * (1 + sp)
                 out.append((ch, w, size, sup, w0))
         return out
 
@@ -186,7 +211,8 @@ class Layout:
         while i < n:
             ch, cw = chs[i][0], chs[i][1]
             if ch == "\n":
-                if i > start:
+                # 잇단 줄 바꿈·맨 앞 줄 바꿈의 빈 줄도 한 줄(옛 판은 안 세어 줄 수가 모자랐음 — 평가 2026-11-09)
+                if i > start or forced or not units:
                     units.append([start, i, w, 0.0, forced])
                 forced, start, w = True, i + 1, 0.0
                 i += 1
@@ -202,7 +228,7 @@ class Layout:
                 continue
             w += cw
             i += 1
-        if i > start or not units:
+        if i > start or forced or not units:  # 끝 줄 바꿈 뒤 빈 줄도 한 줄
             units.append([start, i, w, 0.0, forced])
         return units
 
@@ -318,12 +344,25 @@ class Layout:
         return prev + sum(hs) + nxt, hs, prev, nxt
 
     # ------------------------------------------------------------ 표
+    def cell_content(self, tc, inner_w):
+        """칸 안 글의 높이(HWPUNIT, 칸 안 위아래 여백 빼고)."""
+        cps = cell_paras(tc)
+        content = sum(self.para_height(cp, inner_w)[0] for cp in cps)
+        if cps and not para_tables(cps[-1]):
+            # 칸 안 마지막 줄 아래에는 줄 간격 여분이 붙지 않는다(한글 2024 실측: 2줄 11.4mm·4줄 24.9mm, 13pt 140%)
+            size = max((self.st.char.get(r_.get("charPrIDRef"), {}).get("size", 10) * 100
+                        for r_ in para_runs(cps[-1])), default=1000)
+            content -= max(0.0, self.line_pitch(cps[-1], size) - size)
+        return content
+
     def table_rows(self, tbl):
         """표의 줄마다 높이(HWPUNIT) 목록. 한글은 긴 표를 줄 사이에서 다음 쪽으로 나누므로 쪽 나눔은 줄 단위로 어림한다."""
+        if self.row_cache is not None and tbl in self.row_cache:
+            return list(self.row_cache[tbl])
         inm = tbl.find(T("hp:inMargin"))
         dt = int(inm.get("top", "141")) + int(inm.get("bottom", "141")) if inm is not None else 282
         dl = int(inm.get("left", "510")) + int(inm.get("right", "510")) if inm is not None else 1020
-        rows = {}
+        rows, spans = {}, []
         for r, c, rs, cs, tc in table_grid(tbl):
             sz = tc.find(T("hp:cellSz"))
             w, h = int(sz.get("width", "0")), int(sz.get("height", "0"))
@@ -332,21 +371,61 @@ class Layout:
                 cm = tc.find(T("hp:cellMargin"))
                 mt = int(cm.get("top", "0")) + int(cm.get("bottom", "0"))
                 ml = int(cm.get("left", "0")) + int(cm.get("right", "0"))
-            cps = cell_paras(tc)
-            content = sum(self.para_height(cp, w - ml)[0] for cp in cps)
-            if cps and not para_tables(cps[-1]):
-                # 칸 안 마지막 줄 아래에는 줄 간격 여분이 붙지 않는다(한글 2024 실측: 2줄 11.4mm·4줄 24.9mm, 13pt 140%)
-                size = max((self.st.char.get(r_.get("charPrIDRef"), {}).get("size", 10) * 100
-                            for r_ in para_runs(cps[-1])), default=1000)
-                content -= max(0.0, self.line_pitch(cps[-1], size) - size)
-            need = max(h, content + mt)
+            content = self.cell_content(tc, w - ml) + mt
             if rs == 1:
-                rows[r] = max(rows.get(r, 0), need)
+                rows[r] = max(rows.get(r, 0), h, content)
             else:
                 rows.setdefault(r, 0)
+                spans.append((r, rs, h, content))
+        # 세로로 합친 칸: 합친 줄들의 높이 합이 칸 글보다 낮으면 마지막 줄이 늘어남(옛 판은 합친 칸 높이를 안 세어 같은 긴 글이
+        # 합친 칸이면 24mm, 안 합치면 86mm — 평가 2026-11-09). 칸 높이 값은 합친 줄이 모두 비었을 때만 믿음(줄 높이를 맞춘 뒤 옛 값이 남음)
+        for r, rs, h, content in spans:
+            span = [k for k in range(r, r + rs) if k in rows]
+            have = sum(rows[k] for k in span)
+            want = max(content, h if not have else 0)
+            if span and want > have:
+                rows[span[-1]] += want - have
         out = [rows[r] for r in sorted(rows)] or [0]
         om = tbl.find(T("hp:outMargin"))
         out[-1] += int(om.get("top", "0")) + int(om.get("bottom", "0")) if om is not None else 0
+        if self.row_cache is not None and tbl not in self.row_nocache:
+            self.row_cache[tbl] = list(out)
+        return out
+
+    def row_pieces(self, tbl):
+        """칸 안에서 쪽을 나누는 표(pageBreak=CELL)의 줄마다 나눌 수 있는 조각 높이 — 가장 높은 칸의 글 줄 단위, 칸 안 표는 글자처럼 취급되어 통째로.
+        줄을 통째로 옮겨 세면 355mm 줄 하나로 실제 5쪽 문서가 6쪽이 된다(공모전 양식 시험 2026-11-09)."""
+        inm = tbl.find(T("hp:inMargin"))
+        dt = int(inm.get("top", "141")) + int(inm.get("bottom", "141")) if inm is not None else 282
+        dl = int(inm.get("left", "510")) + int(inm.get("right", "510")) if inm is not None else 1020
+        best = {}
+        for r, c, rs, cs, tc in table_grid(tbl):
+            sz = tc.find(T("hp:cellSz"))
+            w = int(sz.get("width", "0"))
+            mt, ml = dt, dl
+            if tc.get("hasMargin") == "1":
+                cm = tc.find(T("hp:cellMargin"))
+                mt = int(cm.get("top", "0")) + int(cm.get("bottom", "0"))
+                ml = int(cm.get("left", "0")) + int(cm.get("right", "0"))
+            units = [mt / 2]
+            for cp in cell_paras(tc):
+                h, hs, prev, nxt = self.para_height(cp, w - ml)
+                if para_tables(cp) or para_pics(cp):
+                    units.append(h)  # 칸 안 표·그림은 쪽에서 나뉘지 않음
+                else:
+                    units += [prev + hs[0]] + list(hs[1:])
+                    units[-1] += nxt
+            units[-1] += mt / 2
+            if rs == 1 and sum(units) > sum(best.get(r, [])):
+                best[r] = units
+        rows = self.table_rows(tbl)
+        out = []
+        for k, h in enumerate(rows):
+            units = list(best.get(k, []))
+            extra = h - sum(units)  # 칸 높이 값이 글보다 큰 몫 — 줄 끝에 빈 조각으로
+            if extra > 1 or not units:
+                units.append(max(extra, 0.0))
+            out.append(units)
         return out
 
     def table_header(self, tbl):
@@ -381,7 +460,14 @@ class Layout:
             text = para_text(p)
             items.append({"hs": hs, "prev": prev, "next": nxt, "keep": pp.get("keep_next", False),
                           "brk": p.get("pageBreak") == "1", "h": h,
+                          # 한글이 쪽 경계에서 나누는가: 글 문단은 '문단 보호'가 없으면 줄 사이에서, 표는 글자처럼 취급하지 않고 나눔을 끄지 않았으면 줄 사이에서
+                          "splits": (all(t.get("pageBreak") != "NONE" and t.find(T("hp:pos")) is not None
+                                         and t.find(T("hp:pos")).get("treatAsChar") != "1" for t in tables)
+                                     if tables else not pp.get("keep_lines", False)),
                           "repeat": self.table_header(tables[0]) if tables else 0, "table": bool(tables),
+                          "pieces": (self.row_pieces(tables[0]) if len(tables) == 1 and tables[0].get("pageBreak") == "CELL"
+                                     and tables[0].find(T("hp:pos")) is not None and tables[0].find(T("hp:pos")).get("treatAsChar") != "1"
+                                     else None),
                           "blank": not tables and not para_pics(p) and not text.strip(),
                           # 글자처럼 취급하지 않은 표: 한글은 바로 뒤 문단의 위 간격을 쓰지 않는다(실측 — 표 바깥 아래 여백만)
                           "float": bool(tables) and all(t.find(T("hp:pos")) is None
@@ -428,6 +514,7 @@ class Layout:
         where, chains = [], []
         self.tops = []  # 문단마다 첫 줄 (쪽, 위치) — 시험·맞춤용
         self.moved = []  # 다음 쪽에서 시작하게 넘긴 묶음의 첫 문단 번호
+        self.split_rows = 0  # 쪽에 갈라진 표 줄 수(칸 안에서 나누는 표)
         i = 0
         while i < n:
             def chain_to(i, last):
@@ -465,7 +552,7 @@ class Layout:
             if items[i]["brk"] and (y > 0 or page > 0) and i > 0:
                 page, y = page + 1, 0.0
                 used.append(0.0)
-            elif has_table and y > 0 and y + head_need > body_h and head_need <= body_h:
+            elif self.move_whole and has_table and y > 0 and y + head_need > body_h and head_need <= body_h:
                 page, y = page + 1, 0.0
                 used.append(0.0)
                 self.moved.append(i)
@@ -479,11 +566,12 @@ class Layout:
                 used.append(0.0)
                 self.moved.append(i)
             elif (y > 0 and y + chain > body_h and chain <= body_h
-                  and (self.move_whole or not (has_table and block_gap is not None and body_h - y > body_h * block_gap
-                                               and y + head_need <= body_h))):
+                  and (self.move_whole or (j > i or not items[i]["splits"]))):
                 # 한 쪽에 들어가는 묶음은 통째로 다음 쪽으로 — 표가 든 묶음도 쪽 아래가 많이 비더라도 두 쪽에 나누지 않는다
                 # (사용자 원칙 2026-11-04 '큰 표가 두 장에 걸치면 차라리 밑으로 내려서 한 장에 딱 들어가게, 제목도 붙여서'
                 #  — 2026-10-31의 '빈 곳이 block_gap보다 크면 표를 나눔'을 바꿈). 한 쪽보다 긴 표만 나눈다(머리 줄 되풀이).
+                # 쪽 나눔을 박지 않는 어림(move_whole 끔 — 정돈·검사만)은 한글이 하는 대로: '다음 문단과 함께'로 묶인 것과 나눌 수 없는 것만
+                # 통째로, 그 밖 문단·표는 줄 사이에서 나눔(옛 판: 8줄 문단이 7줄 자리에도 넘어감, 평가 2026-11-09)
                 page, y = page + 1, 0.0
                 used.append(0.0)
                 if j > i:
@@ -494,16 +582,30 @@ class Layout:
                 # 글자처럼 취급하지 않은 표 바로 뒤 문단은 위 간격 없이(한글 실측 — 그 자리는 표 바깥 아래 여백이 맡음)
                 y += it["prev"] if y > 0 and not (k > 0 and items[k - 1]["float"]) else 0
                 start = None
-                for lh in it["hs"]:
+                # 칸 안에서 나누는 표는 줄 대신 칸 글 조각 단위로 — 쪽 경계에서 줄이 갈라짐(표 문단 끝 여분은 마지막 조각에)
+                units, row_end = it["hs"], {}
+                if it.get("pieces") and len(it["pieces"]) == len(it["hs"]):
+                    units = [u for row in it["pieces"] for u in row]
+                    units[-1] += sum(it["hs"]) - sum(units)
+                    at = 0
+                    for row in it["pieces"]:
+                        row_end[at] = at + len(row) - 1  # 줄 첫 조각 → 끝 조각
+                        at += len(row)
+                row_start = None
+                for u_i, lh in enumerate(units):
                     if y + lh > body_h + 1 and y > 0:
                         used[page] = y
                         page, y = page + 1, 0.0
                         used.append(0.0)
-                        if start is not None:
-                            y += it["repeat"]  # 표가 나뉘면 다음 쪽에 머리 줄이 되풀이됨
+                        if start is not None and it["repeat"] < body_h / 2:
+                            y += it["repeat"]  # 표가 나뉘면 다음 쪽에 머리 줄이 되풀이됨(쪽을 넘을 만큼 긴 머리 줄은 되풀이되지 않는 것으로 봄)
                     if start is None:
                         start = page
                         self.tops.append((page, y))
+                    if u_i in row_end:
+                        row_start = (page, row_end[u_i])
+                    if row_start and u_i == row_start[1]:
+                        self.split_rows += page != row_start[0]
                     y += lh
                 y += it["next"]
                 used[page] = y

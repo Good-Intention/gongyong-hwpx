@@ -7,6 +7,7 @@
 """
 import json
 import os
+import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PATH = os.environ.get("GONGYONG_PROFILE") or os.path.join(HERE, "..", "assets", "profile.json")
@@ -30,12 +31,25 @@ DEFAULTS = {
     "line_max_pct": 190,            # 쪽 맞춤이 줄 간격을 넓힐 때 상한(%)
     "spacing_min_pct": -18,         # 자간 하한(%) — 줄 맞춤에서 줄일 때
     "spacing_max_pct": 5,           # 자간 상한(%) — 줄 맞춤에서 늘릴 때
+    "line_fill_pct": 3,             # 한 줄·끝 줄을 끝선까지 채울 때 자간을 늘리는 한도(%p), 0이면 끔
     "note_smaller_pt": 2,           # 본문 * 풀이·※ 참고 = 바로 위 문단보다 이만큼 작게
     "note_gap_pt": 3,               # 그 문단 아래 간격 하한
     "paren_smaller_pt": 2,          # 부연설명 괄호 = 이만큼 작게(계획 paren_small로 문서마다 바꿈)
     "square_smaller_pt": 2,         # □ 기호만 뒤 글자보다 이만큼 작게
     "date_gap_pt": 1,               # 날짜·부서 줄 아래(요약 상자 위) 간격
 }
+
+
+# 값의 범위 — 벗어나면 알리고 기본값(자간 하한 12처럼 틀린 값이 말없이 자간 줄이기를 끄던 것, 평가 2026-11-09)
+RANGES = {"spacing_min_pct": (-50, 0), "spacing_max_pct": (0, 20), "line_fill_pct": (0, 20), "line_min_pct": (50, 400), "line_max_pct": (50, 400),
+          "table_title_line_pct": (50, 400), "body_pt": (6, 40), "table_min_pt": (6, 40)}
+
+
+def _warn(msg):
+    try:
+        print("기준값 알림: " + msg, file=sys.stderr)
+    except (OSError, UnicodeError):
+        pass
 
 
 def _load():
@@ -47,6 +61,9 @@ def _load():
         return d
     except ValueError as e:
         raise SystemExit(f"기준값 파일({PATH})이 JSON 모양이 아닙니다: {e}")
+    if not isinstance(raw, dict):
+        _warn(f"기준값 파일({PATH})은 {{ \"항목\": 값 }} 꼴이어야 합니다 — 기본값으로 진행합니다.")
+        return d
     for k, v in raw.items():
         if k.startswith("_"):
             continue
@@ -56,6 +73,10 @@ def _load():
             v = v.get("값")
         if not isinstance(v, (int, float)) or isinstance(v, bool):
             raise SystemExit(f"기준값 ‘{k}’는 숫자여야 합니다(받은 값: {v!r}).")
+        lo, hi = RANGES.get(k, (0, 1000))
+        if not lo <= v <= hi:
+            _warn(f"‘{k}’ 값 {v:g}은 쓸 수 있는 범위({lo:g}~{hi:g}) 밖이라 기본값 {DEFAULTS[k]:g}을 씁니다.")
+            continue
         d[k] = v
     return d
 

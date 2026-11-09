@@ -27,11 +27,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from style_profile import P as PROFILE  # noqa: E402 — 기준값(assets/profile.json)
-from hwpx_lib import (HWPUNIT_PER_MM, UNIT_RE, T, HeaderEdit, Package, Styles, _base_head, blank_png,  # noqa: E402
+from hwpx_lib import (HWPUNIT_PER_MM, NUM_CHARS, UNIT_RE, T, HeaderEdit, Package, Styles, _base_head, blank_png, clean_chars, insert_marker_gap,  # noqa: E402
                       etree,
                       cell_paras,
                       drop_linesegs, indexed_runs, is_blank, is_struct, label_colon, label_content, marker_level, new_id,
                       page_info, para_pics, para_runs, para_tables, para_text, run_objects, run_text, set_run_text, space_colons,
+                      Note, clear_print_method, fake_label, fix_note, head_length, note_is_fix, pct_range,
                       split_marker,
                       table_grid, TABLE_TITLE_MARK, is_table_title)
 from check import check, print_report  # noqa: E402
@@ -55,8 +56,30 @@ YEAR_MARK_PREV = {"(": -50, "[": -50, "~": -30}
 # (왼쪽이 빔), 」는 왼쪽(오른쪽이 빔), ·ㆍ는 가운데(양쪽이 빔). 표시 자리를 잰 글꼴만 좁힌다.
 TIGHT_FONTS = {"휴먼명조"}
 NL = "\n"
+FLOW_BOX_MIN_MM = 15  # 도표 상자가 이보다 좁아질 만큼 단계가 많으면 만들지 않음(40단계에 엉뚱한 칸 수 오류가 나던 것 — 평가 2026-11-09)
 IMAGE_MAX_PX = 1200       # 표 칸 배경 그림: 긴 변을 이 화소까지 줄임(인쇄 A4 칸에 충분, 용량 줄이기 — 사용자 원칙 2026-11-01)
 IMAGE_JPEG_QUALITY = 82
+
+
+def encode_image(im):
+    """Pillow 그림을 흰 바탕에 합쳐 긴 변 IMAGE_MAX_PX로 줄이고 JPEG·PNG 중 작은 쪽으로. (바이트, 확장자, 가로, 세로)."""
+    import io
+    from PIL import Image
+    if im.mode in ("RGBA", "LA", "P"):
+        rgba = im.convert("RGBA")
+        flat = Image.new("RGB", rgba.size, (255, 255, 255))
+        flat.paste(rgba, mask=rgba.getchannel("A"))
+        im = flat
+    else:
+        im = im.convert("RGB")
+    if max(im.size) > IMAGE_MAX_PX:
+        f = IMAGE_MAX_PX / max(im.size)
+        im = im.resize((max(1, round(im.size[0] * f)), max(1, round(im.size[1] * f))), Image.LANCZOS)
+    jpg, png = io.BytesIO(), io.BytesIO()
+    im.save(jpg, "JPEG", quality=IMAGE_JPEG_QUALITY, optimize=True)
+    im.save(png, "PNG", optimize=True)
+    data, ext = (png.getvalue(), "png") if png.tell() < jpg.tell() else (jpg.getvalue(), "jpg")
+    return data, ext, im.size[0], im.size[1]
 
 
 def _png_jpeg_size(data):
@@ -77,11 +100,8 @@ BASIS_TITLE_RE = re.compile(r"근\s*거|관계\s*법|관련\s*법")  # 근거법
 # 부연설명 검사(basis_notes)는 제목이 근거법령 그 자체일 때만('산출근거'·'추진근거 및 경과'는 아님)
 BASIS_LAW_TITLE_RE = re.compile(r"^(근\s*거\s*(법\s*령|법\s*규|규\s*정)?|관\s*[계련]\s*법\s*[령규]|법\s*적\s*근\s*거)\s*$")
 BASIS_RE = re.compile(r"근\s*거|법\s*령|법\s*적|관계\s*법|관련\s*법")  # 근거법령 ○의 괄호 이름표
-# 출력 두 등급: 계획을 고쳐야 하는 알림(고쳐야 함)과 도구가 한 일의 기록(알림) — 중요한 것이 묻히지 않게(검수 2026-11-01)
+# 출력 두 등급: 계획을 고쳐야 하는 알림(고쳐야 함 — fix_note·warn(level='fix'))과 도구가 한 일의 기록(알림) — 중요한 것이 묻히지 않게(검수 2026-11-01)
 SUMMARY_END_RE = re.compile(r"(고자\s*함|보고임)\s*\.?$")  # 요약 상자 끝맺음 ~하고자 함·~줄이고자 함·~에 대한 보고임(사용자 원칙 2026-11-01)
-FIX_RE = re.compile(r"근거법령이 없|‘~으로’로 끝나는|한 열에 세 가지 정보|요약 상자에는|요약 상자 끝맺음|끝 줄에 한두 낱말만|한 줄 줄이기 후보|항목 수 —|두 쪽에 걸친|칸보다 긴 낱말|다음 줄로 넘어가는 칸이 남았|빈칸이 크게 벌어지는 줄이 남은|"
-                    r"견본 문단은 '|굵은 조각이 없어|위 첨자 조각이 없어|넣지 못했습니다|다 들어가지 않을 수 있습니다|"
-                    r"날짜·부서 줄이 없습니다|근거법령에는 부연설명|표 제목이 없습니다|표 제목이 한 줄을 넘|바로 위 제목과 겹치는 ■ 제목|개보다 적은 도표")
 # 날짜·부서 줄: ’26. 10. 30.(금) / 2026. 10. 30. / ’26. ○. ○.(○)로 시작하는 문단
 DATE_NEXT = int(round(PROFILE["date_gap_pt"] * 100))  # 날짜·부서 줄 아래(요약 상자 위) 간격 1pt(사용자 2026-11-05 '부서 이름 행의 아래에 공간을 조금 1pt 정도')
 DATE_LINE_RE = re.compile(r"^[ \t⎵]*(?:[’']\s*[\d○]{2}|(?:19|20)\d{2})\.\s*[\d○]{1,2}\.\s*[\d○]{1,2}\.")
@@ -90,20 +110,88 @@ MID_DOTS = "·ㆍ"
 # — 계획의 "doc_type"이 이 꼴이면 근거법령 검사(맨 앞으로 옮기기·'근거법령이 없습니다')를 건너뛴다(사용자 2026-11-07 '충돌이 있는
 # 근거법령부분은 특정 보고에서는 빼도록 조정합시다'). 검사만(review)은 만든 문서에 남긴 표시나 제목 상자 글로도 알아본다.
 BASIS_EXEMPT_RE = re.compile(r"회의\s*자료|보도\s*자료|보도\s*(관련\s*)?대응|언론|답변서?|주간\s*(업무)?\s*보고|사업\s*설명서")
-SKILL_VERSION = "2.1"  # 만든 문서에 남기는 판(meta made=…) — 판을 올릴 때 README '지금 판'과 함께 바꿈
+SKILL_VERSION = "2.11"  # 만든 문서에 남기는 판(meta made=…) — 판을 올릴 때 README '지금 판'과 함께 바꿈
 # 계획 "omit": 사용자가 일부러 뺀 요소 — 그 요소의 '고쳐야 함'을 알림으로 낮춘다(평가 2026-11-08 '사용자가 일부러 뺀 것을
-# 선언할 길이 없다 — 날짜 줄·요약 상자를 빼라고 해도 끝 번호 3'). 키 → (보이는 이름, 그 요소의 고쳐야 함 문장)
-OMIT_KEYS = {"date": ("날짜·부서 줄", r"날짜·부서 줄이 없습니다"),
-             "summary": ("요약 상자", r"요약 상자"),
-             "basis": ("근거법령", r"근거법령"),
-             "table_title": ("■ 표 제목", r"표 제목이 (없습니다|한 줄을 넘)")}
-
-
-def omit_hit(msg, omit):
-    """이 알림·고쳐야 함 문장이 사용자가 뺀다고 한 요소의 것인가."""
-    return any(re.search(OMIT_KEYS[k][1], msg) for k in omit if k in OMIT_KEYS)
+# 선언할 길이 없다 — 날짜 줄·요약 상자를 빼라고 해도 끝 번호 3'). 키 → 보이는 이름. 알림이 키를 kind로 든다(fix_note)
+OMIT_KEYS = {"date": "날짜·부서 줄", "summary": "요약 상자", "basis": "근거법령", "table_title": "■ 표 제목"}
+BASIS_MISSING = ("근거법령이 없습니다({}) — 모든 공문·보고서·계획서에 근거법령이 옵니다: 로마자 장이 있으면 Ⅰ. 근거법령, 없으면 첫 □ 근거법령"
+                 "(아래 ○ 「…법」 제○조 하나씩). 근거를 모르면 사용자에게 묻습니다.")  # 만들기·검사만이 같은 문장
+SUMMARY_END_MSG = "요약 상자 끝맺음은 ‘~하고자 함’ 또는 ‘~에 대한 보고임’으로 하세요(지금: ‘…{}’)."
 DOC_META = "gongyong-hwpx"  # 만든 문서 content.hpf의 opf:meta 이름 — 'doc_type=…;basis=off'(검사만이 읽음)
 OPF_NS = "http://www.idpf.org/2007/opf/"
+
+
+def check_plan(plan):
+    """계획을 읽자마자 모양을 본다 — 파이썬 오류 대신 쉬운 말로(평가 2026-11-09). 돌려주는 것: 블록 목록."""
+    if isinstance(plan, list):
+        blocks, opts = plan, {}
+    elif isinstance(plan, dict):
+        if "blocks" not in plan:
+            raise BuildError("계획에 \"blocks\"(블록 목록)가 없습니다 — {\"blocks\": [{\"like\": 0, \"text\": \"제목\"}, …]} 꼴로 쓰세요.")
+        blocks, opts = plan["blocks"], plan
+    else:
+        raise BuildError("계획은 { … } 또는 [ … ] 꼴의 JSON이어야 합니다.")
+    if not isinstance(blocks, list):
+        raise BuildError("\"blocks\"는 블록 목록([ … ])이어야 합니다.")
+    for n, b in enumerate(blocks, 1):
+        if not isinstance(b, dict):
+            raise BuildError(f"블록 {n}: 블록은 {{\"like\": 번호, …}} 꼴이어야 합니다(받은 값: {b!r}).")
+        like = b.get("like")
+        if "like" in b and (not isinstance(like, int) or isinstance(like, bool)):
+            raise BuildError(f"블록 {n}: like는 견본 문단 번호(숫자)여야 합니다(받은 값: {like!r}).")
+        if "text" in b and not isinstance(b["text"], str):
+            raise BuildError(f"블록 {n}: text는 글(문자열)이어야 합니다(받은 값: {b['text']!r}) — 빈 글이면 \"\", 견본 글을 그대로 두려면 text를 빼세요.")
+        w = b.get("widths")
+        if w is not None and (not isinstance(w, list) or not w or any(isinstance(x, bool) or not isinstance(x, (int, float)) or x <= 0 for x in w)):
+            raise BuildError(f"블록 {n}: widths는 칸마다 양수를 적은 목록이어야 합니다(비율, 예: [1, 2, 2], 받은 값: {w!r}).")
+    omit = opts.get("omit")
+    if omit is not None and not isinstance(omit, (list, str)):
+        raise BuildError(f"\"omit\"은 목록이어야 합니다(예: [\"date\", \"summary\"], 받은 값: {omit!r}).")
+    small = opts.get("paren_small")
+    if small is True or (small not in (None, False) and not isinstance(small, (int, float))):
+        raise BuildError(f"\"paren_small\"은 줄일 글자 크기(pt) 숫자여야 합니다 — 끄려면 false(받은 값: {small!r}).")
+    return blocks
+
+
+LAW_RE = re.compile(r"「([^「」\n]{2,40})」")
+LAW_NAME_RE = re.compile(r"(법|법률|시행령|시행규칙|규칙|규정|조례|훈령|예규|고시|지침|협약)$")
+ARTICLE_RE = re.compile(r"제\s*(\d+)\s*조(?:의\s*(\d+))?(?:\s*제\s*(\d+)\s*항)?(?:\s*제\s*(\d+)\s*호)?")
+
+
+def law_citations(texts):
+    """글에 나온 법령 인용을 뽑는다 — 돌려주는 것: (인용 글 목록, 번호를 아직 안 채운 '제○조' 꼴 수). 법령이 있는지·조문이 맞는지는
+    여기서 알 수 없어 글을 쓰는 쪽이 법령 검색 도구로 확인한다(도구는 조문을 지어내지 않게 목록만 — 평가 조언 2026-11-09)."""
+    found, blanks = [], 0
+    for text in texts:
+        text = text.replace("⎵", " ").replace("⍽", " ")
+        marks = list(LAW_RE.finditer(text))
+        for k, m in enumerate(marks):
+            stop = marks[k + 1].start() if k + 1 < len(marks) else min(len(text), m.end() + 60)
+            tail = text[m.end():stop]
+            blanks += len(re.findall(r"제\s*[○◯Ｏ]+\s*조", tail))
+            arts = ["".join(("제" + a.group(1) + "조", "의" + a.group(2) if a.group(2) else "", "제" + a.group(3) + "항" if a.group(3) else "",
+                             "제" + a.group(4) + "호" if a.group(4) else "")) for a in ARTICLE_RE.finditer(tail)]
+            # 낫표는 계획·사업 이름에도 쓴다(「2026년도 ○○ 시행계획」) — 조문이 없으면 이름이 법령 꼴일 때만
+            if not arts and "○" not in tail[:12] and LAW_NAME_RE.search(m.group(1)):
+                arts = [""]
+            found += [f"「{m.group(1)}」 {a}".rstrip() for a in arts]
+    found = list(dict.fromkeys(found))
+    with_art = {c.split("」")[0] for c in found if not c.endswith("」")}  # 조문까지 적은 법령은 이름만 줄을 뺌
+    return [c for c in found if not (c.endswith("」") and c.split("」")[0] in with_art)], blanks
+
+
+def print_citations(texts):
+    """법령 인용 목록을 찍는다 — 늘 읽는 설명서를 늘리지 않고 도구 출력이 할 일을 알림."""
+    found, blanks = law_citations(texts)
+    if not found and not blanks:
+        return
+    print(f"## 법령 인용 {len(found)}곳(전하기 전에 법령 검색 도구로 조문이 있는지·뜻이 맞는지 확인 — 도구가 없으면 확인하지 못했다고 전할 것)")
+    for c in found[:40]:
+        print(" - " + c)
+    if len(found) > 40:
+        print(f" - … 그 밖 {len(found) - 40}곳")
+    if blanks:
+        print(f" - 번호를 아직 안 채운 ‘제○조’ {blanks}곳 — 확인한 조문으로 채우거나 사용자에게 물을 것")
 
 
 def basis_exempt(doc_type):

@@ -44,6 +44,17 @@ class Fitter(LineFit, TableFit, PageFit):
                         out.append((cp, w))
         return out
 
+    def summary_paras(self):
+        """요약 상자(제목 상자 뒤 첫 한 칸 상자) 안 문단 — 줄 바꿈을 넣지 않는 곳(style-guide). 없으면 빈 묶음."""
+        paras = self.paras()
+        start = cover_end(paras) or 0
+        one = lambda p: bool(para_tables(p)) and para_tables(p)[0].get("rowCnt") == "1" and para_tables(p)[0].get("colCnt") == "1"  # noqa: E731
+        title = next((i for i, p in enumerate(paras[start:], start) if one(p)), None)
+        if title is None:
+            return set()
+        box = next((p for p in paras[title + 1:title + 6] if one(p)), None)
+        return set(cell_paras(table_grid(para_tables(box)[0])[0][4])) if box is not None else set()
+
     # ------------------------------------------------------------ 표지
     def pull_corners(self):
         """머리 기호(○ - □ …)·괄호 이름표·'항목 : ' 바로 뒤 내용이 여는 낫표(「 『)면, 휴먼명조에서는 표시가 칸 오른쪽에 찍혀
@@ -173,7 +184,7 @@ class Fitter(LineFit, TableFit, PageFit):
             y_band = max(top + COVER_MIN_GAP, y_band - (COVER_MIN_GAP - gap) * (2 if box is not None else 1))
             gap = max(COVER_MIN_GAP, (bottom_top - (y_band + band_h) - box_h) / (2 if box is not None else 1))
         if y_band + band_h + box_h + gap * (2 if box is not None else 1) + bottom_h > self.body_h - SAFETY / 2:
-            self.notes.append("표지 글이 길어 한 쪽에 다 들어가지 않을 수 있습니다 — 개요 상자 글을 줄이세요.")
+            self.notes.append(fix_note("표지 글이 길어 한 쪽에 다 들어가지 않을 수 있습니다 — 개요 상자 글을 줄이세요."))
         sets = [(band, y_band - top), (last_pic, gap)]
         if box is not None:
             sets.append((box, gap))
@@ -270,4 +281,4 @@ class Fitter(LineFit, TableFit, PageFit):
                     "그 묶음 글을 줄이거나 앞 묶음을 줄이세요")
         if unknown:
             msg += f" — 폭 표에 없는 글꼴({', '.join(unknown)})은 어림값으로 계산함"
-        return msg
+        return fix_note(msg) if self.lay.split else msg

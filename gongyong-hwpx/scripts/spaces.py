@@ -12,7 +12,7 @@
 import copy
 import re
 
-from hwpx_lib import T, head_length, para_runs, para_text, run_text, set_run_text
+from hwpx_lib import edit_run_text, head_length, para_runs, para_text, plain_run, run_tabs, run_text, set_run_text
 
 FW = "⎵"
 
@@ -29,7 +29,7 @@ def compact_fw(p, styles, hedit, split, tab_proto):
     for r in list(para_runs(p)):
         t = run_text(r)
         st, pos = pos, pos + len(t)
-        if st >= k or FW * 2 not in t[:k - st] or not (len(r) == 1 and r[0].tag == T("hp:t")):
+        if st >= k or FW * 2 not in t[:k - st] or not (plain_run(r)):
             continue
         cid = r.get("charPrIDRef")
         ratio = styles.char.get(cid, {}).get("ratio", 100)
@@ -56,12 +56,13 @@ def compact_fw(p, styles, hedit, split, tab_proto):
                 merged[-1] = (merged[-1][0] + s, c2)
             else:
                 merged.append((s, c2))
-        set_run_text(r, merged[0][0], tab_proto)
+        tabs = run_tabs(r)
+        set_run_text(r, merged[0][0], tab_proto, tabs)
         r.set("charPrIDRef", merged[0][1])
         last = r
         for s, c2 in merged[1:]:
             twin = copy.deepcopy(r)
-            set_run_text(twin, s, tab_proto)
+            set_run_text(twin, s, tab_proto, tabs)
             twin.set("charPrIDRef", c2)
             last.addnext(twin)
             last = twin
@@ -90,7 +91,7 @@ def lead_to_margin(p, styles, hedit, lay, split, fonts_ok, tab_proto, w):
         t = run_text(r)
         if not t:
             continue
-        if not (len(r) == 1 and r[0].tag == T("hp:t")):
+        if not (plain_run(r)):
             return False
         cut = min(left_n, len(t))
         todo.append((r, t[cut:]))
@@ -98,7 +99,7 @@ def lead_to_margin(p, styles, hedit, lay, split, fonts_ok, tab_proto, w):
     if left_n:
         return False
     for r, t in todo:
-        set_run_text(r, t, tab_proto)
+        edit_run_text(r, t, tab_proto)
     left, intent = pp.get("left", 0), pp.get("intent", 0)
     first = left + max(intent, 0) + width
     rest = left + max(-intent, 0)

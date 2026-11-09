@@ -320,7 +320,7 @@ class TableFit:
         두 열 사이에서 BORROW_STEP씩 폭을 옮겨 보며 (표 전체 줄 수, 꺾인 '· 항목'(뜻 단위 두 줄은 괜찮음)·짧은 값 수,
         모든 칸 줄 수, 자간을 줄인 칸 수 — 한 줄 더 꺾이기보다 자간을 조금 줄이는 쪽)가 좋아질 때만 옮긴다. 폭을 내준 칸은 자간을 TIGHT_SP 줄여야 줄 수가 지켜지면
         그만큼 줄인다. 옮겼으면 1."""
-        info = self._borrow_cells(tbl)
+        info = None if tbl in self.b.fixed_widths else self._borrow_cells(tbl)  # 사용자가 준 너비는 빌리지 않음
         if info is None:
             return 0
         grid, n, cells, heads = info
@@ -516,6 +516,9 @@ class TableFit:
         if not main:
             return None
         want = self._body_size() - TABLE_BODY_GAP - getattr(self, "page_shrink", {}).get(tbl, 0)
+        keep = getattr(self, "keep_table_pt", None)
+        if keep and keep <= main < want:
+            return main, main  # 만들 때 한 장에 넣으려 줄인 표 글자(표시 table_pt) — 다시 재도 키우지 않음(평가 2026-11-09)
         if want != main:
             for r in self._table_runs(tbl):
                 r.set("charPrIDRef", self.b.hedit.char_size(r.get("charPrIDRef"), want - main))
@@ -625,13 +628,22 @@ class TableFit:
         idx = {p: i for i, p in enumerate(paras)}
         starts = sorted(idx[h] for h in heads)
         undone = 0
-        for s0 in self.lay.split:
+        split0 = set(self.lay.split)
+        for s0 in sorted(split0):
             e0 = next((h for h in starts if h > s0), len(paras))
-            for p in paras[s0:e0]:
-                for tbl in para_tables(p):
-                    for el, k, v in pad.pop(tbl, []):
-                        el.set(k, v)
-                        undone += 1
+            tbls = [t for p in paras[s0:e0] for t in para_tables(p) if t in pad]
+            # 넓힌 여백 때문에 걸친 것인지 재 본다 — 되돌려도 그대로 걸치면 여백은 그대로 둠(옛 판은 원인과 상관없이 1.2mm를 되돌렸음, 평가 2026-11-09)
+            now = [(el, k, el.get(k)) for t in tbls for el, k, _ in pad[t]]
+            for t in tbls:
+                for el, k, v in pad[t]:
+                    el.set(k, v)
+            self.lay.paginate(paras, self.body_w, self.body_h - SAFETY, heads, BLOCK_GAP)
+            if s0 in self.lay.split:
+                for el, k, v in now:
+                    el.set(k, v)
+                continue
+            for t in tbls:
+                undone += len(pad.pop(t))
         if undone and refit:
             self.fit_pages()
             self.notes.append("칸 여백을 넓히면 □ 묶음이 두 쪽에 걸치는 곳은 그 묶음 표의 칸 여백을 원래대로 두었습니다(공간이 모자람).")
@@ -1069,7 +1081,7 @@ class TableFit:
                 if font and font[1] != font[0]:
                     shrunk.append(font)
                     self._bullet_cells(tbl)  # 글자가 작아졌으니 둘째 줄 들여쓰기(기호 폭)를 다시 잼
-                if tbl in self.b.flow_tables:  # 투명 선 도표: 상자·화살표 칸 비율 그대로(끝선만 맞춤)
+                if tbl in self.b.flow_tables or tbl in self.b.fixed_widths:  # 투명 선 도표·사용자가 준 너비: 칸 비율 그대로(끝선만 맞춤)
                     new, kind = None, None
                 else:
                     new, kind = self._layout_widths(tbl, grid, n, merged, total, cur)
@@ -1085,6 +1097,7 @@ class TableFit:
                         sz = tc.find(T("hp:cellSz"))
                         sz.set("width", str(int(round(int(sz.get("width", "0")) * f))))
                     tbl.find(T("hp:sz")).set("width", str(int(total)))
+                self._narrow_cells(tbl, table_grid(tbl), self.lay.table_width(tbl))
                 captions += self._caption_box(tbl, table_grid(tbl), self.lay.table_width(tbl))
                 images += self._image_layout(tbl, table_grid(tbl), self.lay.table_width(tbl))
                 # 숫자 열(내용 칸 대부분이 숫자·날짜)의 숫자 칸: 금액과 수량 숫자(대수·건수·명·%·쪽 수 등)는 오른쪽 정렬 + 오른쪽
@@ -1178,16 +1191,16 @@ class TableFit:
                 note_font += self._fit_notes(p, tbl)
         self.notes[:] = [m for m in self.notes if "표 제목이 한 줄을 넘" not in m]
         if self.long_titles:
-            self.notes.append(f"표 제목이 한 줄을 넘습니다 — {len(self.long_titles)}개(" + ", ".join(f"‘{t}…’" for t in self.long_titles[:3])
-                              + "): ■ 제목은 표 폭 안 한 줄로 줄이세요(기준일·출처는 단위 줄이나 표 아래 ※로).")
+            self.notes.append(fix_note(f"표 제목이 한 줄을 넘습니다 — {len(self.long_titles)}개(" + ", ".join(f"‘{t}…’" for t in self.long_titles[:3])
+                              + "): ■ 제목은 표 폭 안 한 줄로 줄이세요(기준일·출처는 단위 줄이나 표 아래 ※로).", "table_title"))
         if again:  # 두 번째 적용: 한 일은 첫 번째 알림에 있고, '남은 칸' 알림만 마지막 상태로 바꿔 적는다
             self.notes[:] = [m for m in self.notes if "다음 줄로 넘어가는 칸이 남았습니다" not in m and "칸보다 긴 낱말" not in m]
             if left:  # (한 장에 넣으려고 표 글자를 줄인 것은 fit_long_tables가 알림)
-                self.notes.append(f"표 {len(left)}개는 다음 줄로 넘어가는 칸이 남았습니다(표 글자는 본문보다 {TABLE_BODY_GAP}pt 작게 "
-                                  "그대로) — 칸 글을 줄이거나 칸을 합치면 한 줄로 들어갑니다: " + ", ".join(f"‘{t}’" for t in left))
+                self.notes.append(fix_note(f"표 {len(left)}개는 다음 줄로 넘어가는 칸이 남았습니다(표 글자는 본문보다 {TABLE_BODY_GAP}pt 작게 "
+                                  "그대로) — 칸 글을 줄이거나 칸을 합치면 한 줄로 들어갑니다: " + ", ".join(f"‘{t}’" for t in left)))
             if cut_words:
-                self.notes.append(f"칸보다 긴 낱말 {len(cut_words)}개는 한글이 글자 단위로 끊습니다(단어로 끊기 어긋남) — "
-                                  "띄어 쓸 수 있는 말이면 띄우거나 줄이세요: " + ", ".join(f"‘{w}’" for w in cut_words))
+                self.notes.append(fix_note(f"칸보다 긴 낱말 {len(cut_words)}개는 한글이 글자 단위로 끊습니다(단어로 끊기 어긋남) — "
+                                  "띄어 쓸 수 있는 말이면 띄우거나 줄이세요: " + ", ".join(f"‘{w}’" for w in cut_words)))
             return
         msg = []
         if edge:
@@ -1241,17 +1254,55 @@ class TableFit:
         if desc_dots:
             msg.append(f"설명 열에서 '·'가 없던 {desc_dots}칸도 '· '로 시작하게 통일했습니다")
         if three_info:
-            self.notes.append(f"한 열에 세 가지 정보가 든 머리 칸 {len(three_info)}개({', '.join(sorted(set(three_info))[:4])}): "
+            self.notes.append(fix_note(f"한 열에 세 가지 정보가 든 머리 칸 {len(three_info)}개({', '.join(sorted(set(three_info))[:4])}): "
                               "내용·배점·부서처럼 세 가지를 한 열에 넣으면 분잡합니다 — 부서는 같은 종류(담당 부서) 열과 합치거나 "
-                              "따로 열로 두세요(배점은 '지표(배점)'처럼 이름 뒤 괄호로).")
+                              "따로 열로 두세요(배점은 '지표(배점)'처럼 이름 뒤 괄호로)."))
         if msg:
             self.notes.append("; ".join(msg) + ".")
         if left:
-            self.notes.append(f"표 {len(left)}개는 다음 줄로 넘어가는 칸이 남았습니다(표 글자는 본문보다 {TABLE_BODY_GAP}pt 작게 "
-                              "그대로) — 칸 글을 줄이거나 칸을 합치면 한 줄로 들어갑니다: " + ", ".join(f"‘{t}’" for t in left))
+            self.notes.append(fix_note(f"표 {len(left)}개는 다음 줄로 넘어가는 칸이 남았습니다(표 글자는 본문보다 {TABLE_BODY_GAP}pt 작게 "
+                              "그대로) — 칸 글을 줄이거나 칸을 합치면 한 줄로 들어갑니다: " + ", ".join(f"‘{t}’" for t in left)))
         if cut_words:
-            self.notes.append(f"칸보다 긴 낱말 {len(cut_words)}개는 한글이 글자 단위로 끊습니다(단어로 끊기 어긋남) — "
-                              "띄어 쓸 수 있는 말이면 띄우거나 줄이세요: " + ", ".join(f"‘{w}’" for w in cut_words))
+            self.notes.append(fix_note(f"칸보다 긴 낱말 {len(cut_words)}개는 한글이 글자 단위로 끊습니다(단어로 끊기 어긋남) — "
+                              "띄어 쓸 수 있는 말이면 띄우거나 줄이세요: " + ", ".join(f"‘{w}’" for w in cut_words)))
+
+    def _narrow_cells(self, tbl, grid, total):
+        """칸 안 여백 + 1mm보다 좁은 칸은 한글이 넓혀 표가 튀어나온다 — 너비를 어느 길로 정했든 마지막에 잰다(옛 판은 너비를 다시 나눌 때만 재서
+        40열 표가 그대로 남음, 평가 2026-11-09). 넓은 칸에서 덜어 오고, 그래도 모자라면 칸 안 여백을 줄여 표 폭에 넣은 뒤 '고쳐야 함'으로
+        (표를 나누거나 가로 쪽). 계획의 widths로 준 표는 너비를 바꾸지 않고 알리기만. 도표·합친 칸 표는 뺌."""
+        if tbl in self.b.flow_tables or any(rs > 1 or cs > 1 for _, _, rs, cs, _ in grid):
+            return
+        n = int(tbl.get("colCnt", "1"))
+        first = {c: tc for r, c, _, _, tc in grid if r == 0}
+        if n <= 1 or len(first) != n:
+            return
+        ws = [int(first[c].find(T("hp:cellSz")).get("width", "0")) for c in range(n)]
+        needs = [self._cell_margin(tbl, first[c]) + 282 for c in range(n)]
+        if all(w >= q for w, q in zip(ws, needs)):
+            return
+        name = (" ".join(para_text(cp) for cp in cell_paras(first[0])) or "표").strip()[:8]
+        if tbl in self.b.fixed_widths:
+            msg = f"계획의 widths로 준 칸이 칸 안 여백보다 좁아 한글이 넓힙니다(표 ‘{name}…’) — widths를 고치세요."
+            if msg not in self.notes:
+                self.notes.append(fix_note(msg))
+            return
+        if sum(needs) > total:
+            for _, _, _, _, tc in grid:
+                tc.set("hasMargin", "1")
+                cm = tc.find(T("hp:cellMargin"))
+                if cm is None:
+                    cm = etree.SubElement(tc, T("hp:cellMargin"))
+                    for k in ("top", "bottom"):
+                        cm.set(k, "141")
+                cm.set("left", str(CELL_MARGIN_MIN))
+                cm.set("right", str(CELL_MARGIN_MIN))
+            msg = (f"열이 많아 칸이 좁은 표 ‘{name}…’({n}열) — 칸 안 여백을 줄여 표 폭에 넣었습니다. 글자가 빽빽하니 표를 나누거나 "
+                   "가로 쪽 문서로 만드세요.")
+            if msg not in self.notes:
+                self.notes.append(fix_note(msg))
+            needs = [self._cell_margin(tbl, first[c]) + 282 for c in range(n)]
+        if sum(needs) <= total:
+            self._set_widths(tbl, grid, [max(w, 1) for w in ws], total)
 
     def _set_widths(self, tbl, grid, widths, total):
         ws = [int(round(w)) for w in widths]

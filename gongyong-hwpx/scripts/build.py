@@ -21,6 +21,7 @@
 """
 from build_base import *  # noqa: F401,F403
 from hwpx_lib import _base_head  # noqa: E402,F401 — 밑줄 이름은 *로 안 넘어옴
+from hwpx_lib import COMPOSE_CHAR, read_plan, same_path  # noqa: E402
 from build_fill import FillPart  # noqa: E402
 from build_rules import RulesPart  # noqa: E402
 from spaces import compact_fw, lead_to_margin  # noqa: E402
@@ -42,6 +43,7 @@ class Builder(FillPart, RulesPart):
         self.keep_numbers = True
         self.colons = True
         self.omit = set()  # 계획 "omit"(사용자가 일부러 뺀 요소)
+        self.fixed_widths = set()  # 계획 "widths"로 칸 너비를 준 표
         self.sec_names = pkg.sections()
         self.sec = pkg.xml(self.sec_names[0])
         self.protos = [p for p in self.sec if p.tag == T("hp:p")]
@@ -51,9 +53,10 @@ class Builder(FillPart, RulesPart):
         self.struct_runs = self._collect_struct()
         self.flow_tables |= self._find_flow_tables()  # 이미 만든 문서의 흐름도도(만들 때는 flow_table이 더함)
 
-    def warn(self, msg):
+    def warn(self, msg, level="info", kind=None):
+        """알림 한 줄. level="fix"면 '고쳐야 함', kind는 계획 "omit" 키(그 요소를 뺀다고 했으면 알림으로 낮춤)."""
         if msg not in self.warnings:
-            self.warnings.append(msg)
+            self.warnings.append(fix_note(msg, kind) if level == "fix" else msg)
 
     # ------------------------------------------------------------ 준비
     def _collect_struct(self):
@@ -95,10 +98,28 @@ class Builder(FillPart, RulesPart):
         return p
 
     # ------------------------------------------------------------ 표지·요약 상자
+    def starts_with_cover(self, blocks):
+        """계획이 표지로 시작하는가: 본문 첫 문단(쪽 설정이 든 견본) 앞 블록에 그림이 있거나, 첫 블록이 견본 첫 그림 바로 다음 문단(제목 띠)일 때 —
+        슬로건을 빼려면 19번을 쓰지 않는다(cover.md)는데 그림으로 시작하는 계획만 표지로 봐 쪽 나눔·쪽 번호 감추기가 빠졌음(평가 2026-11-09)."""
+        sec_idx = next((i for i, p in enumerate(self.protos) if p.find(".//" + T("hp:secPr")) is not None), None)
+        head = []
+        for b in blocks:
+            if isinstance(b, dict) and b.get("like") == sec_idx:
+                break
+            head.append(b)
+        else:
+            return False
+        if not head:
+            return False
+        protos = [self._proto_of(b) for b in head]
+        if any(p is not None and para_pics(p) for p in protos):
+            return True
+        like = head[0].get("like") if isinstance(head[0], dict) else None
+        return isinstance(like, int) and 0 < like < len(self.protos) and bool(para_pics(self.protos[like - 1]))
+
     def cover_break(self, blocks):
         """계획이 표지(그림이 든 견본 문단)로 시작하면 본문 첫 문단(쪽 설정이 든 견본 = 제목 상자)을 새 쪽에서 시작한다."""
-        first = self._proto_of(blocks[0]) if blocks else None
-        if first is None or not para_pics(first):
+        if not self.starts_with_cover(blocks):
             return
         sec_idx = next((i for i, p in enumerate(self.protos) if p.find(".//" + T("hp:secPr")) is not None), None)
         for b in blocks[1:]:
@@ -159,12 +180,12 @@ class Builder(FillPart, RulesPart):
                 seen_title = seen_title or proto.find(".//" + T("hp:secPr")) is not None
                 continue
             text = b.get("text") if isinstance(b.get("text"), str) else ""
-            if "\n" in text.strip() or re.search(r"[①-⑳]|(^|\n)\s*(\d+[.)]|[-○·])\s", text):
+            if "\n" in text.strip() or re.search(rf"[{NUM_CHARS}]|(^|\n)\s*(\d+[.)]|[-○·])\s", text):
                 self.warn(f"블록 {b.get('_src')}: 요약 상자에는 번호·여러 항목을 넣지 않습니다 — 한 문장으로 두세 줄에 쓰세요"
-                          "(세부 항목은 아래 □·○로).")
+                          "(세부 항목은 아래 □·○로).", level="fix", kind="summary")
             if text.strip() and not SUMMARY_END_RE.search(text.strip()):
                 self.warn(f"블록 {b.get('_src')}: 요약 상자 끝맺음은 ‘~하고자 함’ 또는 ‘~에 대한 보고임’으로 하세요"
-                          f"(지금: ‘…{text.strip()[-12:]}’).")
+                          f"(지금: ‘…{text.strip()[-12:]}’).", level="fix", kind="summary")
             return
 
     def check_date_line(self, blocks):
@@ -178,7 +199,7 @@ class Builder(FillPart, RulesPart):
                                         or DATE_LINE_RE.match(b.get("text") if isinstance(b.get("text"), str) else "")):
                 return
         self.warn(f"날짜·부서 줄이 없습니다 — 제목 상자 바로 아래에 날짜·부서 줄(like {dates[0]})을 넣으세요. 날짜·부서를 "
-                  "모르면 줄을 빼지 말고 ‘’26. ○. ○.(○)\\t○○○○과 ○○○’처럼 ○로 채웁니다.")
+                  "모르면 줄을 빼지 말고 ‘’26. ○. ○.(○)\\t○○○○과 ○○○’처럼 ○로 채웁니다.", level="fix", kind="date")
 
     def check_endings(self, out):
         """보고서 문장·항목은 '~으로'로 끝내지 않는다 — '통제 가능한 항목으로 편성'처럼 뒤에 할 일을 붙인다
@@ -197,13 +218,14 @@ class Builder(FillPart, RulesPart):
                     hits.append(f"‘…{text[-16:]}’")
         if hits:
             self.warn(f"‘~으로’로 끝나는 줄 {len(hits)}곳({', '.join(hits[:6])}{' 등' if len(hits) > 6 else ''}): "
-                      "보고서 문장은 ‘~으로’로 끝내지 않습니다 — ‘통제 가능한 항목으로 편성’처럼 뒤에 할 일(편성·배정·전환 등)을 붙이세요.")
+                      "보고서 문장은 ‘~으로’로 끝내지 않습니다 — ‘통제 가능한 항목으로 편성’처럼 뒤에 할 일(편성·배정·전환 등)을 붙이세요.", level="fix")
 
     def build(self, plan):
-        blocks = plan["blocks"] if isinstance(plan, dict) else plan
+        blocks = check_plan(plan)
         if not blocks:
             raise BuildError("계획에 블록이 하나도 없습니다.")
         opts = plan if isinstance(plan, dict) else {}
+        self.fit_base = self.made_reset()  # 이 스킬이 만든 문서를 견본으로 쓸 때 앞 판의 맞춤값을 되돌리고, 맞추기 전 기준값을 잼
         blocks = [dict(b, _src=n + 1) if isinstance(b, dict) else b for n, b in enumerate(blocks)]
         blocks = self.table_units(blocks)  # 이름표 맞추기 등이 '(기준 : …)'을 괄호 이름표로 다루기 전에
         self.doc_type = str(opts.get("doc_type") or "").strip()
@@ -212,7 +234,7 @@ class Builder(FillPart, RulesPart):
         unknown = [x for x in omit if x not in OMIT_KEYS]
         if not isinstance(omit, list) or unknown:
             raise BuildError(f"\"omit\"에는 {', '.join(OMIT_KEYS)} 가운데서만 쓸 수 있습니다(받은 값: {unknown or omit!r}) — "
-                             + ", ".join(f"{k} = {v[0]}" for k, v in OMIT_KEYS.items()) + ".")
+                             + ", ".join(f"{k} = {v}" for k, v in OMIT_KEYS.items()) + ".")
         self.omit = set(omit)
         self.basis_searched = bool(opts.get("basis_searched"))  # 둘째 근거를 찾아봤지만 없음 → ○ 하나여도 알림만
         self.basis_off = not opts.get("basis_first", True) or basis_exempt(self.doc_type) or "basis" in self.omit
@@ -242,7 +264,7 @@ class Builder(FillPart, RulesPart):
         if "date" not in self.omit:
             self.check_date_line(blocks)
         if self.omit:
-            self.warn("계획에서 일부러 뺀다고 한 것(omit — " + "·".join(OMIT_KEYS[k][0] for k in sorted(self.omit))
+            self.warn("계획에서 일부러 뺀다고 한 것(omit — " + "·".join(OMIT_KEYS[k] for k in sorted(self.omit))
                       + ")은 검사하지 않고, 그에 대한 지적은 알림으로만 둡니다(만든 문서에 표시가 남아 검사만도 같음).")
         out = [self.make_block(n, b) for n, b in enumerate(blocks)]
         self.flow_gaps(out)
@@ -274,6 +296,16 @@ class Builder(FillPart, RulesPart):
             self.sec.remove(ch)
         for p in out:
             self.sec.append(p)
+        cut = caps = 0
+        for p in self.sec.iter(T("hp:p")):
+            a, b = clean_chars(p)
+            cut, caps = cut + a, caps + b
+        if cut:
+            self.warn(f"한글에서 네모·붙임표·빈칸으로 찍히는 보이지 않는 글자 {cut}개를 뺐습니다(이모지 표시 글자 등).")
+        if caps:
+            self.warn(f"키캡 숫자(1️⃣) {caps}개를 글자 겹치기 네모 숫자로 바꿨습니다(키캡은 네모가 왼쪽으로 삐져나옴).")
+        for p in self.sec.iter(T("hp:p")):  # 기호 뒤 한 칸(표 칸 글 등 — 머리 기호 줄은 견본 기호와 빈칸을 씀)
+            insert_marker_gap(p)
         if opts.get("word_wrap", True):
             self.word_wrap()
         if opts.get("paren_small", PROFILE["paren_smaller_pt"]):
@@ -306,7 +338,11 @@ class Builder(FillPart, RulesPart):
                 self.one_space()  # 낫표 당기기 앞에: 당기기가 빈칸 한 개(장평 두 배)의 자간을 줄여 '당김' 표시가 남게
             if opts.get("pull_corner", True):
                 f.pull_corners()  # 맨 마지막: 내어쓰기를 다시 재는 단계들 뒤에(아랫줄은 그대로, 낫표만 당김)
+            if opts.get("line_fill", True):
+                f.fill_ends()  # 낫표 당기기로 줄어든 폭까지 보고 끝선에
             self.fit_notes = f.notes + [f.report()]
+            shrunk = [f._main_size(t) for t, d in getattr(f, "page_shrink", {}).items() if d]
+            self.table_pt = min(shrunk) if shrunk else None  # 한 장에 넣으려 줄인 표 글자 — 문서에 남겨 검사만이 다시 키우는 것으로 보지 않게
         elif opts.get("one_space", True):
             self.one_space()
         self._finish(opts)
@@ -325,10 +361,26 @@ class Builder(FillPart, RulesPart):
             return all(self.metrics.checked(f) or f in ham for f in fonts if f)
 
         paras = [p for p in self.sec.iter(T("hp:p")) if not (para_tables(p) or para_pics(p))]
+        body_w = page_info(self.sec)["body_width"] * HWPUNIT_PER_MM
+        body = {p for p in self.sec if p.tag == T("hp:p")}
         for p in paras:
+            # 맞춤 뒤에 돌므로 줄 수를 다시 잰다 — 늘면 그 문단은 그대로(옛 판: 40자 붙은 낱말이 1줄 → 2줄, 평가 2026-11-09)
+            n0 = len(lay.para_lines(p, body_w)[1]) if p in body else None
+            saved = (p.get("paraPrIDRef"), [(r, r.get("charPrIDRef"), copy.deepcopy(list(r))) for r in para_runs(p)], list(p)) if n0 else None
             lead_to_margin(p, self.styles, self.hedit, lay, split, fonts_ok, self.tab_proto, 10 ** 6)
-        for p in paras:
             compact_fw(p, self.styles, self.hedit, split, self.tab_proto)
+            if n0 and len(lay.para_lines(p, body_w)[1]) > n0:
+                pid, runs, kids = saved
+                p.set("paraPrIDRef", pid)
+                for r in para_runs(p):
+                    if not any(r is x for x in kids):
+                        p.remove(r)
+                for r, cid, old in runs:
+                    for ch in list(r):
+                        r.remove(ch)
+                    for k in old:
+                        r.append(k)
+                    r.set("charPrIDRef", cid)
 
     # ------------------------------------------------------------ 마무리
     def _drop_unused_images(self):
@@ -363,6 +415,8 @@ class Builder(FillPart, RulesPart):
         if head.get("secCnt"):
             head.set("secCnt", "1")
         self._drop_unused_images()
+        if clear_print_method(self.pkg):
+            self.warn("견본의 모아찍기 인쇄 설정을 껐습니다 — 켜 두면 인쇄·PDF가 한 장에 2쪽씩 묶입니다.")
         first_id = next(self.sec.iter(T("hp:p"))).get("id")
         if "settings.xml" in self.pkg.data:
             st = self.pkg.xml("settings.xml")
@@ -385,8 +439,11 @@ class Builder(FillPart, RulesPart):
             meta.update({k: v for k, v in (("doc_type", self.doc_type), ("basis", "off")) if v})
         if getattr(self, "basis_searched", False):
             meta["basis_searched"] = "yes"
+        meta.update(getattr(self, "fit_base", None) or {})
+        if getattr(self, "table_pt", None):
+            meta["table_pt"] = str(self.table_pt)
         write_doc_meta(self.pkg, meta)
-        text = "\r\n".join(para_text(p) for p in self.sec if p.tag == T("hp:p"))
+        text = "\r\n".join(para_text(p).replace(COMPOSE_CHAR, "") for p in self.sec if p.tag == T("hp:p"))
         if "Preview/PrvText.txt" in self.pkg.data:
             self.pkg.data["Preview/PrvText.txt"] = text[:1000].encode("utf-16-le")
         if "Preview/PrvImage.png" in self.pkg.data:
@@ -401,13 +458,9 @@ def main():
     ap.add_argument("--brief", action="store_true",
                     help="글 차례를 빼고 보임(고쳐야 함을 고치며 다시 만들 때 — 전하기 전 마지막 판은 빼지 않음)")
     a = ap.parse_args()
-    if os.path.abspath(a.template) == os.path.abspath(a.out):
+    if same_path(a.template, a.out):
         raise SystemExit("견본 파일에 덮어쓰지 않습니다. --out에 다른 이름을 주세요.")
-    with open(a.plan, encoding="utf-8") as f:
-        try:
-            plan = json.load(f)
-        except json.JSONDecodeError as e:
-            raise SystemExit(f"계획 파일이 JSON 모양이 아닙니다: {e}")
+    plan = read_plan(a.plan)
     pkg = Package(a.template)
     try:
         b = Builder(pkg, base_dir=os.path.dirname(os.path.abspath(a.plan)))
@@ -415,13 +468,14 @@ def main():
     except BuildError as e:
         raise SystemExit(f"만들지 못함 — {e}")
     pkg.save(a.out)
+    print(f"gongyong-hwpx v{SKILL_VERSION}")
     print(f"만듦: {a.out}")
     if b.image_notes:
         b.warnings.append(f"표 칸 배경 그림 {len(b.image_notes)}개를 넣었습니다({', '.join(b.image_notes)}) — 칸 높이를 그림 비율에 맞춤.")
     errors, notes, outline = check(a.out)
-    is_fix = lambda w: FIX_RE.search(w) and not omit_hit(w, b.omit)  # noqa: E731 — 뺀다고 한 요소의 지적은 알림으로
-    fix = [w for w in b.warnings + b.fit_notes if is_fix(w)]
-    info = [w for w in b.warnings + b.fit_notes if not is_fix(w)]
+    # 뺀다고 한 요소의 지적은 알림으로
+    fix = [w for w in b.warnings + b.fit_notes if note_is_fix(w, b.omit)]
+    info = [w for w in b.warnings + b.fit_notes if not note_is_fix(w, b.omit)]
     pages = next((w for w in info if w.startswith("어림 쪽 수")), "")
     print(f"## 한눈에: 고쳐야 함 {len(fix) + len(notes)}건, 구조 검사 {'문제 있음' if errors else '통과'}"
           + (f", {pages}" if pages else ""))
@@ -437,6 +491,8 @@ def main():
     if tell:
         print("## 사용자에게 전할 말(결과를 건넬 때마다 빠짐없이 그대로 옮길 것)")
         print(" - " + tell)
+    if not a.brief:  # 전하기 전 마지막 판에서만
+        print_citations(para_text(p) for p in b.sec.iter(T("hp:p")))
     print_report(errors, notes, None if a.brief else outline)
     # 끝 번호: 0 = 고칠 것 없음, 1 = 구조 검사 문제(파일을 쓰면 안 됨), 3 = 파일은 만들었고 '고쳐야 함'이 남음
     sys.exit(1 if errors else 3 if (fix or notes) else 0)

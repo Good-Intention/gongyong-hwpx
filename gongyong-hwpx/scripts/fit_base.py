@@ -4,7 +4,7 @@
 1) 줄 맞춤(원칙 1·5): 마지막 줄에 짧은 낱말 하나만 남으면, 그 문단 자간을 겹치지 않는 범위(-10%까지)에서
    1%씩 줄여 보고, 한 줄이 줄어드는 가장 작은 값을 쓴다.
 2) 쪽 맞춤(원칙 6·8): 쪽 나눔으로 나뉜 덩어리마다
-   - 그대로 / □ 사이 한 줄 빈 줄을 좁은 빈 줄로 / + 줄 간격 150% / + 줄 간격 140%
+   - 그대로 / □ 사이 한 줄 빈 줄을 좁은 빈 줄로 / + 줄 간격을 5%씩 낮춤(140%까지)
    를 어림해 보고, 쪽 수가 줄거나 쪽 아래 큰 빈 곳이 줄어드는 것 가운데 가장 덜 바꾼 것을 고른다.
    이득이 없으면 그대로 둔다. 어림 오차에 대비해 쪽 높이를 3mm 덜 쓴다고 보고 계산한다.
 """
@@ -14,7 +14,7 @@ import re
 from style_profile import P as PROFILE  # noqa: E402 — 기준값(assets/profile.json)
 from hwpx_lib import (HWPUNIT_PER_MM, UNIT_RE, T, cell_paras, head_length, is_blank, label_colon, label_content, marker_level,
                       page_info, para_pics, para_runs, para_tables, para_text, run_text, set_run_text, split_marker, table_grid,
-                      is_table_title, TABLE_TITLE_MARK)
+                      is_table_title, TABLE_TITLE_MARK, etree, fix_note, pct_range, NUM_CHARS)
 from layout import Layout, spacing_after
 
 
@@ -30,6 +30,66 @@ def split_lines(chs):
     out.append(cur)
     return out
 
+def fill_last_line(lay, styles, hedit, p, w, head, split):
+    """문단의 끝 줄(한 줄 문단이면 그 줄)이 끝선에 조금 못 미치면 그 줄 내용 글자의 자간을 늘려 끝선에 맞춘다 — 한글은 양쪽 정렬이어도
+    끝 줄을 벌리지 않아 윗줄·이웃 줄과 끝선이 어긋난다(사용자 2026-11-09 '앞의 끝선이 맞으면 뒤의 끝선도'). 머리 기호·이름표와 따옴표 붙이기로
+    일부러 줄인 조각은 그대로, 줄 나눔이 바뀌면 하지 않는다. 돌려주는 것: (늘린 %p, 채움 전, 채움 뒤) 또는 None(바꾼 것 없음)."""
+    if FILL_MAX <= 0:
+        return None
+    chs, lines = lay.para_lines(p, w)
+    if not lines or not lines[-1][3]:
+        return None
+    s, e, used, avail = lines[-1]
+    if used / avail >= FILL_DONE:
+        return None
+    lo = max(head, s)
+    if (used + FILL_MAX * sum(c[2] for c in chs[lo:e]) / 100) / avail < FILL_MIN or not split(p, lo):
+        return None  # 한도까지 늘려도 모자라는 줄은 조각도 나누지 않음
+    spacing = lambda r: styles.char.get(r.get("charPrIDRef"), {}).get("spacing", 0)  # noqa: E731
+    seg, pos = [], 0
+    for r in para_runs(p):
+        t = run_text(r)
+        at, pos = pos, pos + len(t)
+        if r.find(T("hp:t")) is not None and t and at >= lo and spacing(r) >= FLOOR:
+            seg.append(r)
+    if not seg:
+        return None
+
+    def apply(d):
+        old = []
+        for r in seg:
+            cid, base = r.get("charPrIDRef"), spacing(r)
+            new = spacing_after(base, d, FLOOR)
+            if new != base:
+                old.append((r, cid))
+                r.set("charPrIDRef", hedit.char_spacing(cid, new))
+        return old
+
+    def undo(old):
+        for r, cid in old:
+            r.set("charPrIDRef", cid)
+
+    limit = min(FILL_MAX, WIDEN_MAX - max(spacing(r) for r in seg))
+    starts = [x[0] for x in lines]
+    wide = 0
+    for d in range(1, limit + 1):
+        old = apply(d)
+        fits = bool(old) and [x[0] for x in lay.para_lines(p, w, shrink=SLACK)[1]] == starts
+        undo(old)
+        if not fits:
+            break
+        wide = d
+    if not wide:
+        return None
+    old = apply(wide)
+    last = lay.para_lines(p, w)[1][-1]
+    after = last[2] / last[3]
+    if after < (FILL_MIN if wide < limit else FILL_DONE):  # 한도에 걸린 줄을 FILL_DONE 밑에서 채우면 두 번째 정돈이 또 늘림
+        undo(old)
+        return None
+    return wide, used / avail, after
+
+
 SHORT_LAST = 0.25            # 마지막 줄이 쓸 수 있는 폭의 이 비율보다 짧으면 당겨 볼 만함
 NL = chr(10)                 # 강제 줄 바꿈 글자
 CUT_MAX = 6                  # 이 글자 수 안에서 줄이면 한 줄에 들어가는 두 줄 문단은 '낱말 하나 빼기' 후보로 알림
@@ -42,6 +102,9 @@ SPARSE = 0.85                # 당길 수 없고 이보다 낮으면 자간을 �
 LOOSE = 0.85                 # 맞춘 뒤에도 줄이 이보다 덜 차면 '빈칸이 크게 벌어짐'으로 알림(글을 고치라고)
 WIDEN_MAX = PROFILE["spacing_max_pct"]               # 자간을 늘릴 때 상한(%). +10%는 글자 사이가 넓어 어색하다는 사용자 의견(2026-10-31)
 SLACK = 0.995                # 자간을 바꿔 볼 때 쓸 수 있는 폭을 이만큼만 쓴다고 보고 어림(어림 오차 대비)
+FILL_MAX = PROFILE["line_fill_pct"]  # 한 줄·끝 줄을 끝선까지 채울 때 자간을 늘리는 한도(%p) — 사용자 '과도하게 늘리지 않는 한도'(시안에서 +4%부터 옆 줄보다 성겨 보임)
+FILL_DONE = 0.99             # 끝선까지 이만큼 찬 줄은 이미 맞은 것으로 봄 — 한도까지 늘려서 여기 못 미치면 끝선은 안 맞고 자간만 달라지므로 그대로
+FILL_MIN = 0.98              # 한도에 닿기 전에 더 늘리면 줄이 넘치는 줄은 이만큼 차면 채움(자간은 1% 단위라 끝선까지 1~2mm 남을 수 있음)
 NUMERIC_RE = re.compile(r"^[△▲▽▼+\-−]?[\d,]+(\.\d+)?\s*(%|대|건|곳|개|명|회|원|천원|만원|백만원|억원|점|일|개사)?$")
 # 날짜·시기·기간 칸('26. 11. · '27. 1.~ · 11. 2.~11. 6. · 22:00~02:00 · 4/4분기) — 금액이 아닌 숫자라 가운데 정렬
 _ONE_DATE = r"[’']?\d{1,4}(?:\s*[.:/년월일]\s*\d{1,2})*\s*[.년월일]?\s*(?:분기|주차?|주)?\s*(?:\([월화수목금토일]\))?"
@@ -103,7 +166,7 @@ DOT_COST = 1                 # 가운데점 뒤에서 나누는 것 하나를 �
 HEAD_COST = 3                # 머리 줄 칸이 다음 줄로 넘어가면(‘남은 두 달 할 / 일’) 줄 몇 개로 칠지 — 머리 줄은 되풀이돼 더 눈에 띔
 UNIT_GAP = PROFILE["table_unit_smaller_pt"]                 # 표 위 기준·단위 줄은 표 글자보다 이만큼(pt) 작게
 NOTE_SMALLER = PROFILE["table_note_smaller_pt"]             # 표 바로 밑 ※·* 설명은 표 글자보다 이만큼(pt) 작게(사용자 원칙 2026-11-02)
-BULLET_RE = re.compile(r"^[ ⎵⍽]*[○●◎◦ㅇ·•\-–※*□■◇◆▶►①-⑳][ ⎵⍽]")  # 칸 안 글머리표 줄('- 내용', '○ 내용', '① 순서')
+BULLET_RE = re.compile(r"^[ ⎵⍽]*[○●◎◦ㅇ·•\-–※*□■◇◆▶►" + NUM_CHARS + r"][ ⎵⍽]")  # 칸 안 글머리표 줄('- 내용', '○ 내용', '① 순서') — 붙여 쓴 '①로그인 ②업로드'는 글머리표가 아니라 글
 BULLET_PAD = 1.5 * HWPUNIT_PER_MM  # 칸 안 글머리표 줄은 왼쪽 정렬하되 왼쪽을 약간 띄움(사용자 원칙 2026-11-01)
 # 표 열의 '·' 항목(사용자 수정본·결정 2026-11-01): 이름을 늘어놓는 열(머리 칸이 '등록 후보'·'확인 사항'·'평가지표(배점)'처럼
 # 끝나는 앞쪽 열)은 '·' 줄 대신 쉼표로 한 줄, 설명 열(칸 글이 문장꼴로 긴 열)은 한 항목이어도 모두 '· '로 통일
@@ -145,6 +208,7 @@ FILL_MARGIN = 2 * HWPUNIT_PER_MM  # 참고 쪽을 채울 때 SAFETY에 더해 �
 # 표지(대구시 문서 표지를 본뜸, 2026-11-01): 제목 띠는 본문 높이의 이 비율쯤에서 시작, 마크·부서명은 쪽 아래에 붙임
 COVER_TITLE_AT = 0.22                  # (참고 표지 31% — 가운데 정사각형 개요 상자 자리를 위해 조금 올림)
 COVER_BOTTOM_GAP = 8 * HWPUNIT_PER_MM  # 부서명 아래 남길 높이(참고 표지: 약 8mm)
+CELL_MARGIN_MIN = 142  # 열이 많은 표의 칸 안 좌우 여백 하한(0.5mm)
 COVER_MIN_GAP = 6 * HWPUNIT_PER_MM     # 묶음 사이 최소 간격
 COVER_BOX_MAX = 150 * HWPUNIT_PER_MM   # 표지 개요 상자를 글에 맞춰 넓힐 때 상한(기본 120mm)
 

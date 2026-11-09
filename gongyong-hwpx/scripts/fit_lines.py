@@ -50,8 +50,29 @@ class LineFit:
                     break
         if done:
             self.notes.append(f"마지막 줄에 짧은 낱말만 남던 문단 {len(done)}개는 자간을 조금 줄여"
-                              f"({max(done)}~{min(done)}%) 한 줄을 줄였습니다.")
+                              f"({pct_range(done)}) 한 줄을 줄였습니다.")
         self.widen_sparse()
+
+    def fill_ends(self):
+        """끝선에 조금 못 미친 한 줄·끝 줄을 자간으로 끝선에(fill_last_line, 정돈과 같음). □ 제목·줄 바꿈·탭 문단은 그대로(로마자 번호 줄은 채움)."""
+        got = []
+
+        def split(q, k):
+            self.b._split_run_at(q, k)
+            return True
+
+        for p, box_w in self.text_boxes():
+            text = para_text(p)
+            box = marker_level(text) == 1 and split_marker(text)[1][:1] in "□■◇◆"  # □ 제목은 그대로, 로마자 번호 줄은 채움
+            if "\n" in text or "\t" in text or box or not self.checked(p):
+                continue
+            if self.st.para.get(p.get("paraPrIDRef"), {}).get("align") not in ("JUSTIFY", "DISTRIBUTE"):
+                continue
+            res = fill_last_line(self.lay, self.st, self.b.hedit, p, box_w, head_length(text), split)
+            if res:
+                got.append(res[0])
+        if got:
+            self.notes.append(f"끝선에 조금 못 미치던 한 줄·끝 줄 {len(got)}개는 자간을 늘려({pct_range(got, plus=True)}) 끝선에 맞췄습니다.")
 
     def _content_spacing(self, p):
         """문단 내용(머리 뒤) 글자 수가 가장 많은 자간 — 줄 맞춤이 이미 바꾼 값을 알아보는 기준."""
@@ -61,14 +82,15 @@ class LineFit:
             t = run_text(r)
             if r.find(T("hp:t")) is not None and pos + len(t) > head:
                 sp = self.st.char.get(r.get("charPrIDRef"), {}).get("spacing", 0)
-                count[sp] = count.get(sp, 0) + len(t) - max(0, head - pos)
+                if sp >= FLOOR:  # 따옴표·가운데점 붙이기로 일부러 줄인 조각(-25% 등)은 빼고 잼 — 넣으면 늘릴 상한이 +30%가 됨(평가 2026-11-09)
+                    count[sp] = count.get(sp, 0) + len(t) - max(0, head - pos)
             pos += len(t)
         return max(count, key=count.get) if count else 0
 
-    def widen_sparse(self):
+    def _sparse_pass(self):
         """다음 낱말이 넘어가 양쪽 정렬로 빈칸이 벌어질 줄(쓴 폭 < 97%)이 있으면
         1) 자간을 줄여(-18%까지) 다음 낱말을 그 줄로 당겨 본다(사용자 수정본 규칙: 넘친 글자는 자간을 줄여 한 줄에).
-        2) 그래도 안 되면 줄 바꿈 자리는 그대로 두고 자간을 늘려(+5%까지) 덜 벌어지게 한다."""
+        2) 그래도 안 되면 줄 바꿈 자리는 그대로 두고 자간을 늘려(+5%까지) 덜 벌어지게 한다. 돌려주는 것: (줄인 값들, 늘린 값들)."""
         pulled, widened = [], []
         for p, box_w in self.text_boxes():
             if not self.checked(p):
@@ -114,29 +136,39 @@ class LineFit:
                 best = d
             if best:
                 self.set_delta(p, best)
-                widened.append(best)
+                widened.append(self._content_spacing(p))
+        return pulled, widened
+
+    def widen_sparse(self):
+        pulled, widened = self._sparse_pass()
         if pulled:
             self.notes.append(f"다음 낱말이 넘어가 빈칸이 크게 벌어질 문단 {len(pulled)}개는 자간을 줄여"
-                              f"({max(pulled)}~{min(pulled)}%) 그 낱말을 앞줄로 당겼습니다.")
+                              f"({pct_range(pulled)}) 그 낱말을 앞줄로 당겼습니다.")
         if widened:
-            self.notes.append(f"당길 수 없는 문단 {len(widened)}개는 자간을 조금 늘려(+{min(widened)}~+{max(widened)}%) "
+            self.notes.append(f"당길 수 없는 문단 {len(widened)}개는 자간을 조금 늘려({pct_range(widened, plus=True)}) "
                               "빈칸이 덜 벌어지게 했습니다.")
-        loose = []
-        for p, box_w in self.text_boxes():
-            if self.st.para.get(p.get("paraPrIDRef"), {}).get("align") not in ("JUSTIFY", "DISTRIBUTE"):
-                continue  # 가운데·왼쪽 정렬 줄은 낱말 사이가 벌어지지 않음
-            _, lines = self.lay.para_lines(p, box_w)
-            if any(used / avail < LOOSE for _, _, used, avail in lines[:-1]):
-                text = para_text(p)
-                loose.append(text[head_length(text):].replace("⎵", " ").strip()[:14])
-        if loose:
-            self.notes.append(f"그래도 빈칸이 크게 벌어지는 줄이 남은 문단 {len(loose)}개 — 긴 낱말이 다음 줄로 넘어감. "
-                              "낱말을 줄이거나 순서를 바꾸거나 두 줄로 나누면 좋아집니다: "
-                              + ", ".join(f"‘{t}…’" for t in loose))
         self.cut_hints = []
         self.arrow_breaks()
         if getattr(self, "push", True):
             self.push_down()
+        # 화살표·연결어 줄 바꿈·끝 줄 내리기가 새로 만든 줄도 다시 잰다 — 안 재면 두 번째 다듬기가 -4%로 또 바꿨음(평가 2026-11-09)
+        again = self._sparse_pass()
+        if again[0] or again[1]:
+            self.notes.append(f"줄 바꿈으로 새로 생긴 줄 {len(again[0]) + len(again[1])}곳도 자간을 다시 맞췄습니다.")
+        loose = []
+        for p, box_w in self.text_boxes():
+            if self.st.para.get(p.get("paraPrIDRef"), {}).get("align") not in ("JUSTIFY", "DISTRIBUTE"):
+                continue  # 가운데·왼쪽 정렬 줄은 낱말 사이가 벌어지지 않음
+            chs, lines = self.lay.para_lines(p, box_w)
+            # 줄 바꿈으로 끝나는 줄은 한글이 벌리지 않으므로 세지 않음(만든 뒤 검사만이 '빈칸 큰 줄'로 보던 것 — 평가 2026-11-09)
+            if any(used / avail < LOOSE and "\n" not in (chs[e - 1][0], chs[e][0] if e < len(chs) else "")
+                   for _, e, used, avail in lines[:-1]):
+                text = para_text(p)
+                loose.append(text[head_length(text):].replace("⎵", " ").strip()[:14])
+        if loose:
+            self.notes.append(fix_note(f"그래도 빈칸이 크게 벌어지는 줄이 남은 문단 {len(loose)}개 — 긴 낱말이 다음 줄로 넘어감. "
+                              "낱말을 줄이거나 순서를 바꾸거나 두 줄로 나누면 좋아집니다: "
+                              + ", ".join(f"‘{t}…’" for t in loose)))
         self.report_cut_hints()
         # 내리기로도 못 고친(끝 줄 바로 위에 나눌 빈칸이 없는 등) 문단은 글을 고쳐야 하므로 '고쳐야 함'으로 알린다
         short = []
@@ -151,8 +183,8 @@ class LineFit:
                 text = para_text(p)
                 short.append(text[head_length(text):].replace("⎵", " ").strip()[:14])
         if short:
-            self.notes.append(f"끝 줄에 한두 낱말만 남은 문단 {len(short)}개 — 자간으로도 당기지 못했습니다. 글을 조금 줄이거나 "
-                              "낱말 순서를 바꾸면 한 줄로 들어갑니다: " + ", ".join(f"‘{t}…’" for t in short))
+            self.notes.append(fix_note(f"끝 줄에 한두 낱말만 남은 문단 {len(short)}개 — 자간으로도 당기지 못했습니다. 글을 조금 줄이거나 "
+                              "낱말 순서를 바꾸면 한 줄로 들어갑니다: " + ", ".join(f"‘{t}…’" for t in short)))
 
     def _cut_hint(self, p, box_w, lines):
         """두 줄 문단이 몇 자만 줄이면(자간 -18%까지 줄인 상태에서) 한 줄에 들어가는지 재어, 낱말 하나(CUT_MAX자 안)로
@@ -173,10 +205,15 @@ class LineFit:
             self.cut_hints.append((re.sub(r"\s+", " ", body_text.replace("⎵", " ").replace("⍽", " ")).strip()[:22], n))
 
     def report_cut_hints(self):
+        if getattr(self, "rescan_hints", False):  # 검사만: 이미 줄 바꿈으로 내린 두 줄 문단도 후보로 잼
+            for p, box_w in self.text_boxes():
+                _, lines = self.lay.para_lines(p, box_w)
+                if "\n" in para_text(p) and len(lines) == 2:
+                    self._cut_hint(p, box_w, lines)
         if self.cut_hints:
-            self.notes.append(f"한 줄 줄이기 후보 {len(self.cut_hints)}개 — 없어도 되는 낱말 하나(조사·꾸밈말·겹친 말)를 빼면 "
+            self.notes.append(fix_note(f"한 줄 줄이기 후보 {len(self.cut_hints)}개 — 없어도 되는 낱말 하나(조사·꾸밈말·겹친 말)를 빼면 "
                               "한 줄에 들어갑니다(뜻·숫자·이름은 그대로, 지금은 줄을 내려 둠): "
-                              + ", ".join(f"‘{t}…’(약 {n}자)" for t, n in self.cut_hints))
+                              + ", ".join(f"‘{t}…’(약 {n}자)" for t, n in self.cut_hints)))
 
     def arrow_breaks(self):
         """화살표(⇒ → ➜)가 든 두 줄 이상 문단: 글은 한 줄을 채우고 내려온다(사용자 원칙 2026-11-04 — 화살표부터 통째로
@@ -234,8 +271,9 @@ class LineFit:
         내린다(사용자 원칙 2026-11-01: '+나 및 같은 연결어·연결 기호는 아래로 내리는 게 더 이해하기 쉬움'). 줄 수가 늘면
         그대로 둔다. 한글은 줄 바꿈 바로 앞 줄을 벌리지 않으므로 위 줄은 보통 간격으로 조금 짧게 끝난다."""
         done = 0
+        summary = self.summary_paras()  # 요약 상자에는 줄 바꿈을 넣지 않음(style-guide)
         for p, box_w in self.text_boxes():
-            if self.st.para.get(p.get("paraPrIDRef"), {}).get("align") not in ("JUSTIFY", "DISTRIBUTE", "LEFT"):
+            if p in summary or self.st.para.get(p.get("paraPrIDRef"), {}).get("align") not in ("JUSTIFY", "DISTRIBUTE", "LEFT"):
                 continue
             for _ in range(4):
                 chs, lines = self.lay.para_lines(p, box_w)
@@ -315,6 +353,7 @@ class LineFit:
         줄 바꿈 바로 앞 줄은 벌리지 않는다(실측) — 위 줄은 보통 간격으로 조금 짧게 끝난다.
         머리 기호·이름표 뒤 고정폭 빈칸·묶음 빈칸에서는 나누지 않는다(둘째 줄은 문단 내어쓰기대로 이름표 뒤 글에 맞춤)."""
         done = []
+        summary = self.summary_paras()
         for p, box_w in self.text_boxes():
             if not self.checked(p):
                 continue
@@ -326,6 +365,16 @@ class LineFit:
             s, e, used, _ = lines[-1]
             last = "".join(c[0] for c in chs[s:e])
             if not (used < lines[0][3] * SHORT_LAST and len(last.split()) <= 2):
+                continue
+            if p in summary:
+                # 요약 상자에는 끝 줄 내리기(줄 바꿈)를 하지 않는다 — 검사만이 '여러 항목'으로 보던 원인(평가 2026-11-09). 자간으로 올려 보고
+                # (빈칸 맞춤이 자간을 줄여 끝 줄이 짧아진 경우 앞 단계는 이미 지나감), 안 되면 낱말을 빼라고 알림
+                d = next((d for d in range(-1, FLOOR - 1, -1)
+                          if len(self.lay.para_lines(p, box_w, delta=d, shrink=SLACK, floor=FLOOR)[1]) < len(lines)), None)
+                if d is not None:
+                    self.set_delta(p, d)
+                else:
+                    self._cut_hint(p, box_w, lines)
                 continue
             ps, pe, _, _ = lines[-2]
             head = head_length(para_text(p))
@@ -359,4 +408,4 @@ class LineFit:
             done.append(best[2])
         if done:
             self.notes.append(f"자간으로 올릴 수 없던 짧은 끝 줄(한두 낱말) {len(done)}곳은 위 줄 낱말을 함께 내려 "
-                              f"끝 줄을 {min(done)}~{max(done)}자로 균형을 맞췄습니다(줄 바꿈 — 위 줄은 조금 짧게 끝남).")
+                              f"끝 줄을 {str(min(done)) + '자' if min(done) == max(done) else f'{min(done)}~{max(done)}자'}로 균형을 맞췄습니다(줄 바꿈 — 위 줄은 조금 짧게 끝남).")

@@ -4,10 +4,12 @@
 - HWPX는 ZIP 안에 XML 파일이 든 묶음이다.
   - 본문: Contents/section0.xml (구역이 여럿이면 section1.xml …)
   - 글자 모양·문단 모양·테두리 목록: Contents/header.xml
-- 이 스킬은 견본(양식)의 서식 번호를 그대로 다시 쓰고, 새 서식을 만들지 않는다.
+- 이 스킬은 견본(양식)의 서식을 복사해 필요한 성질(자간·내어쓰기 등)만 바꾼 서식을 더한다.
   그래서 결과 문서의 모양이 견본과 같아진다.
 """
 import copy
+import json
+import os
 import random
 import re
 import struct
@@ -68,14 +70,21 @@ class Package:
                 f"'{path}'는 HWPX 파일이 아닙니다. 옛 형식(.hwp)이면 한글에서 "
                 "[다른 이름으로 저장] → 파일 형식 'HWPX'로 저장해 다시 주세요."
             )
+        except OSError as e:
+            raise SystemExit(f"'{path}' 파일을 열지 못했습니다({e.strerror or e}). 경로를 확인하세요.")
         if "Contents/header.xml" not in self.data:
             raise SystemExit(f"'{path}' 안에 Contents/header.xml이 없습니다. HWPX 문서가 맞는지 확인하세요.")
         self._xml = {}
+        if not self.sections():
+            raise SystemExit(f"'{path}' 안에 본문(Contents/section0.xml)이 없습니다. HWPX 문서가 맞는지 확인하세요.")
 
     def xml(self, name):
         if name not in self._xml:
             parser = etree.XMLParser(huge_tree=True, resolve_entities=False, no_network=True)
-            self._xml[name] = etree.fromstring(self.data[name], parser)
+            try:
+                self._xml[name] = etree.fromstring(self.data[name], parser)
+            except etree.XMLSyntaxError as e:
+                raise SystemExit(f"문서 안 {name}이 깨져 읽지 못했습니다({e}). 한글에서 열어 다시 저장한 뒤 주세요.") from None
         return self._xml[name]
 
     def sections(self):
@@ -119,11 +128,39 @@ class Package:
         if "mimetype" in order:  # mimetype은 맨 앞, 압축하지 않음(HWPX 규칙)
             order.remove("mimetype")
             order.insert(0, "mimetype")
-        with zipfile.ZipFile(path, "w") as z:
-            for n in order:
-                info = zipfile.ZipInfo(n, date_time=(2026, 1, 1, 0, 0, 0))
-                info.compress_type = zipfile.ZIP_STORED if n == "mimetype" else kinds.get(n, zipfile.ZIP_DEFLATED)
-                z.writestr(info, self.data[n])
+        try:
+            with zipfile.ZipFile(path, "w") as z:
+                for n in order:
+                    info = zipfile.ZipInfo(n, date_time=(2026, 1, 1, 0, 0, 0))
+                    info.compress_type = zipfile.ZIP_STORED if n == "mimetype" else kinds.get(n, zipfile.ZIP_DEFLATED)
+                    z.writestr(info, self.data[n])
+        except PermissionError:
+            raise SystemExit(f"'{path}'에 저장하지 못했습니다 — 한글에서 그 파일을 열어 두었으면 닫고 다시 하세요.") from None
+        except OSError as e:
+            raise SystemExit(f"'{path}'에 저장하지 못했습니다({e.strerror or e}) — 폴더가 있는지 확인하세요.") from None
+
+
+def same_path(a, b):
+    """같은 파일을 가리키는가 — Windows는 대소문자를 가리지 않아 'Doc.hwpx'와 'DOC.hwpx'가 같은 파일(검토: 원본을 덮어썼음)."""
+    try:
+        if os.path.exists(a) and os.path.exists(b):
+            return os.path.samefile(a, b)
+    except OSError:
+        pass
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def read_plan(path):
+    """계획 파일(JSON)을 읽는다. 못 읽으면 쉬운 말로 멈춤."""
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            return json.load(f)
+    except OSError as e:
+        raise SystemExit(f"계획 파일을 열지 못했습니다: {path} ({e.strerror or e})") from None
+    except UnicodeDecodeError:
+        raise SystemExit(f"계획 파일이 UTF-8이 아닙니다: {path} — UTF-8로 저장해 주세요.") from None
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"계획 파일이 JSON 모양이 아닙니다: {e}") from None
 
 
 def strip_inner_ns(xml_bytes):
@@ -176,6 +213,10 @@ class Styles:
             "underline": ul is not None and ul.get("type") not in (None, "NONE"),
             "ratio": _num(ratio.get("hangul"), 100) if ratio is not None else 100,
             "spacing": _num(spacing.get("hangul"), 0) if spacing is not None else 0,
+            # 숫자·영문은 한글이 '영문' 칸의 글꼴·장평·자간으로 찍음(언어별 값이 다른 견본 — 평가 2026-11-09)
+            "latin_font": self.fonts.get("latin", {}).get(ref.get("latin")) if ref is not None else None,
+            "latin_ratio": _num(ratio.get("latin"), 100) if ratio is not None else 100,
+            "latin_spacing": _num(spacing.get("latin"), 0) if spacing is not None else 0,
             # 상대 크기(%): 글자 크기는 그대로 두고 글자만 줄임(작은 ○ 머리 기호 등). 기호는 symbol 칸 값
             "rel": _num(rel.get("symbol", rel.get("hangul")), 100) if rel is not None else 100,
             "superscript": c.find(T("hh:supscript")) is not None,
@@ -202,6 +243,7 @@ class Styles:
         info["line"] = _num(ls.get("value"), 160) if ls is not None else 160
         brk = p.find(T("hh:breakSetting"))
         info["keep_next"] = brk is not None and brk.get("keepWithNext") == "1"
+        info["keep_lines"] = brk is not None and brk.get("keepLines") == "1"  # 문단 보호: 쪽 경계에서 나누지 않음
         info["condense"] = _num(p.get("condense"))
         info["word_break"] = brk.get("breakNonLatinWord") if brk is not None else None
         info["squeeze"] = brk is not None and brk.get("lineWrap") == "SQUEEZE"  # 한 줄로 입력: 넘치면 자간을 줄여 한 줄에
@@ -338,6 +380,7 @@ class HeaderEdit:
         if key not in self.cache:
             new = self._clone("hh:paraProperties", "hh:paraPr", pid)
             for ls in new.iter(T("hh:lineSpacing")):
+                ls.set("type", "PERCENT")  # 값은 늘 %로 줌 — 고정값 칸(FIXED 16pt)에 값만 쓰면 1.25pt 줄 간격이 됨(검토)
                 ls.set("value", str(value))
             self.styles.para[new.get("id")] = self.styles._para(new)
             self.cache[key] = new.get("id")
@@ -392,6 +435,22 @@ class HeaderEdit:
             img = etree.SubElement(ib, T("hc:img"))
             for k, v in (("binaryItemIDRef", item_id), ("bright", "0"), ("contrast", "0"), ("effect", "REAL_PIC"), ("alpha", "0")):
                 img.set(k, v)
+            self.styles.border[new.get("id")] = self.styles._border(new)
+            self.cache[key] = new.get("id")
+        return self.cache[key]
+
+    def border_fill(self, bid, color):
+        """선은 그대로 두고 바탕을 한 색으로 채운 테두리 모양(칸 안 표의 머리 줄)."""
+        key = ("fill", bid, color)
+        if key not in self.cache:
+            new = self._clone("hh:borderFills", "hh:borderFill", bid)
+            if new is None:
+                return bid
+            for fb in new.findall(T("hc:fillBrush")):
+                new.remove(fb)
+            brush = etree.SubElement(etree.SubElement(new, T("hc:fillBrush")), T("hc:winBrush"))
+            for k, v in (("faceColor", color), ("hatchColor", "#000000"), ("alpha", "0")):
+                brush.set(k, v)
             self.styles.border[new.get("id")] = self.styles._border(new)
             self.cache[key] = new.get("id")
         return self.cache[key]
@@ -540,6 +599,32 @@ class HeaderEdit:
         return changed
 
 
+# ---------------------------------------------------------------- 알림 등급
+class Note(str):
+    """알림 한 줄 — 등급과 종류를 글과 함께 든다(문장 낱말로 가르면 '두 쪽에 걸친'이 든 참고 문장까지 고쳐야 함이 됨, 평가 2026-11-09)."""
+    level = "info"
+    kind = None  # 계획 "omit" 키(basis·summary·date·table_title) — 사용자가 뺀다고 한 요소의 지적이면 알림으로 낮춤
+
+
+def fix_note(msg, kind=None):
+    """'고쳐야 함' 등급 알림."""
+    n = Note(msg)
+    n.level, n.kind = "fix", kind
+    return n
+
+
+def note_is_fix(w, omit=()):
+    """고쳐야 함인가(뺀다고 한 요소의 지적은 아님)."""
+    return getattr(w, "level", "info") == "fix" and getattr(w, "kind", None) not in omit
+
+
+def pct_range(vals, plus=False):
+    """쓴 값의 범위 글: [-2, -2] → '-2%', [-2, -5] → '-2~-5%'(0에 가까운 값부터)."""
+    a, b = min(vals, key=abs), max(vals, key=abs)
+    f = (lambda v: f"{v:+d}") if plus or a > 0 or b > 0 else (lambda v: f"{v:d}")
+    return f"{f(a)}%" if a == b else f"{f(a)}~{f(b)}%"
+
+
 # ---------------------------------------------------------------- 글 읽기·쓰기
 def t_text(t):
     s = t.text or ""
@@ -549,8 +634,12 @@ def t_text(t):
     return s
 
 
+COMPOSE_CHAR = "\uFDD0"  # 글자 겹치기(hp:compose — 네모 숫자 등)가 글 속에서 차지하는 자리(글자 한 칸 폭). 읽을 때만 쓰고 파일에는 쓰지 않음(set_run_text가 뺌). 유니코드 내부용 비문자라 문서에 있을 수 없음(사용자 영역 글자는 한글 문서에 실제로 쓰임)
+_XML_BAD_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")  # XML에 쓸 수 없는 글자(붙여 넣은 글의 조종 문자 — 그대로 쓰면 저장에서 멈춤)
+
+
 def run_text(run):
-    return "".join(t_text(t) for t in run if t.tag == T("hp:t"))
+    return "".join(t_text(t) if t.tag == T("hp:t") else COMPOSE_CHAR for t in run if t.tag in (T("hp:t"), T("hp:compose")))
 
 
 def run_objects(run):
@@ -633,8 +722,101 @@ def is_blank(p):
             and p.find(".//" + T("hp:secPr")) is None)
 
 
-def set_run_text(run, text, tab_proto=None):
-    """run 안의 글을 text로 바꾼다. \\t·\\n·⎵·⍽는 탭·줄 바꿈·고정폭 빈칸·묶음 빈칸 요소가 된다."""
+def plain_run(run):
+    """글(hp:t) 하나뿐이고 그 안에 줄 바꿈·탭·고정폭·묶음 빈칸만 든 조각인가 — 글을 다시 써도 잃는 것이 없다.
+    형광펜(markpenBegin/End) 등 다른 표시가 들면 False(평가 2026-11-09: 정돈이 다시 쓰며 형광펜이 사라졌음)."""
+    return len(run) == 1 and run[0].tag == T("hp:t") and all(local(ch) in ESC for ch in run[0])
+
+
+def run_tabs(run):
+    """조각 안 탭 요소를 차례대로 — 글을 다시 쓸 때 set_run_text(tabs=…)로 넘기면 채움 문자·폭이 그대로 간다."""
+    return [ch for t in run.findall(T("hp:t")) for ch in t if local(ch) == "tab"]
+
+
+def text_marks(p):
+    """문단 글 속 표시의 수(이름 → 개수) — 글자 비교가 못 보는 형광펜 등 표시와 채움 문자 있는 탭."""
+    out = {}
+    for r in para_runs(p):
+        for t in r.findall(T("hp:t")):
+            for ch in t:
+                name = local(ch)
+                if name == "tab":
+                    name = "" if ch.get("leader", "0") == "0" else "tab:" + ch.get("leader")
+                elif name in ESC:
+                    name = ""
+                if name:
+                    out[name] = out.get(name, 0) + 1
+    return out
+
+
+# 보이지 않아야 하는 글자인데 한글이 찍는 것(한글 2024 실측 2026-11-09): U+FE0E·FE0F 이모지 표시·U+2060은 네모, U+00AD는 붙임표, U+FEFF는 빈칸. AI가 쓴 글에 잘 섞임('☑️'). U+200B~D는 찍히지 않아 그대로
+INVISIBLE_RE = re.compile("[\ufe0e\ufe0f\u2060\ufeff\u00ad]")
+KEYCAP_RE = re.compile(r"(\d{1,2})\ufe0f?\u20e3")  # 키캡 숫자(1️⃣) — 한글이 네모를 앞 글자에 겹쳐 왼쪽으로 삐져나오게 찍음 → 글자 겹치기로
+
+
+def clean_chars(p):
+    """문단의 보이지 않아야 하는 글자를 빼고 키캡 숫자를 글자 겹치기 네모 숫자로 바꾼다. 돌려주는 것: (뺀 글자 수, 바꾼 수)."""
+    cut = caps = 0
+    for r in para_runs(p):
+        if r.find(T("hp:t")) is None:
+            continue
+        text = run_text(r)
+        if not INVISIBLE_RE.search(text) and not KEYCAP_RE.search(text):
+            continue
+        if not plain_run(r):  # 형광펜 등 표시가 든 조각은 글을 다시 쓰지 않고 글자만 뺌
+            for t in r.findall(T("hp:t")):
+                n0 = len(t_text(t))
+                if t.text:
+                    t.text = INVISIBLE_RE.sub("", t.text)
+                for ch in t:
+                    if ch.tail:
+                        ch.tail = INVISIBLE_RE.sub("", ch.tail)
+                cut += n0 - len(t_text(t))
+            continue
+        tabs = run_tabs(r)
+        parts = KEYCAP_RE.split(text)
+        caps += (len(parts) - 1) // 2
+        cleaned = [x if k % 2 else INVISIBLE_RE.sub("", x) for k, x in enumerate(parts)]
+        cut += sum(len(a) - len(b) for a, b in zip(parts[::2], cleaned[::2]))
+        at, used = r, False
+        for k, x in enumerate(cleaned):
+            if not x:
+                continue
+            if used:
+                twin = etree.Element(r.tag, dict(r.attrib))
+                at.addnext(twin)
+                at = twin
+            used = True
+            if k % 2:
+                for t in at.findall(T("hp:t")):
+                    at.remove(t)
+                at.append(compose_el(x))
+            else:
+                set_run_text(at, x, None, tabs)
+        if not used:
+            set_run_text(r, "", None, tabs)
+    return cut, caps
+
+
+def compose_el(text, shape="SHAPE_RECTANGLE"):
+    """글자 겹치기 요소(네모 숫자 — 한글 2024가 저장하는 모양 그대로)."""
+    el = etree.Element(T("hp:compose"))
+    for k, v in (("circleType", shape), ("charSz", "-3"), ("composeType", "SPREAD"), ("charPrCnt", "10"), ("composeText", text)):
+        el.set(k, v)
+    for _ in range(10):
+        etree.SubElement(el, T("hp:charPr")).set("prIDRef", "4294967295")
+    return el
+
+
+def edit_run_text(run, text, tab_proto=None):
+    """이미 있는 글을 고칠 때 — 탭은 그 조각의 탭 요소를 차례대로 그대로 옮긴다(목차 줄의 점선 채움 탭이 보통 탭이 되지 않게)."""
+    return set_run_text(run, text, tab_proto, run_tabs(run))
+
+
+def set_run_text(run, text, tab_proto=None, tabs=None):
+    """run 안의 글을 text로 바꾼다. \\t·\\n·⎵·⍽는 탭·줄 바꿈·고정폭 빈칸·묶음 빈칸 요소가 된다.
+    tabs: 탭 자리에 차례대로 쓸 탭 요소 목록(쓴 것은 빠짐). 다 쓰면 tab_proto."""
+    text = _XML_BAD_RE.sub("", text.replace(COMPOSE_CHAR, ""))
     for t in run.findall(T("hp:t")):
         run.remove(t)
     t = etree.SubElement(run, T("hp:t"))
@@ -657,8 +839,8 @@ def set_run_text(run, text, tab_proto=None):
             buf.append(ch)
             continue
         flush()
-        if name == "tab" and tab_proto is not None:
-            el = copy.deepcopy(tab_proto)
+        if name == "tab" and (tabs or tab_proto is not None):
+            el = copy.deepcopy(tabs.pop(0) if tabs else tab_proto)
             el.tail = None
             t.append(el)
         else:
@@ -680,11 +862,49 @@ def drop_linesegs(el):
 
 # ---------------------------------------------------------------- 머리 기호(□ ○ - * …)
 _SYM = "□■◇◆○●◎◦∘•∙·ㆍ▪▫▶▷►☞※＊*ㅇ-–—➜⇒→"
+# 한 글자로 된 번호(① ⑴ ⒈ ⒜ ⓐ ⓪ ㉑ ㉠ ㉮ ㈀ ㈎ ㊱ ❶ ➀ ➊ Ⅰ ⅰ) — 글 첫머리에서 다른 뜻으로 쓰이지 않아 뒤에 빈칸이 없어도 머리 기호로 봄
+NUM_CHARS = "①-⓿㈀-㈛㉑-㉟㉠-㉻㊱-㊿❶-➓Ⅰ-Ⅻⅰ-ⅻ" + COMPOSE_CHAR  # 네모 숫자는 유니코드에 없어 한글에서 글자 겹치기로 만듦
+_NUM_CHAR_RE = re.compile(f"[{NUM_CHARS}]")
+
+
+def is_num_char(ch):
+    return bool(_NUM_CHAR_RE.fullmatch(ch))
+
+
 _MARK_RE = re.compile(
-    r"^(?P<lead>[ \t⎵⍽　]*)"
-    r"(?P<mark>[" + re.escape(_SYM) + r"]|[Ⅰ-Ⅻ]\.|(?:\d{1,2}|[가-하]|[A-Za-z]|[ivxIVX]{1,4})[.)]|\((?:\d{1,2}|[가-하])\)|[①-⑳㉠-㉭㈀-㈍])"
-    r"(?P<gap>[ \t⎵⍽　]*)"
+    "^(?P<lead>[ \t⎵⍽　\u00a0]*)"
+    r"(?P<mark>[" + re.escape(_SYM) + r"]|[Ⅰ-Ⅻⅰ-ⅻ]\.|(?:\d{1,2}|[가-하])-\d{1,2}[.)]|(?:\d{1,2}|[가-하]|[ㄱ-ㅎ]|[A-Za-z]|[ivxIVX]{1,4})[.)]"
+    r"|\((?:\d{1,2}|[가-하]|[ㄱ-ㅎ]|[A-Za-z]|[ivxIVX]{1,4})\)|[<〈《【\[](?:\d{1,2}|[가-하]|[A-Za-z])[>〉》】\]]|\d{1,2}\ufe0f?\u20e3|[" + NUM_CHARS + r"])"
+    "(?P<gap>[ \t⎵⍽　\u00a0]*)"
 )
+
+
+_TIGHT_HANGUL = "가나다라마바사아자차카타파하"
+
+
+def _number_core(mark):
+    return re.sub(r"[.()<>\[\]〈〉《》【】]", "", mark)
+
+
+def _hangul_number(mark):
+    """글자로 된 번호는 가나다 열네 글자만 — '(주) 대구'·'이. 내용'·'끝. 다음'은 글. '(사)'는 사단법인이라 글로 봄(검토: 작성 모드가 '(주)'를 지웠음)."""
+    core = _number_core(mark)
+    return core.split("-")[0] in _TIGHT_HANGUL and not (mark[0] == "(" and core == "사")
+
+
+def _tight_number(mark, nxt):
+    """빈칸 없이 붙여 쓴 순서 기호인가(nxt는 기호 다음 글자). '1.내용'·'가)내용'·'(1)내용'·'A.내용'·'Ⅰ.개요'는 번호,
+    '1.5배'·'3.1운동'·'A.I.'·'U.S.'·'(주)대구'·'(사)협회'·'이.내용'은 글 — 글을 잘못 번호로 읽으면 작성 모드가 그 글자를 뺀다."""
+    if is_num_char(mark[0]):
+        return True
+    if nxt.isdigit():
+        return False
+    core = _number_core(mark)
+    if core[0].isdigit() or "ㄱ" <= core[0] <= "ㅎ":
+        return True
+    if "가" <= core[0] <= "힣":
+        return True  # 가나다 글자인지는 split_marker가 먼저 가림
+    return not nxt.isascii()  # 알파벳 기호는 뒤가 한글일 때만
 
 
 def split_marker(text):
@@ -693,6 +913,10 @@ def split_marker(text):
     if not m:
         return "", "", text
     mark = m.group("mark")
+    if "가" <= _number_core(mark)[:1] <= "힣" and not _hangul_number(mark):
+        return "", "", text
+    if re.fullmatch(r"[A-Za-z]\.", mark) and re.match(r"[A-Za-z]\.", text[m.end():]):
+        return "", "", text  # 'U. S. 정부' — 줄임말
     # '○○○ 추진계획(안)'처럼 같은 기호가 빈칸 없이 잇달아 오면 채울 자리를 보인 자리표시이지 머리 기호가 아니다
     # (기본 양식 제목 상자 — 제목 '1. 업무용 차량 운영'의 번호를 견본 기호 '○'와 다르다며 빼던 것, 2026-11-05 사용자 요청).
     if mark in _SYM and not m.group("gap") and text[m.end(): m.end() + 1] == mark:
@@ -700,13 +924,55 @@ def split_marker(text):
     # '**굵게**' 표시의 별표는 머리 기호가 아니다.
     if mark in "*＊" and text[m.start("mark") + 1: m.start("mark") + 2] in ("*", "＊"):
         return "", "", text
-    # 숫자·글자 번호(1. 가. 1))는 뒤에 빈칸이 있어야 번호로 본다('1.5배' 같은 글과 구별).
-    if not m.group("gap") and mark[0] not in _SYM and m.end() < len(text):
+    # 빈칸 없이 붙여 쓴 순서 기호는 다음 글자로 가린다('1.내용'은 번호, '1.5배'는 글).
+    if not m.group("gap") and mark[0] not in _SYM and m.end() < len(text) and not _tight_number(mark, text[m.end()]):
         return "", "", text
-    # '-' 뒤에 바로 숫자가 오면 음수일 수 있어 기호로 보지 않는다.
-    if mark in "-–—" and not m.group("gap") and m.end() < len(text):
+    # '-' 뒤에 바로 숫자·영문이 오면 음수·기호일 수 있어, 끝도 '-'이면 '-끝-'이라 기호로 보지 않는다('-내용'은 기호).
+    if mark in "-–—" and not m.group("gap") and m.end() < len(text) and (text[m.end()].isascii() or text.rstrip().endswith(mark)):
         return "", "", text
     return text[: m.end()], mark, text[m.end():]
+
+
+# 기호 바로 뒤가 이런 말이면 띄우지 않는다: 조사('①과 ②', '*은')·조문('①항', '1)호')·자리표시 단위('○월 중', '○과')
+_GAP_END = r"(?:[ ⎵⍽,.·)]|$)"
+_NO_GAP_WORD = re.compile(r"(?:항|호|번|목|조)(?:[ ⎵⍽,.·)]|$|에|의|을|를|은|는|이|가|과|와|로|도|만|부터|까지)"
+                          r"|(?:차|위|과|와|의|을|를|은|는|이|가|에|로|도|만|월|일|년|시|분|곳|개|명|건|대|원|회|층|동|팀|국|실|부|처|청|구|군|읍|면|리)" + _GAP_END +
+                          r"|(?:형|급|종|안)(?:에|의|을|를|은|는|이|가|과|와|으로|로|도|만)?" + _GAP_END +  # '(A)형', 'B안으로'
+                          r"|(?:에서|에게|에는|에도|부터|까지|으로|로서|로써|처럼|보다|만큼|이나|이며|이고|이다|라고|라는)" + _GAP_END +  # '①에서', '(1)부터'
+                          r"|(?:월|일|년|개월|개소|억원|억|천만원|천만|백만원|백만|만원)(?:까지|부터|에는|에서|간|말|초|중|경|도)?" + _GAP_END)  # '○월까지', '○억원'
+_NO_SA = _TIGHT_HANGUL.replace("사", "")
+_SERIES_RE = re.compile(r"(?:^|\s)(?:\d{1,2}[.)](?!\d)|\(\d{1,2}\)|[" + _TIGHT_HANGUL + r"][.)]|\([" + _NO_SA + r"]\))\S")  # '3.5억원'·'(주)대구'는 번호 아님
+
+
+def tight_marker_end(text):
+    """기호 바로 뒤에 빈칸이 없어 한 칸 넣을 자리(글자 위치). 넣지 않을 글이면 None — '①로그인 ②업로드'·'□개인 □팀'처럼 잇단 기호, '①항'·'○월 중'."""
+    pre, mark, rest = split_marker(text)
+    if not mark or not rest or pre[-1] in " \t⎵⍽　\u00a0\n" or rest[0] in " \t⎵⍽　\u00a0\n":
+        return None
+    if not (rest[0].isalnum() or rest[0] in "「『“‘'\"(<[〈《【"):
+        return None  # '□·○ 묶음'처럼 뒤가 또 부호면 글
+    # 같은 기호가 또 나오면 잇단 기호 — 다만 -·*·ㆍ와 번호는 낱말 사이에도 쓰이므로 빈칸 뒤에 올 때만('-사업계획-안', '·항목·내용', '1.내용 2026.1.1.')
+    again = mark in rest if mark in _SYM and mark not in "-–—·ㆍ∙*＊" else re.search(r"\s" + re.escape(mark), rest)
+    if again or _NUM_CHAR_RE.search(rest) or _SERIES_RE.search(rest) or _NO_GAP_WORD.match(rest):
+        return None
+    return len(pre)
+
+
+def insert_marker_gap(p):
+    """붙여 쓴 기호 뒤에 빈칸 한 칸. 넣었으면 (조각, 옛 글) — 되돌릴 때 edit_run_text로. 아니면 None."""
+    k = tight_marker_end(para_text(p))
+    if k is None:
+        return None
+    pos = 0
+    for r in para_runs(p):
+        t = run_text(r)
+        at, pos = pos, pos + len(t)
+        if at <= k < pos:
+            if not plain_run(r):
+                return None
+            edit_run_text(r, t[:k - at] + " " + t[k - at:])
+            return r, t
+    return None
 
 
 def _base_head(text):
@@ -743,6 +1009,17 @@ def label_colon(text):
                 j += 1
             return j if j < len(text) else 0
     return 0
+
+
+NOT_LABEL = {"선택", "참고", "예시", "필수", "공통", "비고", "별첨", "주", "사", "재", "유", "합", "학", "의", "복", "가칭"}  # 괄호로 쓰지만 항목 이름이 아닌 말('(주) 대구상사'를 (   주   )로 벌리면 안 됨)
+
+
+def fake_label(core, rest):
+    """문장 머리 괄호가 이름표가 아닌 꼴인가: '(선택)'·'(참고)' 같은 말, 또는 괄호 뒤에 또 '항목명 : '이 오는 줄 — '(선택) 자동 시험(약 4분) : …'을
+    이름표로 읽어 (선  택)으로 벌리고 내어쓰기를 22.6mm로 만들었음(양식 시험 2026-11-09)."""
+    if re.sub(r"[\s⎵⍽]", "", core) in NOT_LABEL:
+        return True
+    return bool(re.match(r"[^:：,，]{1,20}[ ⎵⍽]:[ ⎵⍽]", rest.lstrip(" ⎵⍽")))
 
 
 def label_content(text):
@@ -878,6 +1155,18 @@ def blank_png(width=60, height=85):
             + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
 
 
+def clear_print_method(pkg):
+    """모아찍기(settings.xml PrintMethod, 2쪽 모아찍기는 4)를 끈다 — 쪽 그림·쪽 수로는 드러나지 않고 인쇄·PDF에서만 한 장에 2쪽씩 묶인다
+    (양식 파일에서 따라옴, 공모전 시험 2026-11-09). 돌려주는 것: 옛 값(꺼져 있었으면 None)."""
+    if "settings.xml" not in pkg.data:
+        return None
+    for el in pkg.xml("settings.xml").iter():
+        if el.get("name") == "PrintMethod" and (el.text or "0").strip() not in ("", "0"):
+            old, el.text = el.text.strip(), "0"
+            return old
+    return None
+
+
 def page_info(sec_root):
     """첫 구역의 용지·여백(mm)."""
     pp = sec_root.find(".//" + T("hp:pagePr"))
@@ -886,9 +1175,15 @@ def page_info(sec_root):
     m = pp.find(T("hp:margin"))
     mm = lambda v: _num(v) / HWPUNIT_PER_MM  # noqa: E731
     w, h = mm(pp.get("width")), mm(pp.get("height"))
+    if pp.get("landscape") == "NARROWLY":  # 가로 쪽 — 저장값은 세로 그대로(59528×84186)이고 인쇄가 가로(한글 2024 확인 2026-11-09: PDF 841×595)
+        w, h = max(w, h), min(w, h)
     info = {"width": w, "height": h, "landscape": pp.get("landscape")}
     if m is not None:
         for k in ("left", "right", "top", "bottom", "header", "footer"):
             info[k] = mm(m.get(k))
-        info["body_width"] = w - info["left"] - info["right"]
+        gutter = mm(m.get("gutter"))  # 제본 여백: 위쪽 제본이면 높이에서, 그 밖에는 폭에서 빠짐
+        if pp.get("gutterType") == "TOP_BOTTOM":
+            info["top"] += gutter
+            gutter = 0
+        info["body_width"] = w - info["left"] - info["right"] - gutter
     return info

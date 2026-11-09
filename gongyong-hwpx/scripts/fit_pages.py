@@ -163,6 +163,7 @@ class PageFit:
                 plans += [(("" if name == "그대로" else name + " + ") + "요약 상자 아래 빈 줄 좁힘", cost + SUMMARY_GAP_COST,
                            lambda act=act: (act(), shrink_summary())) for name, cost, act in list(plans)]
             best = None
+            self.lay.row_cache, self.lay.row_nocache = {}, {t for t, _ in figs}
             for name, cost, act in plans:
                 restore()
                 act()
@@ -175,6 +176,7 @@ class PageFit:
                 bad, pages = self.badness(seg)
                 if pages < best[3] and (bad < best[0] - 1):
                     best = (bad, name, act, pages, cost)
+            self.lay.row_cache = None
             restore()
             best[2]()
             if best[1] != "그대로":
@@ -260,8 +262,9 @@ class PageFit:
             def line_add(d):
                 for p in texts:
                     pid = saved[p]
-                    v = min(LINE_CAP, self.st.para.get(pid, {}).get("line", 0) + d)
-                    p.set("paraPrIDRef", self.b.hedit.para_line(pid, v) if d else pid)
+                    cur = self.st.para.get(pid, {}).get("line", 0)
+                    v = max(cur, min(LINE_CAP, cur + d))  # 상한은 높일 때만 — 견본의 250% 제목 줄을 190%로 깎지 않음(평가 2026-11-09)
+                    p.set("paraPrIDRef", self.b.hedit.para_line(pid, v) if d and v != cur else pid)
 
             best = 0
             for d in range(5, SPREAD_ADD + 1, 5) if texts else ():
@@ -359,7 +362,8 @@ class PageFit:
 
             def tight_height():
                 self._set_rows(tbl, [1] * len(base))
-                floor = [max(n, self._main_size(tbl) * 100 + ROW_TIGHT) for n in self._row_heights(tbl)]
+                main = self._main_size(tbl)  # 표마다 한 번만(줄마다 재면 줄 수 제곱으로 늚 — 8×300 표 29초 중 19.6초, 평가 2026-11-09)
+                floor = [max(n, main * 100 + ROW_TIGHT) for n in self._row_heights(tbl)]
                 self._set_rows(tbl, floor)
                 return sum(self.lay.para_height(paras[g], self.body_w)[0] for g in group)
 
@@ -422,7 +426,8 @@ class PageFit:
             base = self._row_heights(tbl)
             self._set_rows(tbl, [1] * len(base))  # 칸 높이를 아주 작게 두면 글이 차지하는 높이만 남음
             need = self._row_heights(tbl)
-            floor = [max(n, self._main_size(tbl) * 100 + ROW_TIGHT) for n in need]
+            main = self._main_size(tbl)
+            floor = [max(n, main * 100 + ROW_TIGHT) for n in need]
             room = max((b - f for b, f in zip(base, floor)), default=0)
 
             def rows(d):
@@ -443,7 +448,7 @@ class PageFit:
             self._set_rows(tbl, rows(hi))
             done.append(hi / HWPUNIT_PER_MM)
         if done:
-            self.notes.append(f"한 쪽을 조금 넘던 표 {len(done)}개는 줄 높이를 줄여(줄마다 {min(done):.1f}~{max(done):.1f}mm) 한 쪽에 "
+            self.notes.append(f"한 쪽을 조금 넘던 표 {len(done)}개는 줄 높이를 줄여(줄마다 {f'{min(done):.1f}mm' if f'{min(done):.1f}' == f'{max(done):.1f}' else f'{min(done):.1f}~{max(done):.1f}mm'}) 한 쪽에 "
                               "들어가게 했습니다(두 쪽에 나뉘지 않고 제목·단위 줄과 함께 다음 쪽에서 시작).")
         return len(done)
 

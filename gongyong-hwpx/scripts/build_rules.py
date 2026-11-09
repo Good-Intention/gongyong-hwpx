@@ -105,7 +105,10 @@ class RulesPart:
             close([x for x in current if x > lv])
             _, um, body = split_marker(b["text"])
             body = body if um else b["text"]
-            current.setdefault(lv, []).append((n, LABEL_RE.match(body), body))
+            lm = LABEL_RE.match(body)
+            if lm and fake_label(lm.group("core"), body[lm.end():]):
+                lm = None
+            current.setdefault(lv, []).append((n, lm, body))
         close(list(current))
 
         for g in groups:
@@ -125,6 +128,7 @@ class RulesPart:
                 rest = body[m.end():].lstrip(" " + FW)
                 blocks[n] = dict(blocks[n], text=f"{b1}({core}){b2}{FW * k}{rest}")
         # 네 글자를 넘는 이름표는 맞춤에서 빠져도 된다(사용자: 네 글자가 기준, 넘는 것은 규칙에서 어긋나도 됨) — 알리지 않음
+        self._cover_labels(blocks)
 
         # 작대기(-) 항목의 '항목명 : 내용'은 세 글자 폭이 기준(사용자 의견 2026-11-01): '- 교체 : …' → '- 교⎵⎵⎵⎵체 : …'
         # (세 글자·세 글자를 넘는 항목명은 그대로) → 쌍점과 내용이 위아래로 같은 자리
@@ -144,6 +148,33 @@ class RulesPart:
             if k > 0:
                 head = f"{m.group('b1') or ''}{spread(m.group('core'), k)}{m.group('b2') or ''}"
                 blocks[n] = dict(b, text=pre + head + (body if um else b["text"])[m.end():])
+
+    def _cover_labels(self, blocks):
+        """표지 개요 상자의 ○ 줄 두세 글자 이름표도 네 글자 폭으로 — 본문과 같은 규칙(지금까지 정돈 --all만 맞췄음, 평가 2026-11-09)."""
+        if not self.starts_with_cover(blocks):
+            return
+        for n, b in enumerate(blocks):
+            proto = self._proto_of(b)
+            if proto is None:
+                continue
+            if proto.find(".//" + T("hp:secPr")) is not None:
+                break
+            if not para_tables(proto) or not isinstance(b.get("text"), str) or "□" not in b["text"]:
+                continue
+            runs = [r for cp in cell_paras(table_grid(para_tables(proto)[0])[0][4]) for r in indexed_runs(cp)]
+            font = next((self.styles.char.get(r.get("charPrIDRef"), {}).get("font") for r in runs), None)
+            k = max(1, round(self.metrics.em(font, " ") / FW_EM))
+            target = self._label_em("가가가가", font)
+            lines = b["text"].split(NL)
+            for i, line in enumerate(lines):
+                pre, um, body = split_marker(line)
+                m = LABEL_RE.match(body) if um and marker_level(line) == 2 else None
+                if not m:
+                    continue
+                core = m.group("core").strip().replace(" ", FW * k)
+                core = spread(core, max(0, int(round((target - self._label_em(core, font)) / FW_EM))))
+                lines[i] = f"{pre}{m.group('b1') or ''}({core}){m.group('b2') or ''}{FW * k}{body[m.end():].lstrip(' ' + FW)}"
+            blocks[n] = dict(b, text=NL.join(lines))
 
     def _body_font(self, idx):
         runs = indexed_runs(self.protos[idx])
@@ -176,8 +207,12 @@ class RulesPart:
             if para_tables(p):
                 continue
             text = para_text(p)
+            if marker_level(text) == 1:
+                continue
             k = content_at(text)
-            if not k or marker_level(text) == 1:
+            if not k:
+                if not (label_content(text) or label_colon(text)):
+                    self._reset_hang(p, text, lay)
                 continue
             chs, lines = lay.para_lines(p, body_w)
             if len(lines) < 2 or sum(c[1] for c in chs[:k]) > body_w * 0.4:
@@ -219,6 +254,85 @@ class RulesPart:
             self.warn(f"쌍점(:) 뒤 내용이 두 줄 이상인 문단 {n_colon}개는 둘째 줄을 쌍점 뒤 첫 글자에 맞췄습니다.")
         if n_label:
             self.warn(f"괄호 이름표 뒤 내용이 두 줄 이상인 문단 {n_label}개는 둘째 줄을 이름표 뒤 첫 글자에 맞췄습니다.")
+
+    def _reset_hang(self, p, text, lay):
+        """이름표 없는 머리 기호 줄: 견본 문단의 내어쓰기가 머리 기호 뒤 첫 글자보다 한 글자 넘게 크면(앞 판의 이름표용 값 — 새 글의
+        둘째 줄이 33mm에서 시작, 평가 2026-11-09) 새 글의 머리로 다시 잰다. 화살표 뒤에 맞춘 줄은 그대로(arrow_breaks가 맡음)."""
+        pre, mark, _ = split_marker(text)
+        if not mark or "\t" in pre or len(pre) >= len(text):
+            return
+        chs = lay.chars(p)
+        want = sum(c[1] for c in chs[:len(pre)])
+        em = chs[len(pre)][1]
+        cur = -self.styles.para.get(p.get("paraPrIDRef"), {}).get("intent", 0)
+        if cur - want <= em:
+            return
+        k2 = next((i + 1 for i in range(len(text) - 1, len(pre), -1) if text[i] in ARROWS), 0)
+        while k2 and k2 < len(text) and text[k2] in " ⎵⍽":
+            k2 += 1
+        if k2 and k2 < len(chs) and abs(cur - sum(c[1] for c in chs[:k2])) <= 0.02 * chs[k2][1]:
+            return
+        p.set("paraPrIDRef", self.hedit.para_hang(p.get("paraPrIDRef"), want))
+
+    def made_reset(self):
+        """이 스킬이 만든 문서를 견본으로 쓸 때 앞 판의 맞춤값을 되돌린다 — 끝 줄·빈칸 맞춤이 줄인 내용 자간(-5% 위에 또 줄여 -11%),
+        쪽 맞춤이 낮춘 줄 간격(평가 2026-11-09). 기준은 만들 때 남긴 표시(base_line·base_sp), 없으면 같은 수준 문단에서 가장 많이 쓴 값.
+        돌려주는 것: 이번에 맞추기 전 기준값(만든 문서에 다시 남김)."""
+        meta = read_doc_meta(self.pkg)
+        rows = {}
+        for p in self.protos:
+            text = para_text(p)
+            lv = marker_level(text)
+            if para_tables(p) or not lv or not text.strip():
+                continue
+            pp = self.styles.para.get(p.get("paraPrIDRef"), {})
+            row = rows.setdefault(lv, {"lines": [], "sp": {}, "paras": []})
+            if pp.get("line_type", "PERCENT") == "PERCENT":
+                row["lines"].append(pp.get("line", 160))
+            row["paras"].append(p)
+            pos, head = 0, head_length(text)
+            for r in para_runs(p):
+                t = run_text(r)
+                st, pos = pos, pos + len(t)
+                if t.strip() and st >= head and r.find(T("hp:tbl")) is None:
+                    sp = self.styles.char.get(r.get("charPrIDRef"), {}).get("spacing", 0)
+                    if PROFILE["spacing_min_pct"] <= sp <= PROFILE["spacing_max_pct"]:
+                        row["sp"][sp] = row["sp"].get(sp, 0) + len(t)
+
+        def table(key):
+            return {int(a): int(b) for a, b in (x.split(":") for x in meta.get(key, "").split(",") if x)}
+
+        lines, sps = table("base_line"), table("base_sp")
+        for lv, row in rows.items():
+            if lv not in lines and row["lines"]:
+                lines[lv] = max(set(row["lines"]), key=row["lines"].count)
+            if lv not in sps and row["sp"]:
+                sps[lv] = max(row["sp"], key=row["sp"].get)
+        if meta.get("made"):
+            n_line = n_sp = 0
+            for lv, row in rows.items():
+                for p in row["paras"]:
+                    pid = p.get("paraPrIDRef")
+                    pp = self.styles.para.get(pid, {})
+                    if lv in lines and pp.get("line_type", "PERCENT") == "PERCENT" and pp.get("line") != lines[lv]:
+                        p.set("paraPrIDRef", self.hedit.para_line(pid, lines[lv]))
+                        n_line += 1
+                    pos, head, hit = 0, head_length(para_text(p)), False
+                    for r in para_runs(p):
+                        t = run_text(r)
+                        st, pos = pos, pos + len(t)
+                        cid = r.get("charPrIDRef")
+                        sp = self.styles.char.get(cid, {}).get("spacing", 0)
+                        if (lv in sps and t.strip() and st >= head and r.find(T("hp:tbl")) is None and sp != sps[lv]
+                                and PROFILE["spacing_min_pct"] <= sp <= PROFILE["spacing_max_pct"]):
+                            r.set("charPrIDRef", self.hedit.char_spacing(cid, sps[lv]))
+                            hit = True
+                    n_sp += hit
+            if n_line or n_sp:
+                self.warn(f"이 스킬이 만든 문서를 견본으로 써서 앞 판이 맞춘 값을 되돌린 뒤 다시 맞췄습니다(줄 간격 {n_line}문단·내용 자간 {n_sp}문단) — "
+                          "한글에서 손으로 바꾼 값도 함께 되돌아갑니다.")
+        return {"base_line": ",".join(f"{k}:{lines[k]}" for k in sorted(lines)),
+                "base_sp": ",".join(f"{k}:{sps[k]}" for k in sorted(sps))}
 
     def small_squares(self):
         """□ 큰 항목 기호만 뒤 글자보다 SQUARE_DOWN(2pt) 작게(사용자 2026-11-04 '□도 줄이기' — ■ 표 제목 기호를 2pt 줄인 것과
@@ -358,7 +472,7 @@ class RulesPart:
         if few:
             self.warn(f"진행 단계가 {FLOW_MIN_STEPS}개보다 적은 도표 {len(few)}개(" + ", ".join(f"‘{t}’" for t in few[:3])
                       + f"): 도표(워크플로우 표)는 단계가 {FLOW_MIN_STEPS}개 이상일 때만 씁니다(4·5개는 한 줄, 6·7·8개는 두 줄로 "
-                      "좌우를 꽉 채움) — 그보다 적으면 표(시기·내용)나 ○ 글로 쓰세요.")
+                      "좌우를 꽉 채움) — 그보다 적으면 표(시기·내용)나 ○ 글로 쓰세요.", level="fix")
         return len(few)
 
     def _head_titled(self, ps):
@@ -380,7 +494,7 @@ class RulesPart:
         names = [para_text(out[j]).strip().lstrip(TABLE_TITLE_MARK + " ")[:14] for j in hits]
         if not remove:
             self.warn(f"바로 위 제목과 겹치는 ■ 제목 {len(hits)}개(" + ", ".join(f"‘{t}’" for t in names[:3])
-                      + "): □ 제목·참고 머리표 제목이 곧 표 제목이라 ■ 제목 줄은 뺍니다(사용자 원칙).")
+                      + "): □ 제목·참고 머리표 제목이 곧 표 제목이라 ■ 제목 줄은 뺍니다(사용자 원칙).", level="fix")
             return len(hits)
         for j in sorted(hits, reverse=True):
             q = out.pop(j)
@@ -528,32 +642,35 @@ class RulesPart:
                 continue
             ones = [t for t, n in items if n == 1]
             many = [f"{t}({n}개)" for t, n in items if n > 5]
-            msg = f"{child[lv]} 항목 수 — 셋쯤이 좋고 2~5개를 벗어나지 않게(사용자 원칙): "
+            head = f"{child[lv]} 항목 수 — 셋쯤이 좋고 2~5개를 벗어나지 않게(사용자 원칙): "
             basis = [t for t in ones if lv == 1 and BASIS_TITLE_RE.search(t)]
+            ones = [t for t in ones if t not in basis]
             if basis and getattr(self, "basis_searched", False):
                 # 찾아봤지만 더 없음(계획 "basis_searched": true) — 하나로 두고 알림만(사용자 2026-11-07 '훈령이나 지침, 매뉴얼,
                 # 유권해석 등을 찾아봐도 없으면', '1번') — 지어내지 않는다
                 self.warn("근거법령은 ○ 하나로 두었습니다 — 시행령·시행규칙·자치법규·행정규칙(훈령·예규·고시·지침)·매뉴얼·"
                           "법령해석례(유권해석)까지 찾아봤지만 확인된 것이 없음(계획 basis_searched).")
-                ones = [t for t in ones if t not in basis]
-                basis = []
-                if not ones and not many:
-                    continue
-            if basis:  # 근거법령도 ○ 둘 이상(사용자 원칙 2026-11-03) — 나누거나 합치지 말고 확인된 근거를 더함
-                msg += (f"○ 하나뿐인 근거법령({', '.join('‘' + t + '’' for t in basis)}) → 확인된 다른 근거(같은 법령의 시행령·"
-                        "시행규칙, 조례·규칙, 훈령·예규·고시·지침, 매뉴얼·계획, 법령해석례(유권해석))를 법령 검색 도구로 찾아 ○로 "
-                        "더하세요(확인한 것만). 찾아봐도 없으면 계획에 \"basis_searched\": true — 하나로 두고 알림으로 낮춤")
-                ones = [t for t in ones if t not in basis]
-                if ones or many:
-                    msg += "; "
+            elif basis:  # 근거법령도 ○ 둘 이상(사용자 원칙 2026-11-03) — 나누거나 합치지 말고 확인된 근거를 더함
+                self.warn(head + f"○ 하나뿐인 근거법령({', '.join('‘' + t + '’' for t in basis)}) → 확인된 다른 근거(같은 법령의 시행령·"
+                          "시행규칙, 조례·규칙, 훈령·예규·고시·지침, 매뉴얼·계획, 법령해석례(유권해석))를 법령 검색 도구로 찾아 ○로 "
+                          "더하세요(확인한 것만). 찾아봐도 없으면 계획에 \"basis_searched\": true — 하나로 두고 알림으로 낮춤.",
+                          level="fix", kind="basis")
+            tail = {1: " → (추진방향)·(주요내용)처럼 둘 이상으로 나누거나 다른 □와 합치세요",
+                    2: " → -를 둘 이상으로 나누거나 ○ 글에 합치세요",
+                    3: " → ·를 둘 이상으로 나누거나 - 글에 합치세요"}[lv]
+            if lv == 1:  # □마다 따로 — 한 문장에 모으면 "omit": ["basis"]가 다른 □의 항목 수까지 숨김(평가 2026-11-09)
+                for t in ones:
+                    self.warn(head + f"○ 하나뿐인 {names[lv]} ‘{t}’{tail}.", level="fix")
+                for t in many:
+                    self.warn(head + f"○가 다섯을 넘는 {names[lv]} {t} → 묶거나 나누세요.", level="fix")
+                continue
+            msg = head
             if ones:
-                msg += f"{child[lv]} 하나뿐인 {names[lv]} {len(ones)}개({', '.join('‘' + t + '’' for t in ones)})"
-                msg += {1: " → (추진방향)·(주요내용)처럼 둘 이상으로 나누거나 다른 □와 합치세요",
-                        2: " → -를 둘 이상으로 나누거나 ○ 글에 합치세요",
-                        3: " → ·를 둘 이상으로 나누거나 - 글에 합치세요"}[lv]
+                msg += f"{child[lv]} 하나뿐인 {names[lv]} {len(ones)}개({', '.join('‘' + t + '’' for t in ones)})" + tail
             if many:
                 msg += ("; " if ones else "") + f"{child[lv]}가 다섯을 넘는 {names[lv]} " + ", ".join(many) + " → 묶거나 나누세요"
-            self.warn(msg + ".")
+            if ones or many:
+                self.warn(msg + ".", level="fix")
 
     def _is_ref_head(self, p):
         tables = para_tables(p)
@@ -603,7 +720,7 @@ class RulesPart:
         if missing:
             self.warn(f"표 제목이 없습니다 — 표 {len(missing)}개(" + ", ".join(f"‘{t}…’" for t in missing[:3])
                       + (" 등" if len(missing) > 3 else "") + "): 표 블록에 \"title\": \"○○ 현황\"을 넣으면 표 위 왼쪽에 "
-                      "■ 제목이 붙습니다(단위 줄은 그 아래 오른쪽).")
+                      "■ 제목이 붙습니다(단위 줄은 그 아래 오른쪽).", level="fix", kind="table_title")
 
     def basis_notes(self, out):
         """근거법령에는 부연설명을 달지 않는다(사용자 원칙 2026-11-04): Ⅰ. 근거법령 장·□ 근거법령 묶음 안의 -·※·* 줄을
@@ -640,7 +757,7 @@ class RulesPart:
                     + ")는 빼거나 그 내용을 쓰는 □(사업개요·추진배경 등)로 옮기세요")
         if laws:
             msg += ("; " if notes else ": ") + f"- 줄의 하위 법령 {len(laws)}개(" + ", ".join(f"‘{t}…’" for t in laws[:3]) + ")는 ○로 올리세요"
-        self.warn(msg + ".")
+        self.warn(msg + ".", level="fix", kind="basis")
 
     # ------------------------------------------------------------ 부연설명 괄호 작게
     def small_notes(self):
@@ -795,8 +912,9 @@ class RulesPart:
                 for x in para_runs(p):
                     if x.find(T("hp:t")) is not None:
                         sp = self.styles.char.get(x.get("charPrIDRef"), {}).get("spacing", 0)
-                        count[sp] = count.get(sp, 0) + len(run_text(x))
-                mode[p] = max(count, key=count.get) if count else base
+                        if sp >= PROFILE["spacing_min_pct"]:  # 이 단계가 줄인 조각(-25% 등)은 빼고 잼 — '중·동·서·남·북'처럼 줄인 글자가 많으면 -25 → -50이 됐음(평가 2026-11-09)
+                            count[sp] = count.get(sp, 0) + len(run_text(x))
+                mode[p] = max(count, key=count.get) if count else max(base, 0)
             # 문단 보통 자간보다 이미 좁은 조각은 이 단계가 줄인 것 — 보통 자간에서 다시 재어 더 줄일 때만(되풀이해도 같게, 2026-11-04)
             ref = max(base, mode[p])
             cids = [self.hedit.char_spacing(r.get("charPrIDRef"), max(-50, ref + dl)) if dl and ref + dl < base else None
@@ -993,7 +1111,7 @@ class RulesPart:
             where = f"견본 {target}번" if target is not None else f"견본 {fallback}번을 오른쪽 정렬로"
             self.warn(f"표 위 기준·단위 줄 {made}개를 표 오른쪽 끝에 맞춘 모양({where})으로 넣었습니다.")
         elif any(isinstance(b, dict) and b.get("unit") for b in blocks):
-            self.warn("견본에 기준·단위 줄로 쓸 문단이 없어 표 위 \"unit\"을 넣지 못했습니다.")
+            self.warn("견본에 기준·단위 줄로 쓸 문단이 없어 표 위 \"unit\"을 넣지 못했습니다.", level="fix")
         return out
 
     def _block_spacer(self):
@@ -1038,6 +1156,51 @@ class RulesPart:
         m = re.match(r"\(([^)]{1,12})\)", body)
         return bool(m) and bool(BASIS_RE.search(m.group(1)))
 
+    def _is_basis_block(self, b):
+        """계획 블록 글이 근거법령 ○인가 — 글에 쓴 머리 기호를 떼고 본다(plan-format: 기호까지 써도 떼어 냄, 평가 2026-11-09)."""
+        return self._is_basis("○ " + self._bare(b["text"]))
+
+    @staticmethod
+    def _bare(text):
+        _, mark, body = split_marker(text)
+        return body if mark else text
+
+    def _basis_no_heads(self, blocks, start, ref, level, moved, missing):
+        """□·Ⅰ. 제목이 없는 계획: 첫 ○가 근거인지 본다 — 말없이 건너뛰지 않음(평가 2026-11-09). ○도 없으면 자리를 확인하지 못했다고 알림."""
+        items = [n for n in range(start, ref) if level.get(n) == 2]
+        if not items:
+            self.warn("근거법령 자리를 확인하지 못했습니다 — □·Ⅰ. 제목과 ○ 줄이 없는 계획입니다(근거법령은 늘 1번 — 사용자 원칙).")
+            return self._basis_report(blocks, moved, missing)
+        if self._is_basis_block(blocks[items[0]]):
+            return self._basis_report(blocks, moved, missing)
+        basis = next((n for n in items if self._is_basis_block(blocks[n])), None)
+        if basis is None:
+            missing.append(f"첫 ○ ‘{self._bare(blocks[items[0]]['text'])[:10]}’")
+            return self._basis_report(blocks, moved, missing)
+        stop = next((k for k in items if k > basis), ref)
+        moved.append(f"○ ‘{self._bare(blocks[basis]['text'])[:10]}’를 맨 앞 ○로")
+        blocks = blocks[:items[0]] + blocks[basis:stop] + blocks[items[0]:basis] + blocks[stop:]
+        return self._basis_report(blocks, moved, missing)
+
+    def _renumber_chapters(self, blocks, start, ref):
+        """근거 장을 옮긴 뒤 글에 쓴 로마자 번호를 차례대로(옮긴 뒤 Ⅱ, Ⅰ, Ⅲ으로 남던 것 — 평가 2026-11-09). 고쳤으면 알림."""
+        k, changed = 0, []
+        for n in range(start, ref):
+            proto = self._proto_of(blocks[n])
+            if proto is None or para_tables(proto) or "text" not in blocks[n]:
+                continue
+            mark = split_marker(para_text(proto))[1]
+            if not mark or mark[0] not in ROMAN:
+                continue
+            k += 1
+            um = split_marker(blocks[n]["text"])[1]
+            if um and um[0] in ROMAN and um != number_mark("roman", k, um):
+                new = number_mark("roman", k, um)
+                blocks[n] = dict(blocks[n], text=blocks[n]["text"].replace(um, new, 1))
+                changed.append(f"{um} → {new}")
+        if changed:
+            self.warn("근거 장을 앞으로 옮기며 글에 쓴 장 번호를 차례대로 고쳤습니다(" + ", ".join(changed) + ").")
+
     def basis_first(self, blocks):
         """근거법령은 무조건 1번(사용자 원칙 2026-11-01 — 모든 공문·보고서·계획서에 근거법령이 옴):
         - 표지 개요 상자: 첫 □ 아래 첫 ○
@@ -1047,8 +1210,7 @@ class RulesPart:
         없으면 알린다."""
         moved, missing = [], []
         # 표지 개요 상자(그림으로 시작하는 계획의 첫 쪽, 한 칸 상자 글이 □·○ 줄)
-        first = self._proto_of(blocks[0]) if blocks else None
-        if first is not None and para_pics(first):
+        if self.starts_with_cover(blocks):
             for b in blocks:
                 proto = self._proto_of(b)
                 if proto is not None and proto.find(".//" + T("hp:secPr")) is not None:
@@ -1085,7 +1247,7 @@ class RulesPart:
             level[n] = 0 if not mark else (5 if mark[0] in ROMAN else marker_level(para_text(proto)))
         heads = [n for n in range(start, ref) if level.get(n) in (1, 5)]
         if not heads:
-            return self._basis_report(blocks, moved, missing)
+            return self._basis_no_heads(blocks, start, ref, level, moved, missing)
         first = heads[0]
 
         def move(lo, hi, to):  # blocks[lo:hi]를 to 자리 앞으로
@@ -1104,6 +1266,7 @@ class RulesPart:
                     nxt = next((k for k in chapters if k > c), ref)
                     blocks = move(c, nxt, first)
                     moved.append(f"‘{blocks[first]['text'][:8]}’ 장을 Ⅰ.로")
+                    self._renumber_chapters(blocks, start, ref)
             return self._basis_report(blocks, moved, missing)
         if BASIS_TITLE_RE.search(blocks[first]["text"]):
             return self._basis_report(blocks, moved, missing)  # □ 근거법령처럼 첫 □ 자체가 근거
@@ -1117,7 +1280,7 @@ class RulesPart:
         for h in (h for h in heads if level[h] == 1):
             end = next((k for k in heads if k > h), ref)
             items = [n for n in range(h + 1, end) if level.get(n) == 2]
-            basis = next((n for n in items if self._is_basis("○ " + blocks[n]["text"])), None)
+            basis = next((n for n in items if self._is_basis_block(blocks[n])), None)
             if basis is None:
                 continue
             stop = next((k for k in items if k > basis), end)
@@ -1136,7 +1299,7 @@ class RulesPart:
         이름표 뒤 글은 ○로 두고, 아래 줄(-·번호)이 모두 법령(「)이면 ○로 올린다. 이때 이름표 뒤 글이 법령이 아닌
         요약(예: '행정업무 규정·조례')이면 아래 법령 줄과 겹치므로 뺀다(돌려주는 두 번째 값)."""
         head = blocks[basis]
-        body = split_marker("○ " + head["text"])[2]
+        body = split_marker("○ " + self._bare(head["text"]))[2]
         lm = LABEL_RE.match(body)
         rest = body[lm.end():].strip() if lm else body.strip()
         kids = [n for n in range(basis + 1, stop) if level.get(n) == 3]
@@ -1157,9 +1320,7 @@ class RulesPart:
         if moved:
             self.warn("근거법령을 맨 앞(1번)으로 옮겼습니다(" + ", ".join(moved) + ") — 근거법령은 무조건 1번(사용자 원칙).")
         if missing:
-            self.warn("근거법령이 없습니다(" + ", ".join(missing) + ") — 모든 공문·보고서·계획서에 근거법령이 옵니다: "
-                      "로마자 장이 있으면 Ⅰ. 근거법령, 없으면 첫 □ 근거법령(아래 ○ 「…법」 제○조 하나씩). "
-                      "근거를 모르면 사용자에게 묻습니다.")
+            self.warn(BASIS_MISSING.format(", ".join(missing)), level="fix", kind="basis")
         return blocks
 
     def _is_ref_proto(self, b):

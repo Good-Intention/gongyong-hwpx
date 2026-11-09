@@ -9,6 +9,7 @@
     - 본문이 가리키는 글자 모양·문단 모양·테두리·스타일 번호가 header.xml에 모두 있는가
     - 표의 줄·칸 수와 합친 칸이 서로 맞는가
     - 첫 문단에 쪽 설정(secPr)이 있는가
+    - 그림 번호(binaryItemIDRef)가 content.hpf·BinData에 모두 있는가
 한글 프로그램으로 열어 본 것은 아니다. 모양은 한글에서 열어 확인해야 한다.
 """
 import os
@@ -22,6 +23,35 @@ REFS = {"charPrIDRef": "char", "paraPrIDRef": "para", "borderFillIDRef": "border
 
 
 def check(path):
+    """(문제, 참고, 글 차례). 깨진 파일도 오류로 멈추지 않고 '문제'로 돌려준다(평가 2026-11-09)."""
+    try:
+        return _check(path)
+    except SystemExit as e:  # Package가 쉬운 말로 알린 것(XML이 깨진 문서 등)
+        return [f"파일을 끝까지 읽지 못했습니다 — {e}"], [], []
+    except (zipfile.BadZipFile, OSError, KeyError, ValueError, AttributeError, TypeError, IndexError) as e:
+        why = "한글(HWPX) 묶음이 아닙니다(zip으로 열리지 않음)" if isinstance(e, zipfile.BadZipFile) else f"{type(e).__name__}: {e}"
+        return [f"파일을 끝까지 읽지 못했습니다 — {why}"], [], []
+
+
+def check_images(pkg):
+    """본문·서식이 가리키는 그림 번호가 content.hpf와 BinData에 있는가."""
+    if "Contents/content.hpf" not in pkg.data:
+        return []
+    items = {it.get("id"): it.get("href", "") for it in pkg.xml("Contents/content.hpf").iter(T("opf:item"))}
+    errors = []
+    for name in ["Contents/header.xml"] + pkg.sections():
+        for el in pkg.xml(name).iter():
+            ref = el.get("binaryItemIDRef")
+            if not ref:  # 빈 값은 '그림 없음'(한글이 저장한 테두리·배경에 흔함)
+                continue
+            if ref not in items:
+                errors.append(f"{name}: 그림 번호 {ref}가 content.hpf에 없습니다(그림이 비어 보임).")
+            elif items[ref] not in pkg.data:
+                errors.append(f"{name}: 그림 번호 {ref}의 파일 {items[ref]}이 묶음에 없습니다(그림이 비어 보임).")
+    return sorted(set(errors))
+
+
+def _check(path):
     errors, notes = [], []
     with zipfile.ZipFile(path) as z:
         infos = z.infolist()
@@ -43,6 +73,10 @@ def check(path):
                 errors.append(f"{name}: XML을 읽을 수 없음 ({e})")
     if errors:
         return errors, notes, []
+    missing_parts = [n for n in ["Contents/header.xml"] + pkg.sections() if n not in pkg.data]
+    if missing_parts:
+        return [f"목록에는 있는데 묶음에 없는 파일: {', '.join(missing_parts)}"], notes, []
+    errors += check_images(pkg)
     styles = Styles(pkg.xml("Contents/header.xml"))
     have = {"char": set(styles.char), "para": set(styles.para), "border": set(styles.border),
             "style": styles.style_ids}
@@ -65,10 +99,15 @@ def check(path):
         if name == pkg.sections()[0] and paras[0].find(".//" + T("hp:secPr")) is None:
             errors.append("첫 문단에 쪽 설정(secPr)이 없습니다. 한글이 열지 못할 수 있습니다.")
         for tbl in sec.iter(T("hp:tbl")):
-            errors += check_table(tbl)
+            errs = check_table(tbl)
+            errors += errs
+            if errs:
+                continue
             for r, c, w, need in narrow_cells(tbl):
                 notes.append(f"표 칸({r},{c}) 너비 {w / 283.46:.1f}mm가 칸 안 여백보다 좁아 한글이 {need / 283.46:.1f}mm로 "
                              "넓힙니다 — 표가 본문 밖으로 튀어나올 수 있음")
+        if errors:
+            continue
         for i, p in enumerate(paras):
             tables = para_tables(p)
             if tables:
@@ -94,6 +133,9 @@ def check_table(tbl):
     trs = [tr for tr in tbl if tr.tag == T("hp:tr")]
     if len(trs) != rows:
         errs.append(f"표 줄 수가 맞지 않음: rowCnt={rows}, 실제 {len(trs)}줄")
+    lost = [tc for tr in trs for tc in tr if tc.tag == T("hp:tc") and tc.find(T("hp:cellAddr")) is None]
+    if lost:
+        return errs + [f"표 칸 {len(lost)}개에 자리 정보(cellAddr)가 없습니다."]
     seen = {}
     for r, c, rs, cs, tc in table_grid(tbl):
         for rr in range(r, r + rs):
