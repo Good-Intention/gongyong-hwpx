@@ -21,7 +21,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: 필요한 것 설치
-        run: pip install lxml
+        run: pip install lxml pillow
+      - name: 비밀정보 점검
+        run: python tools/secret_scan.py
       - name: 시험
         run: python -m unittest discover -s tests -v
       - name: 스킬 파일 묶기
