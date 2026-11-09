@@ -3,3 +3,7 @@ __pycache__/
 dist/
 .DS_Store
 Thumbs.db
+.env
+.env.*
+*.pem
+*.key

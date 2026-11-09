@@ -16,6 +16,7 @@
 | `tests/` | 공개 시험: 문서 속 계획 예시 '고쳐야 함 0건'·출력 스냅숏(`golden/`)·한글 2024 맞대기(`hangul/` — PC 회귀와 같은 정답 형식)·스킬 파일 검사 | 안 들어감 |
 | `tools/package_skill.py` | .skill 묶기·받은 .skill 대조(PC 묶기 도구와 같은 검사·같은 넣는 파일) | 안 들어감 |
 | `tools/hangul_truth.py`·`tools/pdf_glyphs.py` | 한글 2024 PDF에서 정답 뽑기·맞대기(PC 회귀와 같은 파일, 별도 패키지 없음) | 안 들어감 |
+| `tools/secret_scan.py` | API 키·개인 연락처·PC 경로·문서와 그림 속 작성자 점검(PC 도구와 같은 파일, 올릴 때마다 자동) | 안 들어감 |
 | `예시_보고서/` | 스킬로 만든 4쪽 보고서 .hwpx + 그것을 한글 2024로 저장한 .pdf + 미리보기 | 안 들어감 |
 | `.github/workflows/` | 올릴 때 시험, 릴리스 때 .skill 대조·붙이기 | — |
 
@@ -38,6 +39,7 @@
 ```bash
 export PYTHONDONTWRITEBYTECODE=1           # 스킬 폴더에 파이썬 캐시를 남기지 않음
 pip install lxml                           # 처음 한 번(한글 맞대기도 별도 패키지 없이 돎)
+python tools/secret_scan.py                # 위험 0건이어야 올림
 python -m unittest discover -s tests -v    # 모두 통과해야 올림
 ```
 
