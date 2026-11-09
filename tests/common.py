@@ -55,7 +55,7 @@ def doc_plans():
 
 
 def build(plan, template=BASIC, brief=False):
-    """계획을 만들어 (끝 번호, 출력 글)을 돌려준다. 출력 첫 줄(만든 파일 경로)은 뺀다."""
+    """계획을 만들어 (끝 번호, 출력 글)을 돌려준다. 판 표시 줄과 만든 파일 경로 줄은 뺀다(판마다·임시 폴더마다 달라짐)."""
     with tempfile.TemporaryDirectory() as d:
         pf = os.path.join(d, "plan.json")
         with open(pf, "w", encoding="utf-8") as f:
@@ -64,8 +64,8 @@ def build(plan, template=BASIC, brief=False):
                "--out", os.path.join(d, "out.hwpx")] + (["--brief"] if brief else [])
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8")
         r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
-    lines = r.stdout.splitlines()
-    return r.returncode, "\n".join(lines[1:]) + ("\n" + r.stderr if r.stderr else "")
+    lines = [x for x in r.stdout.splitlines() if not x.startswith(("gongyong-hwpx v", "만듦: "))]
+    return r.returncode, "\n".join(lines) + ("\n" + r.stderr if r.stderr else "")
 
 
 def fix_count(output):
