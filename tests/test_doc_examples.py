@@ -9,7 +9,7 @@ from common import build, doc_plans, fix_count
 class DocExamples(unittest.TestCase):
     def test_examples_found(self):
         names = [n for _, n, _ in doc_plans()]
-        self.assertTrue(any(n.startswith("references/basic-report-map.md") for n in names), names)
+        self.assertTrue(any(n.startswith("references/plan-format.md") for n in names), names)  # 기호로 쓴 예시 하나(늘 읽는 문법 파일에)
 
     def test_examples_pass_checks(self):
         for _, name, plan in doc_plans():

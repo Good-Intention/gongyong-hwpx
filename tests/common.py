@@ -46,7 +46,10 @@ def doc_plans():
             except json.JSONDecodeError:
                 continue  # 문법 설명용 조각({블록} 같은 자리표시)
             blocks = plan.get("blocks") if isinstance(plan, dict) else plan
-            if not isinstance(blocks, list) or not blocks or blocks[0].get("like") != 0:
+            if not isinstance(blocks, list) or not blocks:
+                continue
+            first = blocks[0]  # 맨 앞이 제목 상자: 번호 꼴 {"like": 0, …} 또는 기호 꼴 "제목: …"
+            if not ((isinstance(first, dict) and first.get("like") == 0) or (isinstance(first, str) and first.lstrip().startswith("제목:"))):
                 continue
             line = text[:m.start()].count("\n") + 1
             k += 1
