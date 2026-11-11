@@ -201,7 +201,7 @@ def basis_exempt(doc_type):
     return bool(doc_type) and bool(BASIS_EXEMPT_RE.search(str(doc_type)))
 
 
-# 문서 정보 '기타' 칸(description)에 남기는 표시 줄 — 'gongyong-hwpx made=2.13;base_line=…'. 줄 첫머리에서만 알아본다:
+# 문서 정보 '설명' 칸(description)에 남기는 표시 줄 — 'gongyong-hwpx made=2.13;base_line=…'. 줄 첫머리에서만 알아본다:
 # 줄 가운데 같은 글자가 든 사람 메모('승인 메모: gongyong-hwpx made=2.12 사용 문서')를 표시로 읽거나 지우지 않게(검토 2026-11-12).
 # 한글 2024는 이 칸의 줄 바꿈을 그대로 둔다(실측)
 DOC_NOTE_RE = re.compile(r"^[ \t]*gongyong-hwpx[ :]+(made=[^\r\n]*)$", re.M)
@@ -214,7 +214,7 @@ def _parse_meta(text):
 
 def read_doc_meta(pkg):
     """만든 문서에 남긴 표시 {'made': '2.13', 'doc_type': …, 'basis': 'off'} — 없으면 {}. 숨은 표시(opf:meta gongyong-hwpx)가 먼저,
-    없으면 문서 정보 '기타' 칸의 표시 줄 — 한글은 저장할 때 숨은 표시를 버리고 문서 정보 칸만 남긴다(한글 2024 확인 2026-11-12:
+    없으면 문서 정보 '설명' 칸의 표시 줄 — 한글은 저장할 때 숨은 표시를 버리고 문서 정보 칸만 남긴다(한글 2024 확인 2026-11-12:
     만든 문서를 한글에서 저장하면 표시가 사라져 정돈이 만든 표의 줄 높이·칸 여백을 다시 건드렸음)."""
     if "Contents/content.hpf" not in pkg.data:
         return {}
@@ -230,8 +230,8 @@ def read_doc_meta(pkg):
 
 def write_doc_meta(pkg, info):
     """만든 문서 content.hpf에 표시를 남긴다 — 정돈·검사만·다시 쓰기가 같은 판단을 하게. 두 곳: 숨은 표시(한글 문서 정보 창에 안 보이는
-    이름 — 한글이 저장하면 사라짐)와 문서 정보 '기타' 칸의 한 줄(한글이 저장해도 남음, 기준값 doc_note가 '없음'이면 남기지 않음).
-    '기타' 칸에 사람이 적은 글은 그대로 두고 표시 줄만 바꾼다."""
+    이름 — 한글이 저장하면 사라짐)와 문서 정보 '설명' 칸의 한 줄(한글이 저장해도 남음, 기준값 doc_note가 '없음'이면 남기지 않음).
+    '설명' 칸에 사람이 적은 글은 그대로 두고 표시 줄만 바꾼다."""
     if "Contents/content.hpf" not in pkg.data or not info:
         return
     hpf = pkg.xml("Contents/content.hpf")
