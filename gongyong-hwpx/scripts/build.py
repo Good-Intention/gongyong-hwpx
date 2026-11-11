@@ -24,6 +24,7 @@ from hwpx_lib import _base_head  # noqa: E402,F401 — 밑줄 이름은 *로 안
 from hwpx_lib import COMPOSE_CHAR, read_plan, same_path  # noqa: E402
 from build_fill import FillPart  # noqa: E402
 from build_rules import RulesPart  # noqa: E402
+from plan_text import expand_plan  # noqa: E402
 from spaces import compact_fw, lead_to_margin  # noqa: E402
 
 
@@ -133,7 +134,8 @@ class Builder(FillPart, RulesPart):
         return next((q for q in paras[:6] if para_text(q).strip() and not para_tables(q) and not para_pics(q)), None)
 
     def cover_numbers(self, paras):
-        """표지에는 쪽 번호를 감추고(쪽 번호 감추기), 본문 첫 쪽부터 1로 다시 센다(새 번호로 시작)."""
+        """표지에는 쪽 번호와 머리말(머리말 시 슬로건 그림 — 표지는 제 슬로건이 있음, 사용자 2026-11-11 '표지를 뺀 모든 쪽')을
+        감추고(감추기), 본문 첫 쪽부터 1로 다시 센다(새 번호로 시작)."""
         end = cover_end(paras)
         if end is None:
             return
@@ -141,7 +143,7 @@ class Builder(FillPart, RulesPart):
         # (한글 확인 2026-11-01) — 같은 쪽의 첫 글 문단(날짜 줄 등) 맨 앞에 둔다
         first_text = next((q for q in paras[end:end + 4] if para_text(q).strip() and not para_tables(q)), None)
         for p, tag, attrs in ((paras[0], "hp:pageHiding",
-                               (("hideHeader", "0"), ("hideFooter", "0"), ("hideMasterPage", "0"), ("hideBorder", "0"),
+                               (("hideHeader", "1"), ("hideFooter", "0"), ("hideMasterPage", "0"), ("hideBorder", "0"),
                                 ("hideFill", "0"), ("hidePageNum", "1"))),
                               (first_text if first_text is not None else paras[end], "hp:newNum",
                                (("num", "1"), ("numType", "PAGE")))):
@@ -221,12 +223,13 @@ class Builder(FillPart, RulesPart):
                       "보고서 문장은 ‘~으로’로 끝내지 않습니다 — ‘통제 가능한 항목으로 편성’처럼 뒤에 할 일(편성·배정·전환 등)을 붙이세요.", level="fix")
 
     def build(self, plan):
+        plan = expand_plan(plan, self)  # 기호로 쓴 블록("○ …")·like 없는 표 블록 → 번호 블록(plan_text.py)
         blocks = check_plan(plan)
         if not blocks:
             raise BuildError("계획에 블록이 하나도 없습니다.")
         opts = plan if isinstance(plan, dict) else {}
         self.fit_base = self.made_reset()  # 이 스킬이 만든 문서를 견본으로 쓸 때 앞 판의 맞춤값을 되돌리고, 맞추기 전 기준값을 잼
-        blocks = [dict(b, _src=n + 1) if isinstance(b, dict) else b for n, b in enumerate(blocks)]
+        blocks = [dict(b, _src=b.get("_src", n + 1)) if isinstance(b, dict) else b for n, b in enumerate(blocks)]
         blocks = self.table_units(blocks)  # 이름표 맞추기 등이 '(기준 : …)'을 괄호 이름표로 다루기 전에
         self.doc_type = str(opts.get("doc_type") or "").strip()
         omit = opts.get("omit") or []
@@ -267,6 +270,7 @@ class Builder(FillPart, RulesPart):
             self.warn("계획에서 일부러 뺀다고 한 것(omit — " + "·".join(OMIT_KEYS[k] for k in sorted(self.omit))
                       + ")은 검사하지 않고, 그에 대한 지적은 알림으로만 둡니다(만든 문서에 표시가 남아 검사만도 같음).")
         out = [self.make_block(n, b) for n, b in enumerate(blocks)]
+        out = self.org_settings(out)  # 기준값 파일의 기관 그림(다른 기관 공용) — 첫 문단(쪽 설정을 받을 문단)을 정하기 전에
         self.flow_gaps(out)
         self.lone_dashes(out)
         self.basis_notes(out)
@@ -306,6 +310,7 @@ class Builder(FillPart, RulesPart):
             self.warn(f"키캡 숫자(1️⃣) {caps}개를 글자 겹치기 네모 숫자로 바꿨습니다(키캡은 네모가 왼쪽으로 삐져나옴).")
         for p in self.sec.iter(T("hp:p")):  # 기호 뒤 한 칸(표 칸 글 등 — 머리 기호 줄은 견본 기호와 빈칸을 씀)
             insert_marker_gap(p)
+        self.org_phone()  # 날짜·부서 줄 전화 앞자리(기준값 파일 — 기본 053-803이면 그대로)
         if opts.get("word_wrap", True):
             self.word_wrap()
         if opts.get("paren_small", PROFILE["paren_smaller_pt"]):
@@ -334,6 +339,7 @@ class Builder(FillPart, RulesPart):
             f.spread_pages()
             f.fit_refs()
             f.fit_cover()
+            f.drop_moot_order_hint()  # 맞춘 문서가 이미 그만큼 좋으면 순서 바꾸기 알림은 뺌
             if opts.get("one_space", True):
                 self.one_space()  # 낫표 당기기 앞에: 당기기가 빈칸 한 개(장평 두 배)의 자간을 줄여 '당김' 표시가 남게
             if opts.get("pull_corner", True):
@@ -388,7 +394,10 @@ class Builder(FillPart, RulesPart):
         if "Contents/content.hpf" not in self.pkg.data:
             return
         used = set()
-        for name in ["Contents/header.xml"] + self.sec_names[:1]:
+        # 결과에 남는 모든 XML에서 쓰는 그림을 센다 — 머리말·본문만 보면 바탕쪽(masterpage)에서만 쓰는 견본 로고가 지워짐(검토 2026-11-12)
+        gone = set(self.sec_names[1:])
+        parts = [n for n in self.pkg.data if n.startswith("Contents/") and n.endswith(".xml") and n not in gone]
+        for name in parts:
             for el in self.pkg.xml(name).iter():
                 v = el.get("binaryItemIDRef")
                 if v:
@@ -440,6 +449,9 @@ class Builder(FillPart, RulesPart):
         if getattr(self, "basis_searched", False):
             meta["basis_searched"] = "yes"
         meta.update(getattr(self, "fit_base", None) or {})
+        fit_line = self.fit_line_mark()
+        if fit_line:
+            meta["fit_line"] = fit_line
         if getattr(self, "table_pt", None):
             meta["table_pt"] = str(self.table_pt)
         write_doc_meta(self.pkg, meta)
@@ -473,9 +485,11 @@ def main():
     if b.image_notes:
         b.warnings.append(f"표 칸 배경 그림 {len(b.image_notes)}개를 넣었습니다({', '.join(b.image_notes)}) — 칸 높이를 그림 비율에 맞춤.")
     errors, notes, outline = check(a.out)
-    # 뺀다고 한 요소의 지적은 알림으로
-    fix = [w for w in b.warnings + b.fit_notes if note_is_fix(w, b.omit)]
-    info = [w for w in b.warnings + b.fit_notes if not note_is_fix(w, b.omit)]
+    # 뺀다고 한 요소의 지적은 알림으로 — 근거법령 검사를 끈 문서("basis_first": false·근거법령 없이 시작하는 doc_type)의 근거법령
+    # 지적도(설명서는 '끄면 근거법령 검사도 건너뜀'인데 부연설명·○ 하나 지적이 '고쳐야 함'으로 남았음, 검토 2026-11-12)
+    off = b.omit | ({"basis"} if getattr(b, "basis_off", False) else set())
+    fix = [w for w in b.warnings + b.fit_notes if note_is_fix(w, off)]
+    info = [w for w in b.warnings + b.fit_notes if not note_is_fix(w, off)]
     pages = next((w for w in info if w.startswith("어림 쪽 수")), "")
     print(f"## 한눈에: 고쳐야 함 {len(fix) + len(notes)}건, 구조 검사 {'문제 있음' if errors else '통과'}"
           + (f", {pages}" if pages else ""))
@@ -507,10 +521,11 @@ def margin_note(pi):
     f = lambda v: f"{v:.0f}" if abs(v - round(v)) < 0.05 else f"{v:.1f}"  # noqa: E731
     paper = "A4" if sorted((round(pi["width"]), round(pi["height"]))) == [210, 297] else f"{f(pi['width'])}×{f(pi['height'])}mm"
     top, bottom = pi["top"] + pi["header"], pi["bottom"] + pi["footer"]
+    system = PROFILE.get("org_paste_system") or ""  # 공문 시스템 이름(기준값 파일 — 기본 온나라, 비우면 붙여 넣기 안내를 뺌)
     return (f"여백: {paper}, 본문 칸 위 {f(top)}·아래 {f(bottom)}·왼쪽 {f(pi['left'])}·오른쪽 {f(pi['right'])}mm"
-            f"(용지 여백 위 {f(pi['top'])}·아래 {f(pi['bottom'])}mm에 머리말·꼬리말 {f(pi['header'])}·{f(pi['footer'])}mm). "
-            f"온나라 공문에 붙여 넣으실 때는 [쪽] → [편집 용지]에서 왼쪽·오른쪽 여백을 {f(pi['left'])}·{f(pi['right'])}mm로 "
-            "맞춰 주세요(그래야 줄 바꿈이 그대로 갑니다).")
+            f"(용지 여백 위 {f(pi['top'])}·아래 {f(pi['bottom'])}mm에 머리말·꼬리말 {f(pi['header'])}·{f(pi['footer'])}mm)."
+            + (f" {system} 공문에 붙여 넣으실 때는 [쪽] → [편집 용지]에서 왼쪽·오른쪽 여백을 {f(pi['left'])}·{f(pi['right'])}mm로 "
+               "맞춰 주세요(그래야 줄 바꿈이 그대로 갑니다)." if system else ""))
 
 
 if __name__ == "__main__":

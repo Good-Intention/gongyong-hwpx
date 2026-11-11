@@ -2,6 +2,77 @@
 """글 넣기(Builder의 일부): 견본 문단에 글·조각 넣기, 표 칸·줄·칸 수, 칸 배경 그림, 도표(flow)."""
 from build_base import *  # noqa: F401,F403 — 상수·공통 함수·BuildError
 from hwpx_lib import _base_head  # noqa: E402,F401 — 밑줄 이름은 *로 안 넘어옴
+import hashlib  # noqa: E402
+from style_profile import NO_IMAGE, TEXT_DEFAULTS, org_image  # noqa: E402
+
+# 기관 항목(기준값 파일): 기본 양식의 표지 그림 문단 번호 → 항목 이름, 알림에 쓰는 이름
+ORG_PIC_PROTOS = {19: "org_slogan_image", 22: "org_mark_image"}
+ORG_IMAGE_KEYS = {"org_slogan_image": "슬로건", "org_mark_image": "기관 마크", "org_header_image": "머리말 슬로건"}
+DEFAULT_PHONE = TEXT_DEFAULTS["org_phone_prefix"]
+_ROLES = {}
+
+
+def _bundled_pic_roles():
+    """기본 양식(assets/basic_report.hwpx)의 표지 그림 바이트 지문 → 기관 그림 항목 이름. 결과 문서를 견본으로 다시 써도
+    그림 바이트가 같으므로 알아본다(그림 번호는 한글이 다시 저장하면 바뀜)."""
+    if not _ROLES:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "basic_report.hwpx")
+        pkg = Package(path)
+        sec = pkg.xml(pkg.sections()[0])
+        protos = [p for p in sec if p.tag == T("hp:p")]
+        hrefs = {it.get("id"): it.get("href") for it in pkg.xml("Contents/content.hpf").iter(T("opf:item"))}
+        found = [(key, pic) for k, key in ORG_PIC_PROTOS.items() if k < len(protos) for pic in para_pics(protos[k])]
+        found += [("org_header_image", pic) for hd in sec.iter(T("hp:header")) for pic in hd.iter(T("hp:pic"))]
+        for key, pic in found:
+            for img in pic.iter(T("hc:img")):
+                data = pkg.data.get(hrefs.get(img.get("binaryItemIDRef"), ""))
+                if data is not None:
+                    _ROLES[hashlib.sha1(data).hexdigest()] = key
+    return _ROLES
+
+
+def _resize_pic(pic, w_px, h_px, max_w):
+    """그림 개체(hp:pic)를 새 그림 비율로: 높이는 그대로 두고 너비를 비율대로(본문 폭의 90%를 넘으면 그 폭에 맞춰 높이도 줄임).
+    원래 크기 = 화소 × 75 HWPUNIT(한글 2024 실측 — CLAUDE.md)."""
+    cur = pic.find(T("hp:curSz"))
+    h = int(cur.get("height"))
+    w = int(round(h * w_px / h_px))
+    if w > max_w * 0.9:
+        w = int(max_w * 0.9)
+        h = int(round(w * h_px / w_px))
+    ow, oh = w_px * 75, h_px * 75
+    for tag in ("hp:curSz", "hp:sz"):
+        el = pic.find(T(tag))
+        if el is not None:
+            el.set("width", str(w))
+            el.set("height", str(h))
+    org = pic.find(T("hp:orgSz"))
+    if org is not None:
+        org.set("width", str(ow))
+        org.set("height", str(oh))
+    rot = pic.find(T("hp:rotationInfo"))
+    if rot is not None:
+        rot.set("centerX", str(w // 2))
+        rot.set("centerY", str(h // 2))
+    sca = pic.find(".//" + T("hc:scaMatrix"))
+    if sca is not None:
+        sca.set("e1", f"{w / ow:.6f}")
+        sca.set("e5", f"{h / oh:.6f}")
+    rect = pic.find(T("hp:imgRect"))
+    if rect is not None:
+        for tag, x, y in (("hc:pt0", 0, 0), ("hc:pt1", ow, 0), ("hc:pt2", ow, oh), ("hc:pt3", 0, oh)):
+            pt = rect.find(T(tag))
+            if pt is not None:
+                pt.set("x", str(x))
+                pt.set("y", str(y))
+    clip = pic.find(T("hp:imgClip"))
+    if clip is not None:
+        clip.set("right", str(ow))
+        clip.set("bottom", str(oh))
+    dim = pic.find(T("hp:imgDim"))
+    if dim is not None:
+        dim.set("dimwidth", str(ow))
+        dim.set("dimheight", str(oh))
 
 
 class FillPart:
@@ -235,6 +306,130 @@ class FillPart:
         self.image_cells.add(tc)
         self.image_aspect[tc] = w / h
         self.image_notes.append(f"{len(data) // 1024}KB")
+
+    # ------------------------------------------------------------ 기관 항목(기준값 파일 — 다른 기관 공용, 사용자 2026-11-11)
+    def org_settings(self, out):
+        """기준값 파일(assets/profile.json)의 기관 그림 항목을 결과에 적용한다. 기본 양식에 든 그림(바이트가 같은 그림 = 대구시
+        슬로건·마크)만 바꾸고, 사용자 견본에 든 다른 그림은 건드리지 않는다. 슬로건이 '없음'이면 그 그림만 든 문단을 뺀다.
+        기본값('')이면 아무것도 하지 않는다. 남길 문단 목록을 돌려준다."""
+        wants = {k: org_image(k) for k in ORG_IMAGE_KEYS}
+        if not any(wants.values()):
+            return out
+        roles = _bundled_pic_roles()
+        hpf = self.pkg.xml("Contents/content.hpf")
+        man = hpf.find(".//" + T("opf:manifest"))
+        id_role = {}
+        for it in man:
+            data = self.pkg.data.get(it.get("href", ""))
+            if data is not None and hashlib.sha1(data).hexdigest() in roles:
+                id_role[it.get("id")] = roles[hashlib.sha1(data).hexdigest()]
+        new_ids, keep, dropped = {}, [], 0
+        body_w = page_info(self.sec)["body_width"] * HWPUNIT_PER_MM
+
+        def role_of(pics):
+            return next((id_role.get(img.get("binaryItemIDRef")) for pic in pics for img in pic.iter(T("hc:img"))
+                         if id_role.get(img.get("binaryItemIDRef"))), None)
+
+        def swap(role, want, pics):
+            if role not in new_ids:
+                data, ext, w, h = self._org_image_bytes(want, f"기준값 ‘{role}’")
+                n = 1
+                have = {it.get("id") for it in man}
+                while f"orgimg{n}" in have:
+                    n += 1
+                item_id = f"orgimg{n}"
+                href = f"BinData/{item_id}.{ext}"
+                self.pkg.data[href] = data
+                it = etree.SubElement(man, T("opf:item"))
+                for k, v in (("id", item_id), ("href", href), ("media-type", "image/png" if ext == "png" else "image/jpg"),
+                             ("isEmbeded", "1")):
+                    it.set(k, v)
+                new_ids[role] = (item_id, w, h)
+                self.warn(f"{'' if role == 'org_header_image' else '표지 '}{ORG_IMAGE_KEYS[role]} 그림을 기준값 파일의 기관 그림"
+                          f"({os.path.basename(want)}, {len(data) // 1024}KB)으로 바꿨습니다.")
+            item_id, w, h = new_ids[role]
+            for pic in pics:
+                for img in pic.iter(T("hc:img")):
+                    if id_role.get(img.get("binaryItemIDRef")) == role:
+                        img.set("binaryItemIDRef", item_id)
+                        _resize_pic(pic, w, h, body_w)
+
+        for p in out:
+            pics = para_pics(p)
+            role = role_of(pics)
+            want = wants.get(role) if role else None
+            if not want:
+                keep.append(p)
+                continue
+            if want == NO_IMAGE:
+                if not para_text(p).replace("⎵", "").strip() and not para_tables(p):
+                    dropped += 1
+                    continue
+                keep.append(p)
+                continue
+            swap(role, want, pics)
+            keep.append(p)
+        if dropped:
+            self.warn("기준값 파일이 슬로건을 ‘없음’으로 정해 표지 슬로건 그림을 뺐습니다.")
+        # 머리말 슬로건 띠(쪽 설정과 함께 모아 둔 조종 조각 안 — 결과 첫 글 문단에 들어감)
+        for r in list(self.struct_runs):
+            for ctrl in [c for c in r if c.tag == T("hp:ctrl") and c.find(T("hp:header")) is not None]:
+                pics = list(ctrl.iter(T("hp:pic")))
+                role = role_of(pics)
+                want = wants.get(role) if role else None
+                if not want:
+                    continue
+                if want == NO_IMAGE:
+                    r.remove(ctrl)
+                    self.warn("기준값 파일이 머리말 슬로건을 ‘없음’으로 정해 머리말(오른쪽 위 슬로건 띠)을 뺐습니다.")
+                    continue
+                swap(role, want, pics)
+            if not any(is_struct(ch) for ch in r):
+                self.struct_runs.remove(r)
+        return keep
+
+    def _org_image_bytes(self, path, where):
+        """기관 그림: 투명 PNG는 투명을 살려(머리말·표지 그림 바깥이 종이색이 아니어도 그대로), 아니면 표 칸 그림과 같은 규칙."""
+        data, ext, w, h = self._image_bytes(path, where)
+        if not w or not h:
+            raise BuildError(f"{where}: 그림 크기를 읽지 못했습니다(PNG·JPEG만 됩니다).")
+        try:
+            import io
+            from PIL import Image
+            im = Image.open(path)
+            if im.mode in ("RGBA", "LA") or "transparency" in im.info:
+                im = im.convert("RGBA")
+                if max(im.size) > IMAGE_MAX_PX:
+                    f = IMAGE_MAX_PX / max(im.size)
+                    im = im.convert("RGBa").resize((max(1, round(im.size[0] * f)), max(1, round(im.size[1] * f))),
+                                                   Image.LANCZOS).convert("RGBA")
+                buf = io.BytesIO()
+                im.save(buf, "PNG", optimize=True)
+                return buf.getvalue(), "png", im.size[0], im.size[1]
+        except (ImportError, OSError):
+            pass
+        return data, ext, w, h
+
+    def org_phone(self):
+        """날짜·부서 줄의 사무실 전화 앞자리를 기준값 파일 값으로(기본 053-803 — 그대로면 아무것도 안 함). 첫 날짜 줄 하나만 본다."""
+        pre = PROFILE.get("org_phone_prefix") or ""
+        if not pre or pre == DEFAULT_PHONE:
+            return
+        for p in [x for x in self.sec if x.tag == T("hp:p")][:12]:  # 표지(문단 5개)가 앞에 있어도 제목 상자 아래 날짜 줄까지
+            if para_tables(p) or not DATE_LINE_RE.match(para_text(p)):
+                continue
+            hit = 0
+            for t in p.iter(T("hp:t")):
+                if t.text and DEFAULT_PHONE in t.text:
+                    hit += t.text.count(DEFAULT_PHONE)
+                    t.text = t.text.replace(DEFAULT_PHONE, pre)
+                for ch in t:
+                    if ch.tail and DEFAULT_PHONE in ch.tail:
+                        hit += ch.tail.count(DEFAULT_PHONE)
+                        ch.tail = ch.tail.replace(DEFAULT_PHONE, pre)
+            if hit:
+                self.warn(f"날짜·부서 줄의 전화 앞자리 {DEFAULT_PHONE}을 기준값 파일 값 {pre}(으)로 바꿨습니다.")
+            return
 
     def fill_table(self, p, block, where):
         tables = para_tables(p)
@@ -557,7 +752,8 @@ class FillPart:
                 if len(row) > len(cells):
                     raise BuildError(f"{where}: {i + 1}번째 줄은 칸이 {len(cells)}개인데 글이 {len(row)}개입니다.")
                 for k, tc in enumerate(cells):
-                    self.fill_cell(tc, row[k] if k < len(row) else "", f"{where} {i + 1}번째 줄 {k + 1}번째 칸")
+                    self.fill_cell(tc, row[k] if k < len(row) else "", f"{where} {i + 1}번째 줄 {k + 1}번째 칸",
+                                   marker=block.get("marker", True))  # cells·text와 같게 — table만 "marker": false가 안 먹었음(검토 2026-11-12)
             for tc in cells:
                 drop_linesegs(tc)
                 tc.find(T("hp:cellAddr")).set("rowAddr", str(i))

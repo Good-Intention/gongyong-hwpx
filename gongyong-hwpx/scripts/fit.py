@@ -207,7 +207,7 @@ class Fitter(LineFit, TableFit, PageFit):
             p = cover[i]
             p.set("paraPrIDRef", self.b.hedit.para_margin(p.get("paraPrIDRef"), "prev", max(0, v)))
         self.notes.append(f"표지: 제목 띠는 위에서 {y_band / HWPUNIT_PER_MM:.0f}mm, "
-                          + ("개요 상자는 제목 띠와 대구시 마크 사이 가운데, " if box is not None else "")
+                          + ("개요 상자는 제목 띠와 기관 마크 사이 가운데, " if box is not None else "")
                           + "마크·부서명은 쪽 아래에 두었습니다.")
 
     def _widen_cover_box(self, tbl):
@@ -280,6 +280,28 @@ class Fitter(LineFit, TableFit, PageFit):
             return
         self.notes.append(f"쪽을 꽉 채우려면 순서 바꾸기를 검토하세요: □ ‘{label(a0)}’와 □ ‘{label(b0)}’를 맞바꾸면 "
                           + ", ".join(why) + "(쪽 맞춤 전 어림) — 뜻이 그대로일 때만 계획에서 순서를 바꿉니다(내용을 크게 바꾸지 않는 한 됨).")
+        self._order_hint = (self.notes[-1], sc[0], sc[1], body0, ref_i)
+
+    def drop_moot_order_hint(self):
+        """쪽 맞춤을 끝낸 문서가 이미 '순서를 바꾼 것'만큼 좋으면(걸친 묶음 수·본문 쪽 수가 같거나 적음) 순서 바꾸기 알림을 뺀다 —
+        맞춤 전 어림으로 '본문 3→2쪽'이라 알리는데 맞춘 문서가 이미 2쪽이면 할 일이 없는 알림이고, 글 쓰는 쪽은 번번이 따져 본다
+        (시험 2026-11-12: 두 주문 모두 이 알림을 읽고 '바꾸지 않음'으로 끝남)."""
+        hint = getattr(self, "_order_hint", None)
+        if not hint or hint[0] not in self.notes:
+            return
+        note, splits, pages, body0, ref_i = hint
+        paras = self.paras()
+        ref_now = next((i for i, p in enumerate(paras) if self._is_ref_head(p)), len(paras))
+        if ref_now <= body0:
+            return
+        try:
+            where, used = self.lay.paginate(paras[:ref_now], self.body_w, self.body_h - SAFETY, self.heads(), BLOCK_GAP)
+            first, last = where[body0][0], where[ref_now - 1][1]
+            now = (len(self.lay.split), last - first)
+        finally:
+            self.lay.paginate(paras, self.body_w, self.body_h - SAFETY, self.heads(), BLOCK_GAP)
+        if now[0] <= splits and now[1] <= pages:
+            self.notes.remove(note)
 
     def report(self):
         """어림 쪽 수와 쪽마다 채운 비율."""

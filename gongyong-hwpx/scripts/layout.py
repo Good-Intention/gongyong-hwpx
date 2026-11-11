@@ -515,6 +515,7 @@ class Layout:
         self.tops = []  # 문단마다 첫 줄 (쪽, 위치) — 시험·맞춤용
         self.moved = []  # 다음 쪽에서 시작하게 넘긴 묶음의 첫 문단 번호
         self.split_rows = 0  # 쪽에 갈라진 표 줄 수(칸 안에서 나누는 표)
+        self.row_pos = {}  # 표 문단 번호 → 줄마다 (시작 쪽, 시작 위치, 끝 쪽, 끝 위치) — 정돈의 쪽 끝 줄 넘기기·나누기(2026-11-11)
         i = 0
         while i < n:
             def chain_to(i, last):
@@ -592,6 +593,7 @@ class Layout:
                         row_end[at] = at + len(row) - 1  # 줄 첫 조각 → 끝 조각
                         at += len(row)
                 row_start = None
+                rec = self.row_pos.setdefault(k, []) if it["table"] else None
                 for u_i, lh in enumerate(units):
                     if y + lh > body_h + 1 and y > 0:
                         used[page] = y
@@ -604,8 +606,12 @@ class Layout:
                         self.tops.append((page, y))
                     if u_i in row_end:
                         row_start = (page, row_end[u_i])
+                        row_y = y
                     if row_start and u_i == row_start[1]:
                         self.split_rows += page != row_start[0]
+                        rec.append((row_start[0], row_y, page, y + lh))
+                    elif not row_end and rec is not None:  # 줄 사이에서만 나누는 표: 조각 하나 = 줄 하나
+                        rec.append((page, y, page, y + lh))
                     y += lh
                 y += it["next"]
                 used[page] = y

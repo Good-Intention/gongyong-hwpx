@@ -111,6 +111,7 @@ class RulesPart:
             current.setdefault(lv, []).append((n, lm, body))
         close(list(current))
 
+        bolded = 0
         for g in groups:
             labeled = [(n, m, body) for n, m, body in g if m]
             if not labeled:
@@ -125,8 +126,15 @@ class RulesPart:
             for (n, m, body), core, w in zip(labeled, cores, widths):
                 core = spread(core, max(0, int(round((target - w) / FW_EM))))
                 b1, b2 = m.group("b1") or "", m.group("b2") or ""
+                if not b1 and not b2 and self._label_bold(blocks[n]["like"]):
+                    # 견본 문단의 이름표가 굵으면 ** 없이 쓴 이름표도 굵게 — 견본대로(시험 2026-11-12: '(현황)은 그냥 쓴다'를
+                    # 읽고 ** 없이 쓴 이름표 14곳이 보통 글씨로 나왔고 도구는 아무 말이 없었음)
+                    b1 = b2 = "**"
+                    bolded += 1
                 rest = body[m.end():].lstrip(" " + FW)
                 blocks[n] = dict(blocks[n], text=f"{b1}({core}){b2}{FW * k}{rest}")
+        if bolded:
+            self.warn(f"첫머리 괄호 이름표 {bolded}곳을 견본 문단처럼 굵게 넣었습니다(**를 붙이지 않아도 됨).")
         # 네 글자를 넘는 이름표는 맞춤에서 빠져도 된다(사용자: 네 글자가 기준, 넘는 것은 규칙에서 어긋나도 됨) — 알리지 않음
         self._cover_labels(blocks)
 
@@ -175,6 +183,21 @@ class RulesPart:
                 core = spread(core, max(0, int(round((target - self._label_em(core, font)) / FW_EM))))
                 lines[i] = f"{pre}{m.group('b1') or ''}({core}){m.group('b2') or ''}{FW * k}{body[m.end():].lstrip(' ' + FW)}"
             blocks[n] = dict(b, text=NL.join(lines))
+
+    def _label_bold(self, idx):
+        """견본 문단 idx의 첫머리 괄호 이름표가 굵은 조각인가."""
+        proto = self.protos[idx]
+        text = para_text(proto)
+        pre, mark, body = split_marker(text)
+        if not LABEL_RE.match(body):
+            return False
+        at, pos = len(pre) if mark else 0, 0
+        for r in indexed_runs(proto):
+            t = run_text(r)
+            if pos <= at < pos + len(t):
+                return self.styles.is_bold(r.get("charPrIDRef"))
+            pos += len(t)
+        return False
 
     def _body_font(self, idx):
         runs = indexed_runs(self.protos[idx])
@@ -303,6 +326,12 @@ class RulesPart:
             return {int(a): int(b) for a, b in (x.split(":") for x in meta.get(key, "").split(",") if x)}
 
         lines, sps = table("base_line"), table("base_sp")
+        # 만든 뒤 사람이 줄 간격을 바꾼 수준(만들 때 도구가 남긴 값 fit_line 밖의 값이 있음)은 되돌리지 않고 그 값을 새 기준으로 —
+        # '사용자가 고친 것을 되돌리지 않는다'(write.md). 표시가 한글 저장을 견디게 되면서(문서 정보) 고쳐 다시 올린 파일에도 되돌리기가 걸리므로
+        fits = {int(a): {int(v) for v in b.split("|") if v} for a, b in (x.split(":") for x in meta.get("fit_line", "").split(",") if x)}
+        edited = {lv for lv, row in rows.items() if lv in fits and any(int(v) not in fits[lv] for v in row["lines"])}
+        for lv in edited:
+            lines[lv] = max(set(rows[lv]["lines"]), key=rows[lv]["lines"].count)
         for lv, row in rows.items():
             if lv not in lines and row["lines"]:
                 lines[lv] = max(set(row["lines"]), key=row["lines"].count)
@@ -314,7 +343,8 @@ class RulesPart:
                 for p in row["paras"]:
                     pid = p.get("paraPrIDRef")
                     pp = self.styles.para.get(pid, {})
-                    if lv in lines and pp.get("line_type", "PERCENT") == "PERCENT" and pp.get("line") != lines[lv]:
+                    if (lv in lines and lv not in edited and pp.get("line_type", "PERCENT") == "PERCENT"
+                            and pp.get("line") != lines[lv]):
                         p.set("paraPrIDRef", self.hedit.para_line(pid, lines[lv]))
                         n_line += 1
                     pos, head, hit = 0, head_length(para_text(p)), False
@@ -330,9 +360,26 @@ class RulesPart:
                     n_sp += hit
             if n_line or n_sp:
                 self.warn(f"이 스킬이 만든 문서를 견본으로 써서 앞 판이 맞춘 값을 되돌린 뒤 다시 맞췄습니다(줄 간격 {n_line}문단·내용 자간 {n_sp}문단) — "
-                          "한글에서 손으로 바꾼 값도 함께 되돌아갑니다.")
+                          "한글에서 손으로 바꾼 내용 자간도 함께 되돌아갑니다(손으로 바꾼 줄 간격은 그대로 둠).")
+            if edited:
+                self.warn("견본에서 손으로 바꾼 줄 간격(" + ", ".join(f"{'□○-*'[lv - 1]} {lines[lv]}%" for lv in sorted(edited) if 1 <= lv <= 4)
+                          + ")은 그대로 새 기준으로 삼았습니다.")
         return {"base_line": ",".join(f"{k}:{lines[k]}" for k in sorted(lines)),
                 "base_sp": ",".join(f"{k}:{sps[k]}" for k in sorted(sps))}
+
+    def fit_line_mark(self):
+        """맞춤을 끝낸 문서에 수준(□ ○ - *)마다 남은 줄 간격 값들 — '1:150|170,2:140'. 이 문서를 다시 견본으로 쓸 때 그 밖의 값이
+        있으면 사람이 바꾼 것으로 본다(made_reset)."""
+        seen = {}
+        for p in self.sec:
+            if p.tag != T("hp:p") or para_tables(p):
+                continue
+            text = para_text(p)
+            lv = marker_level(text)
+            pp = self.styles.para.get(p.get("paraPrIDRef"), {})
+            if lv and text.strip() and pp.get("line_type", "PERCENT") == "PERCENT":
+                seen.setdefault(lv, set()).add(int(pp.get("line", 160)))
+        return ",".join(f"{lv}:{'|'.join(map(str, sorted(seen[lv])))}" for lv in sorted(seen))
 
     def small_squares(self):
         """□ 큰 항목 기호만 뒤 글자보다 SQUARE_DOWN(2pt) 작게(사용자 2026-11-04 '□도 줄이기' — ■ 표 제목 기호를 2pt 줄인 것과
@@ -377,7 +424,7 @@ class RulesPart:
         """날짜·부서 줄 아래를 DATE_NEXT(1pt) 띄운다(사용자 2026-11-05 '날짜 부서 이름 들어가는 줄 아래 여백을 조금만 더') —
         첫 날짜 줄이고 바로 아래가 표(요약 상자)일 때만. 이미 그만큼 띄웠으면 그대로. 바꿨으면 1."""
         ps = [x for x in self.sec if x.tag == T("hp:p")]
-        for k, p in enumerate(ps[:6]):
+        for k, p in enumerate(ps[:12]):  # 표지(문단 5개)가 앞에 있어도(옛 판은 6문단까지만 봐 표지 문서는 빠졌음, 2026-11-11)
             if para_tables(p) or not DATE_LINE_RE.match(para_text(p)):
                 continue
             if k + 1 >= len(ps) or not para_tables(ps[k + 1]):
@@ -483,7 +530,8 @@ class RulesPart:
         """바로 위 제목이 곧 표 제목인 곳(_head_titled — 참고 자체가 표 하나, □ 제목 바로 아래 표)의 ■ 제목 줄을 뺀다(사용자 2026-11-05).
         remove=False(검사만)이면 빼지 않고 '고쳐야 함'으로 알린다. 뺀(또는 찾은) 수."""
         hits = []
-        for p in self._head_titled(out):
+        titled = self._head_titled(out)
+        for p in (q for q in out if q in titled):  # 문서 차례대로 — 모음(set) 차례로 돌면 같은 계획도 돌릴 때마다 알림의 이름 순서가 달라짐
             j = out.index(p) - 1
             while j >= 0 and not para_tables(out[j]) and UNIT_RE.match(para_text(out[j])):
                 j -= 1
@@ -1287,11 +1335,11 @@ class RulesPart:
             while stop - 1 > basis and "text" not in blocks[stop - 1] and level.get(stop - 1) == 0:
                 stop -= 1  # 묶음 끝의 빈 줄은 두고 감
             group, dropped = self._basis_square(blocks, first, basis, stop, level)
-            moved.append(f"□ ‘{blocks[h]['text'][:10]}’ 안의 근거 ○를 □ 근거법령으로 떼어"
+            moved.append(f"□ ‘{self._bare(blocks[h]['text'])[:10]}’ 안의 근거 ○를 □ 근거법령으로 떼어"
                          + (f" — 법령 아닌 요약 ‘{dropped}’은 빼고 아래 법령 줄을 ○로" if dropped else ""))
             blocks = blocks[:first] + group + blocks[first:basis] + blocks[stop:]
             return self._basis_report(blocks, moved, missing)
-        missing.append(f"본문 첫 □ ‘{blocks[first]['text'][:10]}’")
+        missing.append(f"본문 첫 □ ‘{self._bare(blocks[first]['text'])[:10]}’")
         return self._basis_report(blocks, moved, missing)
 
     def _basis_square(self, blocks, first, basis, stop, level):

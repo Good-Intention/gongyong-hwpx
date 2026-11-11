@@ -189,6 +189,7 @@ PAREN_SPLIT = 6              # 낱말에 붙은 괄호 안 글자가 이만큼 �
 INFO_PAREN_RE = re.compile(r"\((?!안\)|가칭\))[^()]+\)")  # 머리 칸의 '(배점)'처럼 정보를 더하는 괄호('(안)'은 아님)
 CAPTION_PAD = 4 * HWPUNIT_PER_MM  # 제목 걸친 상자의 제목 양옆(위 선이 끊긴 자리) 여유
 NOTE_GAP = PROFILE["table_note_gap_mm"] * HWPUNIT_PER_MM  # 표 바로 뒤 ※와 표 사이(표 바깥 여백 아래) — 너무 붙는다는 사용자 의견(2026-11-01)
+INNER_NOTE_GAP = 425  # 칸 안 표와 바로 밑 ※ 사이(1.5mm — 표 문단 줄 간격 여분까지 쳐서, 사용자 2026-11-11)
 MONEY_PAD = PROFILE["money_pad_mm"] * HWPUNIT_PER_MM  # 금액 칸은 오른쪽 정렬하되 오른쪽에 약간 띄움(사용자 원칙 2026-11-01)
 # 참고 쪽은 가급적 한 장에 꽉 채우고, 표가 작으면 두 개를 한 장에(사용자 원칙 2026-11-01)
 REF_RE = re.compile(r"^\s*(참\s*고|붙\s*임|별\s*첨|첨\s*부)")

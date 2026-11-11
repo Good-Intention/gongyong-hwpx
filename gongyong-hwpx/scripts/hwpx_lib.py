@@ -167,9 +167,18 @@ def strip_inner_ns(xml_bytes):
     """맨 위 요소에 이미 있는 이름공간 선언이 안쪽 요소에 또 붙으면 지운다(복사한 요소에 생김)."""
     head_end = xml_bytes.find(b">")
     head, body = xml_bytes[: head_end + 1], xml_bytes[head_end + 1 :]
-    for m in re.finditer(rb' xmlns:(\w+)="([^"]*)"', head):
-        body = body.replace(b" xmlns:%s=\"%s\"" % (m.group(1), m.group(2)), b"")
-    return head + body
+    decls = [b" xmlns:%s=\"%s\"" % (m.group(1), m.group(2)) for m in re.finditer(rb' xmlns:(\w+)="([^"]*)"', head)]
+    if not any(d in body for d in decls):
+        return xml_bytes
+
+    def clean(m):
+        tag = m.group(0)
+        for d in decls:
+            tag = tag.replace(d, b"")
+        return tag
+
+    # 요소 머리(<…>) 안에서만 지운다 — 통째로 바꾸면 본문 글에 같은 글자열이 있을 때 그 글까지 지워짐(검토 2026-11-12)
+    return head + re.sub(rb"<[^<>]* xmlns:[^<>]*>", clean, body)
 
 
 # ---------------------------------------------------------------- 서식 목록(header.xml)
@@ -905,6 +914,24 @@ def _tight_number(mark, nxt):
     if "가" <= core[0] <= "힣":
         return True  # 가나다 글자인지는 split_marker가 먼저 가림
     return not nxt.isascii()  # 알파벳 기호는 뒤가 한글일 때만
+
+
+# 조문 상자(법령 조문 발췌) 번호 줄의 들임 — 항(①)은 왼쪽 끝, 호(1.)는 두 칸(빈칸 두 개 = 글자 하나 폭), 목(가.)은 네 칸, 그 아래(1)·(1))는 여섯 칸
+# (사용자 2026-11-11 '제2항부터는(거의 동그라미 숫자) 좌측에 딱 붙어서 시작할텐데, 제1호 부터는(거의 1. 2. 3.) 두칸 정도 띄어서 … 법률표시니까').
+QUOTE_LEVEL_RE = ((re.compile(r"[①-⑳㉑-㉟㊱-㊿]"), 0), (re.compile(r"\d{1,2}\.(?!\d)"), 1), (re.compile(r"[가-하]\."), 2),
+                  (re.compile(r"(?:\(\d{1,2}\)|\d{1,2}\))"), 3))
+
+
+def quote_indent(text):
+    """조문 상자 글 한 줄의 들임(글자 수) — 번호 줄이 아니면 None('제○조(…)'·이어진 글은 그대로)."""
+    head, mark, _ = split_marker(text.lstrip(" 	⎵⍽　"))
+    if not mark:
+        return None
+    core = mark.strip()
+    for rx, em in QUOTE_LEVEL_RE:
+        if rx.fullmatch(core):
+            return em
+    return None
 
 
 def split_marker(text):

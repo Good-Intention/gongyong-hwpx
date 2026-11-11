@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """줄 맞춤(Fitter의 일부): 자간으로 끝 줄 당기기·빈칸 큰 줄 넓히기·화살표·연결어·끝 줄 내리기."""
 from fit_base import *  # noqa: F401,F403 — 상수·공통 함수(HWPUNIT_PER_MM, T, re, copy …)
-from hwpx_lib import edit_run_text, plain_run  # noqa: E402
+from hwpx_lib import edit_run_text, plain_run, quote_indent  # noqa: E402
 from layout import FW_EM  # noqa: E402
 
 
@@ -73,10 +73,31 @@ class LineFit:
     def _quote_hang(self, p):
         """조문 상자의 항·호·목 번호 줄(①·1.·가. 등)은 왼쪽 끝에서 시작하고 둘째 줄을 기호 뒤 첫 글자 밑에(사용자 2026-11-10 견본 두 벌을 보고
         '1번 내어쓰기'). 기호 뒤 보통 빈칸은 고정폭으로(양쪽 정렬에서 늘어나면 첫 줄 글 시작이 밀림 — 정돈과 같은 바꾸기). '제○조(…)' 줄은 그대로.
-        내어쓰기를 바꿨으면 True."""
+        들임은 단계마다(사용자 2026-11-11): 항(①)은 왼쪽 끝, 호(1.)는 두 칸(글자 하나 폭), 목(가.)은 네 칸 — 계획의 앞 빈칸은 빼고 여백으로.
+        내어쓰기나 들임을 바꿨으면 True."""
+        lvl = quote_indent(para_text(p))
+        moved = False
+        if lvl is not None:
+            for r in para_runs(p):  # 앞 빈칸은 여백이 맡음(그대로 두면 끝에 one_space가 여백에 더해 두 번 들어감)
+                t = run_text(r)
+                if r.find(T("hp:t")) is None or not plain_run(r):
+                    if t.strip():
+                        break
+                    continue
+                lead = len(t) - len(t.lstrip(" 	⎵⍽　"))
+                if lead:
+                    edit_run_text(r, t[lead:], self.b.tab_proto)
+                if t[lead:]:
+                    break
+            size = next((self.st.char.get(r.get("charPrIDRef"), {}).get("size", 10) for r in para_runs(p) if run_text(r).strip()), 10)
+            want = int(round(lvl * size * 100))
+            pp = self.st.para.get(p.get("paraPrIDRef"), {})
+            if abs(pp.get("left", 0) - want) > 1:
+                p.set("paraPrIDRef", self.b.hedit.para_margin(p.get("paraPrIDRef"), "left", want))
+                moved = True
         k = len(split_marker(para_text(p))[0])
         if not k:
-            return False
+            return moved
         pos = 0
         for r in para_runs(p):
             t = run_text(r)
@@ -95,9 +116,8 @@ class LineFit:
         hang = sum(c[1] for c in self.lay.chars(p)[:k])
         pp = self.st.para.get(p.get("paraPrIDRef"), {})
         if abs(-pp.get("intent", 0) - hang) <= 1:
-            return False
-        # 왼쪽 여백은 그대로 — 계획에서 앞 빈칸으로 들여 쓴 호 줄('  1. …')은 만들기 끝에 그 빈칸이 여백으로 옮겨짐(one_space).
-        # 표 칸 글머리표 규칙의 1.5mm 띄움은 조문 상자에 걸지 않으므로(_bullet_cells) 견본 여백(0)에서 시작
+            return moved
+        # 표 칸 글머리표 규칙의 1.5mm 띄움은 조문 상자에 걸지 않으므로(_bullet_cells) 위 단계별 들임에서 시작
         p.set("paraPrIDRef", self.b.hedit.para_hang(p.get("paraPrIDRef"), hang))
         return True
 
@@ -260,7 +280,9 @@ class LineFit:
             if any(used / avail < LOOSE and "\n" not in (chs[e - 1][0], chs[e][0] if e < len(chs) else "")
                    for _, e, used, avail in lines[:-1]):
                 text = para_text(p)
-                loose.append(text[head_length(text):].replace("⎵", " ").strip()[:14])
+                # 상자·표 칸 안 문단이면 밝힌다 — 같은 글이 본문에도 있으면 어느 쪽인지 알 수 없었음(시험 2026-11-12: 표지 개요 상자의 줄)
+                inside = "(상자·표 칸 안) " if any(a.tag == T("hp:tc") for a in p.iterancestors()) else ""
+                loose.append(inside + text[head_length(text):].replace("⎵", " ").strip()[:14])
         if loose:
             self.notes.append(fix_note(f"그래도 빈칸이 크게 벌어지는 줄이 남은 문단 {len(loose)}개 — 긴 낱말이 다음 줄로 넘어감. "
                               "낱말을 줄이거나 순서를 바꾸거나 두 줄로 나누면 좋아집니다: "

@@ -209,6 +209,9 @@ class Inspector:
         f = Fitter(self.b)
         f.lay.move_whole = False  # 원본 쪽 수도 한글이 하는 대로
         pages = f.report()  # 바꾸기 전 어림(원본 쪽 수)
+        if len(self.b.sec_names) > 1:  # 글·짜임 검사와 위 쪽 수는 첫 구역만 — 말없이 넘어가면 둘째 구역의 문제를 '없음'으로 읽음(검토 2026-11-12)
+            self.info.append(f"구역이 {len(self.b.sec_names)}개인 문서입니다 — 위 쪽 수와 '고쳐야 함'(글·짜임)은 첫 구역만 본 것이고, "
+                             "'정돈이 고칠 것'은 모든 구역을 봅니다.")
         self.fonts()
         self.basis()
         self.title_and_summary()
@@ -219,10 +222,12 @@ class Inspector:
                 self.fix.append(whole)
         self.dry_fit(tables)
         self.tidy_preview()
-        if self.omit:  # 만들 때(또는 --omit) 일부러 뺀다고 한 요소의 지적은 알림으로
-            moved = [w for w in self.fix if getattr(w, "kind", None) in self.omit]
+        # 만들 때(또는 --omit) 일부러 뺀다고 한 요소의 지적은 알림으로 — 근거법령 검사를 끈 문서(--no-basis·문서 종류)의 근거법령 지적도
+        off = self.omit | ({"basis"} if self._basis_skip() else set())
+        if off:
+            moved = [w for w in self.fix if getattr(w, "kind", None) in off]
             self.fix = [w for w in self.fix if w not in moved]
-            self.info += [f"(일부러 뺌 — omit) {w}" for w in moved]
+            self.info += [f"(일부러 뺌 — omit) {w}" if getattr(w, "kind", None) in self.omit else f"(근거법령 검사를 끔) {w}" for w in moved]
         errors, notes, _ = check(self.path)
         return pages, errors, notes
 

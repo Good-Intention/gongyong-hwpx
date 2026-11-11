@@ -56,7 +56,6 @@ YEAR_MARK_PREV = {"(": -50, "[": -50, "~": -30}
 # (왼쪽이 빔), 」는 왼쪽(오른쪽이 빔), ·ㆍ는 가운데(양쪽이 빔). 표시 자리를 잰 글꼴만 좁힌다.
 TIGHT_FONTS = {"휴먼명조"}
 NL = "\n"
-FLOW_BOX_MIN_MM = 15  # 도표 상자가 이보다 좁아질 만큼 단계가 많으면 만들지 않음(40단계에 엉뚱한 칸 수 오류가 나던 것 — 평가 2026-11-09)
 IMAGE_MAX_PX = 1200       # 표 칸 배경 그림: 긴 변을 이 화소까지 줄임(인쇄 A4 칸에 충분, 용량 줄이기 — 사용자 원칙 2026-11-01)
 IMAGE_JPEG_QUALITY = 82
 
@@ -110,7 +109,7 @@ MID_DOTS = "·ㆍ"
 # — 계획의 "doc_type"이 이 꼴이면 근거법령 검사(맨 앞으로 옮기기·'근거법령이 없습니다')를 건너뛴다(사용자 2026-11-07 '충돌이 있는
 # 근거법령부분은 특정 보고에서는 빼도록 조정합시다'). 검사만(review)은 만든 문서에 남긴 표시나 제목 상자 글로도 알아본다.
 BASIS_EXEMPT_RE = re.compile(r"회의\s*자료|보도\s*자료|보도\s*(관련\s*)?대응|언론|답변서?|주간\s*(업무)?\s*보고|사업\s*설명서")
-SKILL_VERSION = "2.12"  # 만든 문서에 남기는 판(meta made=…) — 판을 올릴 때 README '지금 판'과 함께 바꿈
+SKILL_VERSION = "2.13"  # 만든 문서에 남기는 판(meta made=…) — 판을 올릴 때 README '지금 판'과 함께 바꿈
 # 계획 "omit": 사용자가 일부러 뺀 요소 — 그 요소의 '고쳐야 함'을 알림으로 낮춘다(평가 2026-11-08 '사용자가 일부러 뺀 것을
 # 선언할 길이 없다 — 날짜 줄·요약 상자를 빼라고 해도 끝 번호 3'). 키 → 보이는 이름. 알림이 키를 kind로 든다(fix_note)
 OMIT_KEYS = {"date": "날짜·부서 줄", "summary": "요약 상자", "basis": "근거법령", "table_title": "■ 표 제목"}
@@ -185,13 +184,16 @@ def print_citations(texts):
     found, blanks = law_citations(texts)
     if not found and not blanks:
         return
-    print(f"## 법령 인용 {len(found)}곳(전하기 전에 법령 검색 도구로 조문이 있는지·뜻이 맞는지 확인 — 도구가 없으면 확인하지 못했다고 전할 것)")
+    if found:
+        print(f"## 법령 인용 {len(found)}곳(전하기 전에 법령 검색 도구로 조문이 있는지·뜻이 맞는지 확인 — 도구가 없으면 확인하지 못했다고 전할 것)")
+    else:  # 조 번호를 비운 법령만 있을 때 '인용 0곳'이라고 하면 법령이 없는 것으로 읽힘(시험 2026-11-12)
+        print("## 법령 인용(조 번호를 비운 것만 있음)")
     for c in found[:40]:
         print(" - " + c)
     if len(found) > 40:
         print(f" - … 그 밖 {len(found) - 40}곳")
     if blanks:
-        print(f" - 번호를 아직 안 채운 ‘제○조’ {blanks}곳 — 확인한 조문으로 채우거나 사용자에게 물을 것")
+        print(f" - 번호를 아직 안 채운 ‘제○조’ {blanks}곳 — 확인한 조문으로 채우거나, 채울 곳으로 사용자에게 알릴 것")
 
 
 def basis_exempt(doc_type):
@@ -199,30 +201,58 @@ def basis_exempt(doc_type):
     return bool(doc_type) and bool(BASIS_EXEMPT_RE.search(str(doc_type)))
 
 
+# 문서 정보 '기타' 칸(description)에 남기는 표시 줄 — 'gongyong-hwpx made=2.13;base_line=…'. 줄 첫머리에서만 알아본다:
+# 줄 가운데 같은 글자가 든 사람 메모('승인 메모: gongyong-hwpx made=2.12 사용 문서')를 표시로 읽거나 지우지 않게(검토 2026-11-12).
+# 한글 2024는 이 칸의 줄 바꿈을 그대로 둔다(실측)
+DOC_NOTE_RE = re.compile(r"^[ \t]*gongyong-hwpx[ :]+(made=[^\r\n]*)$", re.M)
+NO_NOTE = "없음"  # 기준값 doc_note가 이 값이면 문서 정보에는 남기지 않음(숨은 표시만)
+
+
+def _parse_meta(text):
+    return dict(kv.split("=", 1) for kv in text.strip().split(";") if "=" in kv)
+
+
 def read_doc_meta(pkg):
-    """만든 문서에 남긴 표시 {'doc_type': …, 'basis': 'off'} — 없으면 {}."""
+    """만든 문서에 남긴 표시 {'made': '2.13', 'doc_type': …, 'basis': 'off'} — 없으면 {}. 숨은 표시(opf:meta gongyong-hwpx)가 먼저,
+    없으면 문서 정보 '기타' 칸의 표시 줄 — 한글은 저장할 때 숨은 표시를 버리고 문서 정보 칸만 남긴다(한글 2024 확인 2026-11-12:
+    만든 문서를 한글에서 저장하면 표시가 사라져 정돈이 만든 표의 줄 높이·칸 여백을 다시 건드렸음)."""
     if "Contents/content.hpf" not in pkg.data:
         return {}
     hpf = pkg.xml("Contents/content.hpf")
+    note = None
     for m in hpf.iter("{%s}meta" % OPF_NS):
         if m.get("name") == DOC_META and m.text:
-            return dict(kv.split("=", 1) for kv in m.text.split(";") if "=" in kv)
-    return {}
+            return _parse_meta(m.text)
+        if m.get("name") == "description" and m.text:
+            note = DOC_NOTE_RE.search(m.text)
+    return _parse_meta(note.group(1)) if note else {}
 
 
 def write_doc_meta(pkg, info):
-    """만든 문서 content.hpf에 표시를 남긴다(한글 문서 정보 창에는 보이지 않는 이름) — 검사만이 같은 판단을 하게."""
+    """만든 문서 content.hpf에 표시를 남긴다 — 정돈·검사만·다시 쓰기가 같은 판단을 하게. 두 곳: 숨은 표시(한글 문서 정보 창에 안 보이는
+    이름 — 한글이 저장하면 사라짐)와 문서 정보 '기타' 칸의 한 줄(한글이 저장해도 남음, 기준값 doc_note가 '없음'이면 남기지 않음).
+    '기타' 칸에 사람이 적은 글은 그대로 두고 표시 줄만 바꾼다."""
     if "Contents/content.hpf" not in pkg.data or not info:
         return
     hpf = pkg.xml("Contents/content.hpf")
     meta = hpf.find(".//{%s}metadata" % OPF_NS)
     if meta is None:
         return
-    for m in list(meta.iter("{%s}meta" % OPF_NS)):
+    tag = "{%s}meta" % OPF_NS
+    for m in list(meta.iter(tag)):
         if m.get("name") == DOC_META:
             meta.remove(m)
-    el = etree.SubElement(meta, "{%s}meta" % OPF_NS, name=DOC_META, content="text")
-    el.text = ";".join(f"{k}={v}" for k, v in info.items())
+    text = ";".join(f"{k}={v}" for k, v in info.items())
+    desc = next((m for m in meta.iter(tag) if m.get("name") == "description"), None)
+    keep = [ln for ln in ((desc.text or "") if desc is not None else "").splitlines() if not DOC_NOTE_RE.match(ln)]
+    if PROFILE.get("doc_note") != NO_NOTE:
+        if desc is None:
+            desc = etree.SubElement(meta, tag, name="description", content="text")
+        keep.append(f"{DOC_META} {text}")
+    if desc is not None:
+        desc.text = "\n".join(keep) or None
+    el = etree.SubElement(meta, tag, name=DOC_META, content="text")
+    el.text = text
 NOTE_STAR_PT = PROFILE["note_smaller_pt"]        # * 풀이는 설명하는 글보다 이만큼(pt) 작게(사용자 원칙 2026-11-02)
 SQUARE_DOWN = PROFILE["square_smaller_pt"]         # □ 큰 항목 기호만 뒤 글자보다 이만큼(pt) 작게(사용자 2026-11-04 '□도 줄이기')
 NOTE_REF_PT = PROFILE["note_smaller_pt"]         # 본문 ※ 참고도 2pt 작게(사용자 원칙 2026-11-02 v1.1 — 표 밑 ※는 표 글자보다 1pt, fit)
@@ -233,7 +263,10 @@ FLOW_TITLE_PT = 12  # 도표 위 제목(예: ○○○ 신청절차): 굵게
 # 도표 상자 모양(디자인 검토 권고 2026-11-01 — 정사각형 대신 가로로 긴 상자, 쪽의 가로 띠 리듬에 맞춤)
 FLOW_BOX_H_MM = 14  # 상자 높이: 글 1~2줄(제목 상자 높이와 같음), 한 줄 늘 때마다 5mm
 FLOW_BOX_MAX_MM = 42  # 상자 너비 상한(2~3칸 도표가 늘어져 보이지 않게, 이때는 가운데)
-FLOW_BOX_MIN_MM = 26  # 한 줄 상자 너비 하한 — 이보다 좁으면 두 줄로
+# 도표 상자가 이보다 좁아질 만큼 단계가 많으면 만들지 않음(40단계에 엉뚱한 칸 수 오류가 나던 것 — 평가 2026-11-09).
+# 같은 이름이 아래에서 26(옛 '이보다 좁으면 두 줄로' — 줄 수를 단계 수로 정하면서 안 쓰게 된 값)으로 다시 정해져 15가 죽어 있었고,
+# 그래서 본문 폭 160mm 견본에서 5단계 도표(상자 24mm)가 '너무 좁습니다'로 멈췄다(검토 2026-11-12) — 15 하나로.
+FLOW_BOX_MIN_MM = 15
 FLOW_GAP_MM = 10  # 상자 사이 화살표 칸 폭
 FLOW_ROW_GAP_MM = 5  # 두 줄 도표의 줄 사이(둘째 줄도 왼쪽 → 오른쪽, 아래 화살표 없음)
 FLOW_PAD_MM = 2  # 상자 안 좌우 여백

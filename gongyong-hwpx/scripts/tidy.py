@@ -32,10 +32,10 @@ from collections import Counter
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from style_profile import P as PROFILE  # noqa: E402 — 기준값(assets/profile.json)
-from hwpx_lib import (COMPOSE_CHAR, HWPUNIT_PER_MM, INVISIBLE_RE, KEYCAP_RE, T, HeaderEdit, Package, Styles, cell_paras, clean_chars, drop_linesegs, etree, insert_marker_gap,  # noqa: E402
+from hwpx_lib import (UNIT_RE, COMPOSE_CHAR, HWPUNIT_PER_MM, INVISIBLE_RE, KEYCAP_RE, T, HeaderEdit, Package, Styles, cell_paras, clean_chars, drop_linesegs, etree, insert_marker_gap,  # noqa: E402
                       clear_print_method, edit_run_text, fake_label, head_length, is_blank, is_table_title, label_colon, label_content, marker_level,
                       page_info, para_pics, para_runs, para_tables, para_text, plain_run, run_tabs, run_text, set_run_text,
-                      split_marker, table_grid, text_marks, pct_range, is_num_char, same_path, tight_marker_end)
+                      split_marker, table_grid, text_marks, pct_range, is_num_char, same_path, tight_marker_end, quote_indent)
 from layout import FIT_FLOOR, FW_EM, Layout, Metrics, spacing_after  # noqa: E402
 from spaces import compact_fw, lead_to_margin  # noqa: E402
 from build_base import DATE_LINE_RE, SKILL_VERSION, read_doc_meta  # noqa: E402
@@ -73,6 +73,18 @@ FLAT_SUB_EM = 1.25  # □ 없는 칸에서 ○·번호 줄 아래 - 줄의 자�
 # 작성 모드가 모르는 머리 기호(전임자 문서에 흔함) — 기호 다음에 빈칸이 있어야 머리 기호로 봄
 EXTRA_MARK_RE = re.compile(r"^(?P<lead>[ \t⎵⍽　]*)(?P<mark>[‣▸▹➢➤✓◦])(?P<gap>[ \t⎵⍽　]+)")
 FILL_DROP = 0.10  # 정돈 뒤 가장 빈 쪽의 채움이 이만큼 넘게 줄면 되돌림(쪽 수가 같아도 □ 묶음째 다음 쪽으로 밀려 한 쪽이 빈 일 — 평가 2026-11-09)
+# 표 줄 높이·쪽 끝 줄(사용자 2026-11-11)
+ROW_SPARE = 100  # 칸 글 높이 여유(form_fill.INNER_SPARE와 같음 — 칸 안 표는 칸이 저절로 늘지 않아 모자라면 윗줄이 잘림)
+ROW_FIT_MIN = 850  # 줄 높이 값이 글 높이보다 이만큼(3mm) 넘게 크고
+ROW_FIT_RATIO = 1.5  # 이 배수를 넘으면 글 높이로 줄임(양식이 조금 넉넉히 잡은 줄은 그대로)
+ROW_PAGE_SAFETY = 1000  # 쪽 끝 줄을 늘려 채울 때 남기는 여유(약 3.5mm) — 어림이 조금 틀려도 늘린 줄이 다음 쪽으로 밀리지 않게
+ROW_MOVE_GAP = 0.25  # 줄을 통째로 넘겨 앞 쪽에 남는 빈 곳이 본문 높이의 이 비율 이하면 앞 줄을 늘려 채우고, 넘으면 줄을 나눔(사용자 답 1)
+ROW_GAP_MIN = 300  # 이보다 작은 쪽 끝 빈 곳(약 1mm)은 그대로
+FLOW_ARROWS = {"→", "⇒", "➜"}  # 도표 사이 칸
+CELL_PAD_STEPS = (709, 567, 425, 283)  # 칸 글 위아래 여백(2.5·2·1.5·1mm) — 사용자 2026-11-11 '2~3mm 정도는 여유 … 어쩔 수 없는 경우에도 최소 1mm'
+CELL_PAD_MIN = 283  # 쪽이 늘어도 지키는 최소(1mm)
+INNER_PAD = 283  # 칸 안 표 칸 위아래 여백(1mm) — 사용자 2026-11-11 1.5·2.5mm 비교 그림을 보고 '1mm'
+SETTLE_MAX = 3  # 정돈 결과에 다시 걸어 보는 횟수 상한(두 번 정돈해도 같게)
 SIGN_RE = re.compile(r"\((?:서명|날인|인)(?: ?(?:또는|/) ?(?:서명|날인|인))?\)")  # 서명란 '(서명)'·'(인)' 꼴
 
 
@@ -114,8 +126,11 @@ def flat(text):
 
 class Tidier:
     def __init__(self, path, keep_o=True, gaps=None, blank_mm=None, all_rules=False, gap_cap=None, no_lines=False, no_indent=False,
-                 hang_at=None):
+                 hang_at=None, _round=0):
         self.path = path
+        self._round = _round  # 1 = 정돈 결과에 다시 거는 회차(_settle) — 그 안에서는 다시 걸지 않음
+        self._opts = dict(keep_o=keep_o, gaps=gaps, blank_mm=blank_mm, all_rules=all_rules, gap_cap=gap_cap, no_lines=no_lines,
+                          no_indent=no_indent, hang_at=hang_at)
         # 둘째 줄 기준을 사용자가 밝힘(--hang-at): '기호'(머리 기호 뒤 첫 글자) 또는 '이름표'(이름표·쌍점 뒤, 없으면 기호 뒤).
         # 밝히면 기존 내어쓰기의 0.4글자 허용 없이 그 자리에 정확히, 한 줄 문단에도 같은 값(사용자 2026-11-10)
         self.hang_at = hang_at
@@ -148,6 +163,7 @@ class Tidier:
         # 문단은 요소 자체를 열쇠로(lxml 요소의 id()는 다시 쓰일 수 있어 열쇠로 못 씀 — 첫 시험에서 '글자 바뀜' 오판)
         self.orig_text = {p: para_text(p) for p in self.all_paras()}
         self.orig_marks = {p: text_marks(p) for p in self.all_paras()}
+        self.orig_look = {p: self._look(p) for p in self.all_paras()}  # 보이는 모양(끝에 '바뀐 곳'에서 되돌아온 문단을 뺌)
         self.eol_ok = set()  # 끝 줄 균형으로 빈칸 ↔ 줄 바꿈을 바꾼 문단(글자 비교에서 그 바꿈만 허용)
         self.page_of = self._orig_pages()
         # 제목 걸친 상자(조문 발췌 등) 안 인용 글 — 자간·양쪽 정렬만(quote_fit), 줄 바꿈 넣기·빈칸 당기기·끝 줄 내리기는 걸지 않음(작성 모드와 같게)
@@ -710,6 +726,15 @@ class Tidier:
                     p.set("paraPrIDRef", self.hedit.para_align(pid, "JUSTIFY"))
                     self.mark(p, "조문 상자 글을 양쪽 정렬로(끝선은 자간으로)")
                     self._quote_aligned += 1
+                lvl = quote_indent(text)  # 항(①) 왼쪽 끝·호(1.) 두 칸·목(가.) 네 칸 — 작성 모드 _quote_hang과 같음(사용자 2026-11-11)
+                if lvl is not None:
+                    size = next((self.styles.char.get(r.get("charPrIDRef"), {}).get("size", 10) for r in para_runs(p) if run_text(r).strip()), 10)
+                    want = int(round(lvl * size * 100))
+                    pid = p.get("paraPrIDRef")
+                    if abs(self.styles.para.get(pid, {}).get("left", 0) - want) > 1:
+                        p.set("paraPrIDRef", self.hedit.para_margin(pid, "left", want))
+                        self.mark(p, f"조문 {('항', '호', '목', '목 아래')[lvl]} 줄 들임 {want / HWPUNIT_PER_MM:.1f}mm"
+                                     + ("(왼쪽 끝)" if not lvl else f"({lvl * 2}칸)"))
 
     def quote_fit(self):
         """제목 걸친 상자(조문 발췌 등) 안 인용 글은 양쪽 정렬로 두고 자간만 바꿔 줄마다 끝선까지 고르게 — 작성 모드 fit_quotes와 같은 셈
@@ -1111,8 +1136,16 @@ class Tidier:
         for paras, w, scope in self.blocks():
             if scope == "본문":
                 continue
+            # 칸 안 표 바로 밑 ※·* 설명은 표 왼쪽 끝에서 시작(본문 표 규칙 — 사용자 2026-11-11 '표안의 표에도 본문표 스킬') — 들이지 않음
+            notes = set()
+            for k in range(1, len(paras)):
+                if para_tables(paras[k - 1]):
+                    j = k
+                    while j < len(paras) and para_text(paras[j]).lstrip(" ⎵").startswith(("※", "*")):
+                        notes.add(paras[j])
+                        j += 1
             rows = [(p, self.level(para_text(p))) for p in paras
-                    if not (para_tables(p) or para_pics(p)) and para_text(p).strip()]
+                    if not (para_tables(p) or para_pics(p)) and para_text(p).strip() and p not in notes]
             first = next((k for k, (_, lv) in enumerate(rows) if lv == 1), None)
             if first is None:
                 tops = [p for p, lv in rows if lv == 2 or (lv == 3 and self._is_number(para_text(p)))]
@@ -1151,13 +1184,21 @@ class Tidier:
                     place = 3.5 if has_o and after_num else LEVEL_EM[lv]
                 under.append((p, place))
             os_ = tops
-            if len(os_) < 2:
+            if not os_:  # ○ 하나뿐인 칸도(옛 판: 둘 이상만 — 한 표 안에서 칸마다 ○ 자리가 달랐음, 사용자 2026-11-11 '동그라미 레벨 정리가 일정하지 않은')
                 continue
             base = self._start_x(rows[first][0])
             em = lambda p: (self._para_size(p) or 10) * 100  # noqa: E731
             if min(self._start_x(p) for p in os_) - base >= 0.25 * em(os_[0]):
                 continue  # 작성자가 이미 들여 둠
             moved = self._shift_lines(under, base, w)
+            if moved is None:  # 들이면 줄이 늘 때: 쪽 수가 그대로면 줄이 늘어도 들임(한 표 안에서 ○ 자리를 같게)
+                saved = [(q, q.get("paraPrIDRef")) for q, _ in under]
+                pages0 = self.pages()
+                moved = self._shift_lines(under, base, w, grow=True)
+                if moved is not None and self.pages() > pages0:
+                    for q, qid in saved:
+                        q.set("paraPrIDRef", qid)
+                    moved = None
             if moved is None:
                 stuck += 1
                 continue
@@ -1172,7 +1213,7 @@ class Tidier:
         if stuck:
             self.notes.append(f"표 칸 {stuck}개는 ○ 줄을 들이면 줄이 늘어 그대로 두었습니다.")
 
-    def _shift_lines(self, under, base, w):
+    def _shift_lines(self, under, base, w, grow=False):
         """줄마다 (문단, 글자 수 자리)를 base + 자리로 들인다(왼쪽 여백만). 이미 그 자리거나 더 들인 줄은 그대로. 들여서 줄이 늘면 내용 자간으로
         지키고, 그래도 늘면 모두 되돌리고 None. 옮긴 줄은 [(문단, 옛 여백, 새 여백)]."""
         undo, spacing, moved = [], [], []
@@ -1187,7 +1228,7 @@ class Tidier:
             undo.append((p, pid))
             p.set("paraPrIDRef", self.hedit.para_margin(pid, "left", left + want - cur))
             moved.append((p, left, left + want - cur))
-            if len(self.lay.para_lines(p, w, shrink=SLACK)[1]) > n0:
+            if not grow and len(self.lay.para_lines(p, w, shrink=SLACK)[1]) > n0:
                 got = self._keep_lines(p, w, n0)
                 if got is None:
                     self._undo(spacing)
@@ -1284,6 +1325,460 @@ class Tidier:
                               + (f"(칸 높이는 그대로, {grew}칸만 쪽 수가 늘지 않는 만큼 키움)." if grew else "(칸 높이는 그대로)."))
         if stuck:
             self.notes.append(f"표 칸 {stuck}개는 ○ 위 간격을 넣으면 표 줄이 다음 쪽으로 밀리거나 쪽이 늘어 넣지 않았습니다.")
+
+    # ------------------------------------------------------------ 표 줄 높이·쪽 끝 줄(사용자 2026-11-11)
+    def _skip_tables(self):
+        """줄 높이·쪽 끝 줄 손질에서 빼는 표: 상자(1칸)·제목 걸친 상자·도표(화살표만 든 칸)·칸 바탕 그림이 든 표."""
+        img_fills = {bf.get("id") for bf in self.header.iter(T("hh:borderFill")) if bf.find(".//" + T("hc:imgBrush")) is not None}
+        quotes = {tc for tc, _ in self._quote_cells()}
+        skip = set()
+        for sec in self.secs:
+            for tbl in sec.iter(T("hp:tbl")):
+                grid = table_grid(tbl)
+                if len(grid) <= 1 or any(tc in quotes for *_, tc in grid):
+                    skip.add(tbl)
+                elif any(tc.get("borderFillIDRef") in img_fills for *_, tc in grid):
+                    skip.add(tbl)
+                elif any("".join(para_text(cp) for cp in cell_paras(tc)).strip() in FLOW_ARROWS for *_, tc in grid):
+                    skip.add(tbl)
+        return skip
+
+    def _row_need(self, tc, w, mt):
+        """칸 글이 들어갈 높이 — 양식 칸 채우기(form_fill.set_row_heights)와 같은 셈(칸 안 표는 칸이 저절로 늘지 않아 여유를 둠)."""
+        return sum(self.lay.para_height(cp, w)[0] for cp in cell_paras(tc)) + mt + ROW_SPARE
+
+    def _row_ends_page(self, tbl):
+        """본문 표에서 쪽 끝을 채운 줄(다음 줄이 다음 쪽에서 시작) — 줄이면 쪽 아래만 비므로 줄 높이를 줄이지 않는다
+        (쪽 끝 줄 넘기기가 앞 줄을 늘려 채운 것도 여기에 걸려 두 번째 정돈에서 되돌리지 않음)."""
+        for sec in self.secs:
+            paras = [p for p in sec if p.tag == T("hp:p")]
+            k = next((n for n, p in enumerate(paras) if tbl in para_tables(p)), None)
+            if k is None:
+                continue
+            body_w, body_h = self.box(sec)
+            self.lay.paginate(paras, body_w, body_h)
+            pos = self.lay.row_pos.get(k) or []
+            return {r for r in range(len(pos) - 1) if pos[r + 1][0] > pos[r][2]}
+        return set()
+
+    def row_heights(self):
+        """표 줄 높이를 글자에 맞게(사용자 2026-11-11 '표가 저렇게 공간이 많은 것은 보기 좋지 않습니다. 글자의 크기에 맞게 적당하게'
+        → 답 1: 모든 표, 글이 든 줄만): 줄 높이 값이 글 높이보다 3mm 넘게 크고 1.5배를 넘으면 글 높이(+여유)로 줄인다.
+        빈 줄(결재란 도장 칸·손으로 쓰는 칸)·그림 줄·세로로 합친 칸이 걸친 줄·쪽 끝을 채운 줄은 그대로, 상자·도표 등은 뺀다."""
+        skip = self._skip_tables()
+        rows_done, tables = 0, set()
+        for sec in self.secs:
+            for tbl in list(sec.iter(T("hp:tbl"))):
+                if tbl in skip:
+                    continue
+                grid = table_grid(tbl)
+                cells = {tc: (w, mt) for tc, w, mt in self._cells(tbl)}
+                spanned = {k for r, c, rs, cs, tc in grid if rs > 1 for k in range(r, r + rs)}
+                by_row = {}
+                for r, c, rs, cs, tc in grid:
+                    by_row.setdefault(r, []).append(tc)
+                ends = None
+                for r, tcs in sorted(by_row.items()):
+                    if r in spanned:
+                        continue
+                    texts = [para_text(cp).replace("⎵", "").strip() for tc in tcs for cp in cell_paras(tc)]
+                    if not any(texts) or any(para_pics(cp) for tc in tcs for cp in cell_paras(tc)):
+                        continue
+                    # 손으로 채우는 줄('팀원2 | 빈칸 | 빈칸 …', 넓은 칸이 빈 줄)은 그대로 — 사용자 답 1 '빈 줄은 그대로'
+                    empty = [tc for tc in tcs if not "".join(para_text(cp) for cp in cell_paras(tc)).replace("⎵", "").strip()]
+                    if len(empty) * 2 >= len(tcs) or any(self._wide(tc, cells[tc][0]) for tc in empty):
+                        continue
+                    cur = max(int(tc.find(T("hp:cellSz")).get("height", "0")) for tc in tcs)
+                    need = max(self._row_need(tc, *cells[tc]) for tc in tcs)
+                    if cur - need <= ROW_FIT_MIN or cur <= need * ROW_FIT_RATIO:
+                        continue
+                    if ends is None:
+                        ends = self._row_ends_page(tbl)
+                    if r in ends:
+                        continue
+                    for tc in tcs:
+                        tc.find(T("hp:cellSz")).set("height", str(int(round(need))))
+                    rows_done += 1
+                    tables.add(tbl)
+                    self._mark_row(tbl, r, f"표 줄 높이를 글에 맞춤({cur / HWPUNIT_PER_MM:.1f} → {need / HWPUNIT_PER_MM:.1f}mm)")
+                if tbl in tables:
+                    self._table_height(tbl)
+        if rows_done:
+            self.notes.append(f"표 {len(tables)}개의 줄 {rows_done}개를 글 높이에 맞춰 줄였습니다(빈 곳이 3mm·1.5배 넘던 줄 — "
+                              "빈 줄·그림 줄·합친 칸 줄·쪽 끝을 채운 줄은 그대로).")
+
+    def _pad_now(self, tbl, tc):
+        """칸의 (위 여백, 아래 여백, 왼쪽, 오른쪽)."""
+        inm = tbl.find(T("hp:inMargin"))
+        vals = [int(inm.get(k, d)) if inm is not None else int(d) for k, d in (("top", "141"), ("bottom", "141"), ("left", "510"), ("right", "510"))]
+        cm = tc.find(T("hp:cellMargin"))
+        if tc.get("hasMargin") == "1" and cm is not None:
+            vals = [int(cm.get(k, "0")) for k in ("top", "bottom", "left", "right")]
+        return vals
+
+    def _set_pad(self, tc, top, bottom, left, right):
+        tc.set("hasMargin", "1")
+        cm = tc.find(T("hp:cellMargin"))
+        if cm is None:
+            cm = etree.Element(T("hp:cellMargin"))
+            sz = tc.find(T("hp:cellSz"))
+            (sz.addnext(cm) if sz is not None else tc.append(cm))
+        for k, v in (("left", left), ("right", right), ("top", top), ("bottom", bottom)):
+            cm.set(k, str(int(v)))
+
+    def cell_pads(self):
+        """표 칸 글 위아래 여백(사용자 2026-11-11 '셀의 위아래에 아무 여백도 없으면 안됩니다. 2~3mm 정도는 여유를 주어야 합니다.
+        어쩔 수 없는 경우에도 최소 1mm는'): 글이 칸을 채워 위·아래 선과 글 사이가 2.5mm보다 좁은 넓은 글 칸은 칸 안 위아래 여백을
+        2.5mm로 — 쪽이 늘면 2 → 1.5 → 1mm로 줄이고, 1mm는 쪽이 늘어도 지킨다. 칸 높이가 넉넉해(세로 가운데) 이미 떨어져 있는 칸은 그대로.
+        칸 안 표는 1mm(사용자 2026-11-11 '이런 표안에 표에서 위아래가 딱 붙는 현상도' → 비교 그림 보고 '1mm') — 표 하나는 모든 칸을 같은 여백으로,
+        한글이 칸 안 표 줄 높이를 저절로 늘리지 않아 줄 높이도 함께 늘린다(_inner_pads). 상자·도표·조문 상자는 뺀다."""
+        skip = self._skip_tables()
+        self._inner_pads(skip)
+        want = []
+        for sec in self.secs:
+            for tbl in sec.iter(T("hp:tbl")):
+                if tbl in skip or any(a.tag == T("hp:tc") for a in tbl.iterancestors()):
+                    continue
+                rows = self.lay.table_rows(tbl)
+                for (r, c, rs, cs, tc), (tc2, w, mt) in zip(table_grid(tbl), self._cells(tbl)):
+                    if rs > 1 or not self._wide(tc, w) or not any(para_text(cp).strip() for cp in cell_paras(tc)):
+                        continue
+                    top, bot, left, right = self._pad_now(tbl, tc)
+                    content = self.lay.cell_content(tc, w)
+                    slack = max(0.0, (rows[r] if r < len(rows) else 0) - content - top - bot)
+                    sub = tc.find(T("hp:subList"))
+                    va = sub.get("vertAlign", "CENTER") if sub is not None else "CENTER"
+                    room = min(top + (slack / 2 if va == "CENTER" else slack if va == "BOTTOM" else 0),
+                               bot + (slack / 2 if va == "CENTER" else slack if va == "TOP" else 0))
+                    if room < CELL_PAD_STEPS[0] - 1:
+                        want.append((tbl, tc, top, bot, left, right))
+        if not want:
+            return
+        base = self.pages()
+        chosen = None
+        for m in CELL_PAD_STEPS:
+            for tbl, tc, top, bot, left, right in want:
+                self._set_pad(tc, max(top, m), max(bot, m), left, right)
+            self.lay.row_cache = None
+            if self.pages() <= base or m == CELL_PAD_MIN:
+                chosen = m
+                break
+        n = 0
+        for tbl, tc, top, bot, left, right in want:
+            if max(top, chosen) > top or max(bot, chosen) > bot:
+                n += 1
+                words = [cp for cp in cell_paras(tc) if para_text(cp).strip()]
+                if words:
+                    self.mark(words[0], f"칸 글 위아래 여백 {chosen / HWPUNIT_PER_MM:.1f}mm")
+        self._end_cells = None
+        if n:
+            self.notes.append(f"글이 칸 위아래 선에 붙던 칸 {n}개의 칸 안 위아래 여백을 {chosen / HWPUNIT_PER_MM:.1f}mm로 했습니다"
+                              + ("(2.5mm는 쪽이 늘어 줄임 — 최소 1mm는 지킴)." if chosen < CELL_PAD_STEPS[0] else "."))
+
+    def _inner_pads(self, skip):
+        """칸 안 표의 칸 위아래 여백: 글과 칸 선 사이가 1mm보다 좁은 칸이 있는 표는 표의 모든 칸을 같은 여백 1mm(INNER_PAD — 사용자가 비교
+        그림을 보고 고름)로, 줄마다 높이를 글 + 여백(+0.35mm)으로 늘림(칸 안 표는 칸이 저절로 늘지 않아 모자라면 윗줄이 잘림)."""
+        tables = []
+        for sec in self.secs:
+            for tbl in sec.iter(T("hp:tbl")):
+                if tbl in skip or not any(a.tag == T("hp:tc") for a in tbl.iterancestors()):
+                    continue
+                grid = table_grid(tbl)
+                if any(rs > 1 for r, c, rs, cs, tc in grid):
+                    continue
+                rows = self.lay.table_rows(tbl)
+                orig = {}
+                need_pad = False
+                for (r, c, rs, cs, tc), (tc2, w, mt) in zip(grid, self._cells(tbl)):
+                    top, bot, left, right = self._pad_now(tbl, tc)
+                    orig[tc] = (r, w, top, bot, left, right, int(tc.find(T("hp:cellSz")).get("height", "0")))
+                    if not any(para_text(cp).strip() for cp in cell_paras(tc)):
+                        continue
+                    content = self.lay.cell_content(tc, w)
+                    slack = max(0.0, (rows[r] if r < len(rows) else 0) - content - top - bot)
+                    sub = tc.find(T("hp:subList"))
+                    va = sub.get("vertAlign", "CENTER") if sub is not None else "CENTER"
+                    room = min(top + (slack / 2 if va == "CENTER" else slack if va == "BOTTOM" else 0),
+                               bot + (slack / 2 if va == "CENTER" else slack if va == "TOP" else 0))
+                    need_pad |= room < INNER_PAD - 1
+                if need_pad:
+                    tables.append((tbl, orig))
+        if not tables:
+            return
+        base = self.pages()
+        chosen = INNER_PAD
+        for m in (INNER_PAD,):
+            for tbl, orig in tables:
+                rows = {}
+                for tc, (r, w, top, bot, left, right, h) in orig.items():
+                    t2, b2 = max(top, m), max(bot, m)
+                    self._set_pad(tc, t2, b2, left, right)
+                    need = sum(self.lay.para_height(cp, w)[0] for cp in cell_paras(tc)) + t2 + b2 + ROW_SPARE
+                    rows[r] = max(rows.get(r, 0), need)
+                for tc, (r, w, top, bot, left, right, h) in orig.items():
+                    tc.find(T("hp:cellSz")).set("height", str(int(round(rows[r]))))
+                self._table_height(tbl)
+            self.lay.row_cache = None
+            if self.pages() <= base or m == INNER_PAD:
+                chosen = m
+                break
+        for tbl, orig in tables:
+            words = [cp for tc in orig for cp in cell_paras(tc) if para_text(cp).strip()]
+            if words:
+                self.mark(words[0], f"칸 안 표 칸 위아래 여백 {chosen / HWPUNIT_PER_MM:.1f}mm(줄 높이도 함께)")
+        self.notes.append(f"칸 안 표 {len(tables)}개의 칸 위아래 여백을 {chosen / HWPUNIT_PER_MM:.1f}mm로, 줄 높이를 글 + 여백으로 했습니다(글이 칸 선에 붙던 표).")
+
+    def _table_height(self, tbl):
+        """표 전체 높이 값을 줄 높이 합으로(줄 높이를 바꾼 뒤)."""
+        rows = {}
+        for r, c, rs, cs, tc in table_grid(tbl):
+            if rs == 1:
+                rows[r] = max(rows.get(r, 0), int(tc.find(T("hp:cellSz")).get("height", "0")))
+        sz = tbl.find(T("hp:sz"))
+        if sz is not None and rows:
+            sz.set("height", str(sum(rows.values())))
+
+    def _report_table(self, tbl):
+        """표 안 보고서 표인가: 칸 안에서 쪽을 나누고(pageBreak=CELL, 글자처럼 취급 안 함) 2칸 넘는 줄에 넓은 보고글 칸이 있음."""
+        pos = tbl.find(T("hp:pos"))
+        if tbl.get("pageBreak") != "CELL" or pos is None or pos.get("treatAsChar") == "1":
+            return False
+        return any(self._wide(tc, w) and len(cell_paras(tc)) >= 2 for tc, w, _ in self._cells(tbl))
+
+    def _split_row(self, tbl, r, keep):
+        """줄 r을 둘로: 보고글 칸의 앞 keep문단은 그 줄에, 나머지는 바로 아래 새 줄로. 다른 칸(구분 제목 등)은 두 줄 모두에 같게
+        (사용자 2026-11-11 '어쩔 수 없이 두쪽에 걸쳐야 하는 경우엔 두곳 모두에 구분 열의 제목'). 새 줄 칸 문단(복사본)은 원래 글과 같다고 봄."""
+        grid = table_grid(tbl)
+        tcs = [tc for rr, c, rs, cs, tc in grid if rr == r]
+        tr = tcs[0].getparent()
+        new = copy.deepcopy(tr)
+        content = max(tcs, key=lambda tc: len(cell_paras(tc)))
+        idx = tcs.index(content)
+        ntcs = [x for x in new if x.tag == T("hp:tc")]
+        moved = cell_paras(content)[keep:]
+        sub_old = content.find(T("hp:subList"))
+        sub_new = ntcs[idx].find(T("hp:subList"))
+        for cp in cell_paras(ntcs[idx]):
+            sub_new.remove(cp)
+        for cp in moved:  # 원래 문단을 옮김(복사하지 않음 — 정돈 전후 글 대조가 그대로)
+            sub_old.remove(cp)
+            sub_new.append(cp)
+        for k, ntc in enumerate(ntcs):
+            if k != idx:
+                for op, cp in zip(cell_paras(tcs[k]), cell_paras(ntc)):
+                    self.orig_text[cp] = self.orig_text.get(op, para_text(op))
+                    self.orig_marks[cp] = self.orig_marks.get(op, text_marks(op))
+        for *_, tc in grid:
+            a = tc.find(T("hp:cellAddr"))
+            if int(a.get("rowAddr", "0")) > r:
+                a.set("rowAddr", str(int(a.get("rowAddr")) + 1))
+        for ntc in ntcs:
+            ntc.find(T("hp:cellAddr")).set("rowAddr", str(r + 1))
+        tr.addnext(new)
+        tbl.set("rowCnt", str(int(tbl.get("rowCnt", "1")) + 1))
+        return tcs, ntcs
+
+    def row_pages(self):
+        """표 안 보고서(칸 안에서 쪽을 나누는 표)의 쪽 끝 줄(사용자 2026-11-11 '셀을 다음페이지로 넘기죠 … 어쩔 수 없이 두쪽에 걸쳐야 하는
+        경우엔 두곳 모두에 구분 열의 제목 … 앞쪽의 셀 높이를 좀 높이면' → 답 1). 표를 '줄 사이에서만 나눔'(pageBreak=TABLE — 한글이 줄을
+        가르지 않고 들어가지 않는 줄을 통째로 다음 쪽으로)으로 바꾸고, 그때 앞 쪽 아래에 생기는 빈 곳을
+        ① 쪽의 1/4 이하면 앞 줄 높이를 늘려 채우고(줄을 통째로 넘김) ② 더 크면 그 줄을 빈 곳에 들어가는 문단까지 끊어 둘로 나눠 앞 조각은
+        빈 곳에, 나머지는 다음 쪽에 — 두 줄 모두에 구분 제목. 한 쪽보다 긴 줄도 쪽 끝에서 같은 식으로 나눈다.
+        나눌 수 없는 긴 줄(한 쪽보다 긴 문단, 다른 칸에 긴 글, 세로로 합친 칸)이 있는 표는 그대로 둔다(칸 안에서 나눔)."""
+        moved = split = 0
+        stuck = []
+        skip = self._skip_tables()
+        for sec in self.secs:
+            body_w, body_h = self.box(sec)
+            paras = [p for p in sec if p.tag == T("hp:p")]
+            for p in paras:
+                tables = para_tables(p)
+                if len(tables) != 1 or tables[0] in skip or not self._report_table(tables[0]):
+                    continue
+                tbl = tables[0]
+                heads = {r for r, c, rs, cs, tc in table_grid(tbl) if tc.get("header") == "1"} if tbl.get("repeatHeader") == "1" else set()
+                repeat = self.lay.table_header(tbl)
+                rows = self.lay.table_rows(tbl)
+                full = body_h - repeat - ROW_PAGE_SAFETY
+                bad = [r for r, h in enumerate(rows) if r not in heads and h > full and not self._splittable(tbl, r, full)]
+                if bad:
+                    cps = [cp for tc in self._row_cells(tbl, bad[0]) for cp in cell_paras(tc)]
+                    stuck.append(self.name(max(cps, key=lambda cp: len(para_text(cp)))) if cps else "?")
+                    continue
+                k = paras.index(p)
+                tbl.set("pageBreak", "TABLE")
+                self.lay.row_cache = None
+                for _ in range(80):
+                    self.lay.paginate(paras, body_w, body_h)
+                    pos = self.lay.row_pos.get(k) or []
+                    rows = self.lay.table_rows(tbl)
+                    act = None
+                    for r in range(len(pos)):
+                        if r in heads:
+                            continue
+                        # 앞 쪽 아래 빈 곳 먼저(통째로 넘어간 줄) — 긴 줄을 먼저 그 쪽 끝에서 자르면 같은 줄을 두 번 자름(세 조각)
+                        if r - 1 >= 0 and r - 1 not in heads and pos[r][0] > pos[r - 1][2]:
+                            gap = body_h - pos[r - 1][3]
+                            if gap > ROW_PAGE_SAFETY + ROW_GAP_MIN:
+                                act = ("move" if gap <= body_h * ROW_MOVE_GAP and rows[r] <= full + 1 else "split", r, gap)
+                                break
+                        if rows[r] > full + 1:  # 쪽 맨 위에서 시작해도 한 쪽보다 긴 줄 — 그 쪽 끝에서 나눔
+                            act = ("split", r, body_h - pos[r][1])
+                            break
+                    if act is None:
+                        break
+                    kind, r, gap = act
+                    room = gap - ROW_PAGE_SAFETY
+                    keep = self._split_keep(tbl, r, room) if kind == "split" else 0
+                    if keep:
+                        self._split_row(tbl, r, keep)
+                        self.lay.row_cache = None
+                        need2 = max(self._row_need(tc, *self._cell_box(tbl, tc)) for tc in self._row_cells(tbl, r + 1))
+                        self._stretch_row(tbl, r + 1, need2)  # 뒤 조각은 글 높이
+                        self._stretch_row(tbl, r, room, top=True)  # 앞 조각은 그 쪽 끝까지(빈 곳을 채움)
+                        split += 1
+                        self._mark_row(tbl, r, "두 쪽에 걸친 칸을 쪽 끝에서 둘로 나누고 두 칸 모두에 구분 제목")
+                    elif r >= 1 and r - 1 not in heads:
+                        # 앞 줄을 늘려 쪽 아래 빈 곳을 채움 — 줄은 통째로 다음 쪽(빈 곳이 커도 나눌 문단 자리가 없을 때 — 첫 문단이 빈 곳보다 큼)
+                        gap_prev = body_h - pos[r - 1][3] - ROW_PAGE_SAFETY
+                        if gap_prev <= 0:
+                            break
+                        self._stretch_row(tbl, r - 1, rows[r - 1] + gap_prev, top=True)
+                        moved += 1
+                        self._mark_row(tbl, r, "쪽 끝에 걸린 칸을 통째로 다음 쪽으로(앞 칸을 늘려 빈 곳을 채움)")
+                    else:
+                        break
+                self._table_height(tbl)
+                self.touched.add(p)
+                self._untop(tbl, p, paras, k, body_w, body_h)
+        if moved or split:
+            self.notes.append(f"표 안 보고서의 쪽 끝 칸: {moved}칸은 통째로 다음 쪽으로(앞 칸을 늘려 쪽 아래를 채움), {split}칸은 쪽 끝에서 "
+                              "둘로 나눠 두 쪽 모두에 구분 제목을 넣었습니다. 표는 '줄 사이에서만 나눔'으로 바꿨습니다 — 한글에서 쪽 끝을 확인하세요.")
+        if stuck:
+            self.notes.append(f"쪽보다 길어 나눌 자리를 찾지 못한 칸이 있는 표 {len(stuck)}개(‘{stuck[0]}…’)는 그대로 두었습니다(칸이 두 쪽에 갈림).")
+
+    def _splittable(self, tbl, r, full):
+        """한 쪽보다 긴 줄을 쪽마다 나눌 수 있는가: 세로로 합친 칸이 걸치지 않고, 보고글 칸 말고는 짧은 글, 보고글 문단 하나하나는 한 쪽 안."""
+        if any(rs > 1 for rr, c, rs, cs, tc in table_grid(tbl) if rr <= r < rr + rs):
+            return False
+        tcs = self._row_cells(tbl, r)
+        content = max(tcs, key=lambda tc: len(cell_paras(tc)))
+        if any(tc is not content and (len(cell_paras(tc)) > 1 or len(para_text(cell_paras(tc)[0]) if cell_paras(tc) else "") > 30) for tc in tcs):
+            return False
+        w, mt = self._cell_box(tbl, content)
+        return all(self.lay.para_height(cp, w)[0] + mt <= full for cp in cell_paras(content))
+
+    def _row_cells(self, tbl, r):
+        return [tc for rr, c, rs, cs, tc in table_grid(tbl) if rr == r]
+
+    def _cell_box(self, tbl, tc):
+        for t, w, mt in self._cells(tbl):
+            if t is tc:
+                return w, mt
+        return 0, 0
+
+    def _mark_row(self, tbl, r, what):
+        cps = [cp for tc in self._row_cells(tbl, r) for cp in cell_paras(tc)]
+        if cps:
+            self.mark(max(cps, key=lambda cp: len(para_text(cp))), what)
+
+    def _stretch_row(self, tbl, r, h, top=False):
+        """줄 r의 칸 높이 값을 h로. top: 보고글 칸은 위에 붙임(쪽 끝까지 늘린 줄 — 세로 가운데면 글 위가 떠 보임, 한글 확인 2026-11-11)."""
+        tcs = self._row_cells(tbl, r)
+        for tc in tcs:
+            tc.find(T("hp:cellSz")).set("height", str(int(round(h))))
+        if top and tcs:
+            tc = max(tcs, key=lambda tc: len(cell_paras(tc)))
+            sub = tc.find(T("hp:subList"))
+            if sub is not None and sub.get("vertAlign") != "TOP":
+                sub.set("vertAlign", "TOP")
+                if not hasattr(self, "_topped"):
+                    self._topped = set()
+                self._topped.add(tc)
+        self.lay.row_cache = None
+        self._end_cells = None
+
+    def _untop(self, tbl, p, paras, k, body_w, body_h):
+        """늘려서 위에 붙인 칸 가운데 마지막 배치에서 쪽 끝 줄이 아닌 것은 세로 가운데로 되돌림(나눈 뒤 자리가 바뀐 줄)."""
+        mine = getattr(self, "_topped", set())
+        if not mine:
+            return
+        self.lay.paginate(paras, body_w, body_h)
+        pos = self.lay.row_pos.get(k) or []
+        ends = {r for r in range(len(pos) - 1) if pos[r + 1][0] > pos[r][2]}
+        for r in range(len(pos)):
+            for tc in self._row_cells(tbl, r):
+                if tc in mine and r not in ends:
+                    tc.find(T("hp:subList")).set("vertAlign", "CENTER")
+                    mine.discard(tc)
+        self._end_cells = None
+
+    def _page_end_cells(self):
+        """쪽 끝을 채운 표 안 보고서 줄(다음 줄이 다음 쪽에서 시작)의 보고글 칸 — 세로 위 붙임을 그대로 둠(두 번째 정돈에서도)."""
+        if getattr(self, "_end_cells", None) is not None:
+            return self._end_cells
+        out = set()
+        for sec in self.secs:
+            for p in [x for x in sec if x.tag == T("hp:p")]:
+                for tbl in para_tables(p):
+                    if tbl.get("pageBreak") not in ("TABLE", "CELL") or not any(
+                            self._wide(tc, w) and len(cell_paras(tc)) >= 2 for tc, w, _ in self._cells(tbl)):
+                        continue
+                    for r in self._row_ends_page(tbl):
+                        tcs = self._row_cells(tbl, r)
+                        top = [tc for tc in tcs if tc.find(T("hp:subList")) is not None and tc.find(T("hp:subList")).get("vertAlign") == "TOP"]
+                        out |= set(top)
+        self._end_cells = out
+        return out
+
+    def _split_keep(self, tbl, r, blank):
+        """줄 r을 쪽 끝에서 나눌 때 앞 줄(높이 blank 안)에 남길 보고글 문단 수(0 = 나눌 자리 없음). 다른 칸은 짧은 글(한 문단·30자 이하)이어야 나눈다.
+        앞 줄 끝이 □·○ 제목이고 다음이 그 딸린 줄이면 한 문단 앞에서 나눔(제목만 쪽 끝에 남지 않게)."""
+        tcs = self._row_cells(tbl, r)
+        if any(rs > 1 for rr, c, rs, cs, tc in table_grid(tbl) if rr <= r < rr + rs):
+            return 0
+        content = max(tcs, key=lambda tc: len(cell_paras(tc)))
+        for tc in tcs:
+            if tc is not content and (len(cell_paras(tc)) > 1 or len(para_text(cell_paras(tc)[0]) if cell_paras(tc) else "") > 30):
+                return 0
+        w, mt = self._cell_box(tbl, content)
+        cps = cell_paras(content)
+        y, keep = mt + ROW_SPARE, 0
+        room = blank
+        for n, cp in enumerate(cps[:-1]):
+            y += self.lay.para_height(cp, w)[0]
+            if y > room:
+                break
+            keep = n + 1
+        while keep > 1 and self.level(para_text(cps[keep - 1])) in (1, 2) and self.level(para_text(cps[keep])) > self.level(para_text(cps[keep - 1])):
+            keep -= 1
+        return keep
+
+    def table_text_gaps(self):
+        """칸 안 표 바로 밑 ○·- 글 줄의 위 간격(사용자 2026-11-11 '표와 동그라미의 간격이 지나치게 좁은'): 칸 안 표는 글자처럼 취급되어 표 뒤 간격은
+        다음 문단의 위 간격이 맡는다 — 그 줄 위 간격이 칸의 ○ 간격(없으면 4pt, 글자 크기의 0.4배까지)보다 작으면 그 값으로. ※·* 설명·단위 줄은 그대로."""
+        done = 0
+        for sec in self.secs:
+            for tbl in sec.iter(T("hp:tbl")):
+                for tc, w, mt in self._cells(tbl):
+                    ps = cell_paras(tc)
+                    gaps = [self.styles.para.get(q.get("paraPrIDRef"), {}).get("prev", 0) for q in ps
+                            if marker_level(para_text(q)) == 2 and not para_tables(q)]
+                    gaps = [g for g in gaps if g >= CELL_GAP_MIN]
+                    for k in range(1, len(ps)):
+                        p = ps[k]
+                        text = para_text(p).replace("⎵", " ").strip()
+                        if not para_tables(ps[k - 1]) or para_tables(p) or not text or text.startswith(("※", "*", "■")) or UNIT_RE.match(text):
+                            continue
+                        size = (self._para_size(p) or 10) * 100
+                        want = Counter(gaps).most_common(1)[0][0] if gaps else min(400, int(size * CELL_GAP_EM))
+                        pid = p.get("paraPrIDRef")
+                        if self.styles.para.get(pid, {}).get("prev", 0) < want - 1:
+                            p.set("paraPrIDRef", self.hedit.para_margin(pid, "prev", want))
+                            self.mark(p, f"칸 안 표 바로 밑 줄 위 간격 {want / 100:g}pt")
+                            done += 1
+        if done:
+            self.notes.append(f"칸 안 표 바로 밑 글 줄 {done}개에 위 간격을 주었습니다(표 아랫선에 붙지 않게 — 칸의 ○ 간격).")
 
     def cell_keep(self):
         """칸 안에서 쪽을 나누는 표: 보고서 칸의 □ 제목을 아래 줄과 같은 쪽에(다음 문단과 함께) — □만 쪽 끝에 홀로 남던 것(양식 시험 2026-11-09).
@@ -2060,6 +2555,8 @@ class Tidier:
                         continue
                     if any(para_pics(cp) for cp in cell_paras(tc)):
                         continue
+                    if tc in self._page_end_cells():
+                        continue  # 쪽 끝을 채우려고 늘린 표 안 보고서 칸 — 글은 위에 붙임(가운데면 위가 떠 보임)
                     sub.set("vertAlign", "CENTER")
                     words = [cp for cp in cell_paras(tc) if para_text(cp).strip()]
                     if words:
@@ -2311,7 +2808,11 @@ class Tidier:
             self.o_gaps()
             self.cell_lines()  # 칸 높이의 여유를 쓰는 것은 끝 줄 맞춤 뒤에 — 줄 수가 정해진 다음
             self.cell_gaps()
+            self.table_text_gaps()  # ○ 간격(cell_gaps)을 정한 뒤 — 그 값으로
             self.cell_keep()
+            self.row_heights()  # 칸 높이 여유를 쓰는 단계(줄 간격·○ 간격) 뒤에 남은 빈 곳만
+            self.cell_pads()  # 줄 높이를 줄인 뒤에 — 먼저 넣으면 줄 높이 맞춤이 여백 몫까지 줄여 두 번째 정돈에서 다시 넣음
+            self.row_pages()  # 줄 높이·여백이 정해진 뒤 쪽 끝 줄 넘기기·나누기
             self.one_space()
             self.hang_verify()  # 맨 끝 — 빈칸 정리·폭 손질이 끝난 상태로 둘째 줄 자리를 다시 대조
         now = self.line_counts()
@@ -2328,9 +2829,92 @@ class Tidier:
         if bad:
             bad = self._restore_bad(bad)
         after = self.pages()
+        self._drop_noops()
         if out and not bad:  # out이 없으면 저장하지 않음(검사만 — '정돈이 고칠 것'). 글자가 바뀐 채로는 저장하지 않음
             self.pkg.save(out)
+            if not self._round:
+                after = self._settle(out, after)
         return before, after, bad
+
+    @staticmethod
+    def _state(pkg):
+        """보이는 상태 — 문단·글자 모양은 번호 대신 실제 값으로(값이 같은 새 모양 번호로 바뀐 것은 같은 것으로), 줄 배치 기록은 뺌."""
+        st = Styles(pkg.xml("Contents/header.xml"))
+        ref = {"paraPrIDRef": st.para, "charPrIDRef": st.char}
+        out = []
+        for n in pkg.sections():
+            stack = [pkg.xml(n)]
+            while stack:
+                el = stack.pop()
+                if not isinstance(el.tag, str) or el.tag == T("hp:linesegarray"):
+                    continue
+                attrs = []
+                for k, v in sorted(el.attrib.items()):
+                    if k in ref:
+                        v = tuple(sorted((a, str(b)) for a, b in ref[k].get(v, {}).items()))
+                    elif k in ("id", "instid"):
+                        continue
+                    attrs.append((k, v))
+                out.append((el.tag, tuple(attrs), el.text or "", el.tail or ""))
+                stack.extend(reversed(list(el)))
+        return out
+
+    def _settle(self, out, after):
+        """정돈 결과에 정돈을 한 번 더 걸어 보고 더 바뀌는 곳이 있으면 그 결과까지(바뀌지 않을 때까지, 최대 SETTLE_MAX번) — 사용자가
+        두 번 정돈해도 같은 결과가 되게(사용자 2026-11-11 '이런일이 없도록 잡아주시길'). 한 번 더 걸 때 글자가 바뀌거나 쪽이 늘면 그 앞 결과로.
+        더 바뀐 문단은 '## 바뀐 곳'에 함께 적는다(같은 자리의 문단)."""
+        import shutil
+        import tempfile
+        mine = list(self.all_paras())
+        extra = 0
+        for _ in range(SETTLE_MAX):
+            t2 = Tidier(out, _round=1, **self._opts)
+            fd, tmp = tempfile.mkstemp(suffix=".hwpx", dir=os.path.dirname(os.path.abspath(out)) or None)
+            os.close(fd)
+            try:
+                _, a2, bad2 = t2.run(tmp)
+                if bad2 or a2 > after or not os.path.getsize(tmp):
+                    break
+                if self._state(t2.pkg) == self._state(Package(out)):
+                    break
+                shutil.copyfile(tmp, out)
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            theirs = list(t2.all_paras())
+            if len(theirs) == len(mine):
+                for q, whats in t2.changes.items():
+                    k = theirs.index(q)
+                    self.changes.setdefault(mine[k], []).extend(w for w in whats if w not in self.changes.get(mine[k], []))
+            extra += len(t2.changes) or 1
+            after = a2
+            self.notes += [n for n in t2.notes if n not in self.notes and n.startswith(("표 안 보고서의 쪽 끝 칸", "글이 칸 위아래", "표 "))]
+        if extra:
+            self.notes.append(f"정돈한 결과에 한 번 더 걸어 보니 더 맞출 곳이 있어(문단 {extra}개) 그 결과까지 반영했습니다 — 다시 정돈해도 같은 결과.")
+        return after
+
+    def _look(self, p):
+        """문단의 보이는 모양 — 글·문단 모양 값·조각마다 글자 모양 값, 칸 안 문단이면 그 칸의 크기·여백·세로 정렬."""
+        st = self.styles
+        pp = tuple(sorted((k, str(v)) for k, v in st.para.get(p.get("paraPrIDRef"), {}).items()))
+        runs = tuple((run_text(r), tuple(sorted((k, str(v)) for k, v in st.char.get(r.get("charPrIDRef"), {}).items())))
+                     for r in para_runs(p))
+        tc = next((a for a in p.iterancestors() if a.tag == T("hp:tc")), None)
+        cell = None
+        if tc is not None:
+            sz, cm, sub = tc.find(T("hp:cellSz")), tc.find(T("hp:cellMargin")), tc.find(T("hp:subList"))
+            addr = tc.find(T("hp:cellAddr"))
+            tbl = next((a for a in tc.iterancestors() if a.tag == T("hp:tbl")), None)
+            cell = (tuple(sorted(sz.attrib.items())) if sz is not None else None, tuple(sorted(cm.attrib.items())) if cm is not None else None,
+                    sub.get("vertAlign") if sub is not None else None, tc.get("hasMargin"),
+                    addr.get("rowAddr") if addr is not None else None, tbl.get("pageBreak") if tbl is not None else None)
+        return pp, runs, cell, p.get("pageBreak")
+
+    def _drop_noops(self):
+        """한 회차 안에서 바꿨다가 되돌아온 문단(모양이 처음과 같음)은 '바뀐 곳'에서 뺀다 — 두 번째 정돈에 '바뀐 곳'이 남지 않게."""
+        for p in [q for q in self.changes if q in self.orig_look]:
+            if self._look(p) == self.orig_look[p]:
+                del self.changes[p]
 
     def _restore_bad(self, bad):
         """글자가 바뀐 문단(도구 오류)은 원본 그대로 되돌린다 — 글을 잃은 파일을 내보내지 않게. 되돌리지 못한 문단을 돌려준다."""
@@ -2402,7 +2986,11 @@ class Tidier:
             print(f" - 글자가 바뀐 문단 {len(bad)}개 — 정돈은 글자를 바꾸면 안 되어 파일을 저장하지 않았습니다(도구 오류): "
                   + ", ".join(f"‘{flat(para_text(p))[:12]}…’" for p in bad[:3]))
         print("## 한 일")
-        for n in self.notes or ["바꿀 곳이 없었습니다(이미 정돈된 문서)."]:
+        notes = self.notes
+        if not self.changes and not self.doc_changes:
+            # 실제로 바뀐 문단이 없으면(바꿨다 되돌아온 것만) '바꿀 곳 없음' — 남은 것·못 한 것 알림만 덧붙임(한 일처럼 읽히는 알림은 뺌)
+            notes = ["바꿀 곳이 없었습니다(이미 정돈된 문서)."] + [n for n in notes if re.search(r"남은|남았|못 |못했|그대로 두었|확인하", n)]
+        for n in notes or ["바꿀 곳이 없었습니다(이미 정돈된 문서)."]:
             print(" - " + n)
         print("## 바뀐 곳(실제로 바뀐 문단만, 쪽은 원본 기준" + (" 어림" if self.page_guess else "") + ")")
         for line in self.change_lines() or ["없음"]:

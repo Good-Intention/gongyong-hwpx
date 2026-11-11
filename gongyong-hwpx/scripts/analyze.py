@@ -2,7 +2,8 @@
 """견본 한글 파일(.hwpx)을 읽어 '양식 지도'를 보인다.
 
 쓰는 법:
-    python analyze.py 견본.hwpx            # 양식 지도(문단마다 번호·역할·서식·글)
+    python analyze.py 견본.hwpx            # 짧은 양식 지도(여백 → 기호로 쓰면 고르는 문단 → 번호로 쓰는 문단)
+    python analyze.py 견본.hwpx --all      # 문단마다 조각·표 칸의 서식까지(번호·조각 모양을 직접 고를 때)
     python analyze.py 견본.hwpx --text     # 글만 처음부터 끝까지(문체 익히기)
     python analyze.py 견본.hwpx --json 지도.json   # 기계가 읽는 지도도 저장
 
@@ -19,6 +20,7 @@ from hwpx_lib import (STRUCT_CTRLS, UNIT_RE, Package, Styles, T, cell_paras, cel
                       table_grid)
 
 SHOW = 60  # 글 미리 보기 글자 수
+BRIEF_MAX = 30  # 짧은 지도의 '번호로 쓰는 문단' 줄 수 상한
 
 
 def short(s, n=SHOW):
@@ -102,7 +104,10 @@ def analyze(path):
             for ctrl in r.findall(T("hp:ctrl")):
                 for x in ctrl:
                     if local(x) in ("header", "footer"):
-                        txt = " / ".join(para_text(q) for q in x.iter(T("hp:p")))
+                        txt = " / ".join(t for t in (para_text(q) for q in x.iter(T("hp:p"))) if t.strip())
+                        n_pic = len(list(x.iter(T("hp:pic"))))
+                        if n_pic:  # 기본 양식 머리말 = 오른쪽 위 시 슬로건 띠 그림(2026-11-11)
+                            txt = (txt + " / " if txt else "") + f"그림 {n_pic}개(오른쪽 위 띠 그림 등)"
                         result["header_footer"].append({"kind": "머리말" if local(x) == "header" else "꼬리말",
                                                         "applyTo": x.get("applyPageType"), "text": txt})
                     elif local(x) == "pageNum":
@@ -134,6 +139,153 @@ def signature(item):
         t = item["tables"][0]
         return ("표", t["rows"], t["cols"], item["paraPr"], tuple(c["border"] for c in t["cells"][:3]))
     return (item["role"], item["paraPr"], tuple(r["charPr"] for r in item["runs"]), item["marker"].strip())
+
+
+def _kinds(item):
+    """문단에 있는 조각 모양 표시 — 계획의 **굵게**·^^위 첨자^^는 견본 문단에 그 모양 조각이 있어야 먹는다."""
+    chars = " ".join(r["char"] for r in item["runs"])
+    return ("·굵은 조각" if "굵게" in chars else "") + ("·위 첨자 조각" if "위첨자" in chars else "")
+
+
+def _table_line(item):
+    t = item["tables"][0]
+    rows = {}
+    for c in t["cells"]:
+        rows.setdefault(c["row"], []).append(short(" ".join(p["text"] for p in c["paras"]).strip(), 12))
+    head = " | ".join(rows.get(0, []))
+    return f"표 {t['rows']}×{t['cols']}{', 합친 칸 있음' if t['merged'] else ''} — 첫 줄: {head}"
+
+
+def print_brief(res, path):
+    """짧은 지도(기본): 여백 → 기호로 쓰면 고르는 문단 → 번호로만 쓰는 문단. 30KB가 넘던 지도가 한 번에 읽히지 않아
+    견본 하나 읽는 데 가장 오래 걸렸다(시험 2026-11-12) — 조각·칸마다의 서식은 --all로."""
+    pg = res["page"]
+    items = res["paragraphs"]
+    print(f"# 양식 지도: {res['file']}")
+    if pg:
+        kind = "세로" if pg["width"] < pg["height"] else "가로"
+        body_h = pg["height"] - pg.get("top", 0) - pg.get("bottom", 0) - pg.get("header", 0) - pg.get("footer", 0)
+        print(f"- 용지 {pg['width']:.0f}×{pg['height']:.0f}mm({kind}), 여백 왼 {pg.get('left', 0):.1f} · 오른 {pg.get('right', 0):.1f} · "
+              f"위 {pg.get('top', 0):.1f} · 아래 {pg.get('bottom', 0):.1f}mm → 본문 폭 {pg.get('body_width', 0):.1f}mm, "
+              f"높이 {body_h:.1f}mm(머리말 {pg.get('header', 0):.1f}·꼬리말 {pg.get('footer', 0):.1f} 뺌)")
+    for hf in res["header_footer"]:
+        print(f"- {hf['kind']}: {short(hf['text']) or '(글 없음)'}")
+    if not any(hf["kind"] in ("머리말", "꼬리말") for hf in res["header_footer"]):
+        print("- 머리말·꼬리말: 없음")
+    if res["sections"] > 1:
+        print(f"- 주의: 구역이 {res['sections']}개입니다. 첫 구역의 문단만 견본으로 쓰고, 결과 문서는 구역 하나로 만듭니다.")
+    wide = []
+    for it in items:
+        for t in it.get("tables", []):
+            diff = t.get("width_mm", 0) - (pg.get("body_width", 0) - it.get("margin_mm", 0)) if pg else 0
+            if abs(diff) > 0.3:
+                wide.append(f"[{it['index']}] {diff:+.1f}mm")
+    if wide:
+        print("- 본문 폭과 다른 표(+ 넓음·- 좁음): " + ", ".join(wide[:12]))
+    print("- 기호: ⎵ 고정폭 빈칸, ⍽ 묶음 빈칸, ⇥ 탭, ↵ 줄 바꿈")
+
+    # 기호로 쓰면 도구가 고르는 문단 — 만들 때(plan_text)와 같은 방법으로 고른다
+    used = {}
+    try:
+        from build import Builder
+        from plan_text import Roles
+        roles = Roles(Builder(Package(path)))
+    except Exception:  # noqa: BLE001 — 쪽 설정이 없는 파일 등: 번호 목록만 보임
+        roles = None
+    print()
+    print("## 기호로 쓰기 — 계획에 이렇게 쓰면 이 견본 문단 모양으로 들어감")
+
+    def show(how, idx, note=""):
+        if idx is None:
+            return
+        it = items[idx]
+        used.setdefault(idx, how)
+        if it.get("tables"):
+            print(f"- `{how}` → [{idx}] {it['role']} | {_table_line(it)}{note}")
+        else:
+            print(f"- `{how}` → [{idx}] {it['role']} | {it['para']}{_kinds(it)}{note} | 예) \"{short(it['text'], 34)}\"")
+
+    if roles is not None:
+        show("제목: …", roles.title())
+        show("날짜: …", roles.date())
+        show("요약: …", roles.summary())
+        seen_marks = set()
+        for it in items:
+            mark = split_marker(it["text"])[1]
+            if it.get("tables") or not mark or mark == "■" or it["role"] in seen_marks:
+                continue
+            role = it["role"]
+            seen_marks.add(role)
+            group = [i for i in roles.of(role)]
+            if role in ("주석(*)", "참고(※)"):
+                shapes = {}
+                for i in group:
+                    shapes.setdefault(items[i]["para"], i)
+                for i in shapes.values():
+                    show(f"{mark} …", i, " — 바로 위 항목의 글 시작 자리에 가까운 모양을 고름" if len(shapes) > 1 else "")
+            else:
+                lab = [i for i in group if roles.labeled[i]]
+                plain = [i for i in group if not roles.labeled[i]]
+                if lab and plain:
+                    show(f"{mark} (이름표) …", roles.common(lab))
+                    show(f"{mark} …", roles.common(plain))
+                else:
+                    show(f"{mark} …", roles.common(group))
+        plain_t = roles.plain_tables()
+        seen_cols = set()
+        for i in plain_t:  # 칸 수마다 실제로 고르는 표 하나씩(칸 수가 같으면 앞선 표를 고름)
+            cols = items[i]["tables"][0]["cols"]
+            if cols not in seen_cols:
+                seen_cols.add(cols)
+                show("{\"table\": [[…], …]}", i)
+        if len(plain_t) > 1:
+            print("  (표가 여럿 — 칸 수가 같은 표를 먼저, 없으면 첫 표를 고르고 칸 수는 도구가 맞춤. 표 모양을 정하려면 "
+                  "{\"like\": 번호, \"table\": …})")
+        if plain_t:
+            print("- `■ 제목` · `(기준 : …) (단위 : …)` → 바로 다음 표 위의 제목 줄·단위 줄(도구가 표에 맞춰 만듦)")
+        elif roles.of("표"):
+            print("- (줄·칸을 바꿔 쓸 표가 없는 견본 — 합친 칸 있는 표뿐. 표는 아래 번호로 {\"like\": 번호, \"cells\": …} 칸만 채움)")
+        show("[참고1] 제목", roles.ref())
+        if not seen_marks:
+            print("- (머리 기호로 시작하는 문단이 없는 견본 — 아래 번호로 쓰세요)")
+    print("- □ 사이 빈 줄·표 위아래 간격은 도구가 넣는다. 목록에 없는 기호는 이 견본에 없다(있는 기호로 바꾸거나 번호로).")
+
+    # 번호로만 쓰는 문단(상자·그림·모양이 다른 문단) — 같은 모양은 한 줄로
+    rest = {}
+    for it in items:
+        if it["index"] in used:
+            continue
+        if it.get("tables"):
+            key = ("t", it["role"], it["tables"][0]["rows"], it["tables"][0]["cols"], _table_line(it))
+        else:
+            key = ("p", it["role"], it["para"], it["marker"].strip(), _kinds(it))
+        rest.setdefault(key, []).append(it["index"])
+    # 기호로 고른 문단과 모양까지 같은 문단은 따로 보이지 않는다 — 기호만 같고 모양(들여쓰기·줄 간격·조각)이 다른 문단은 번호로
+    # 골라 쓸 수 있게 보인다(역할·기호만 보고 숨기면 '같은 기호의 다른 모양'을 찾을 길이 없음, 검토 2026-11-12)
+    same_as = set()
+    for idx in used:
+        it = items[idx]
+        if not it.get("tables"):
+            same_as.add(("p", it["role"], it["para"], it["marker"].strip(), _kinds(it)))
+    lines = []
+    for key, idxs in rest.items():
+        first = items[idxs[0]]
+        if key in same_as:
+            continue
+        what = _table_line(first) if first.get("tables") else f"{first['para']}{_kinds(first)}"
+        flag = " [쪽 나눔]" if first["pageBreak"] else ""
+        more = f" (같은 모양 {len(idxs) - 1}개 더)" if len(idxs) > 1 else ""
+        text = "" if first.get("tables") else f" | \"{short(first['text'], 30)}\""
+        lines.append(f"- [{idxs[0]}] {first['role']}{flag} | {what}{text}{more}")
+    if lines:
+        print()
+        print("## 번호로 쓰는 문단 — {\"like\": 번호, \"text\"·\"cells\": …}")
+        for ln in lines[:BRIEF_MAX]:
+            print(ln)
+        if len(lines) > BRIEF_MAX:  # 100쪽 넘는 문서는 모양이 수백 가지 — 지도가 다시 길어지지 않게
+            print(f"- … 그 밖 {len(lines) - BRIEF_MAX}가지 모양(모두 보려면 --all)")
+    print()
+    print(f"- 최상위 문단 {len(items)}개. 조각·표 칸마다의 서식까지 보려면 --all, 글만 읽으려면 --text.")
 
 
 def print_map(res, show_all=False):
@@ -232,7 +384,7 @@ def main():
     ap = argparse.ArgumentParser(description="견본 hwpx의 양식 지도를 보인다")
     ap.add_argument("template")
     ap.add_argument("--text", action="store_true", help="글만 보이기")
-    ap.add_argument("--all", action="store_true", help="문단·표 칸을 줄이지 않고 모두 보이기")
+    ap.add_argument("--all", action="store_true", help="문단마다 조각·표 칸의 서식까지 모두 보이기(번호·조각 모양을 직접 고를 때)")
     ap.add_argument("--json", help="지도를 JSON 파일로도 저장")
     a = ap.parse_args()
     res = analyze(a.template)
@@ -241,8 +393,10 @@ def main():
             json.dump(res, f, ensure_ascii=False, indent=1)
     if a.text:
         print_text(res)
+    elif a.all:
+        print_map(res, True)
     else:
-        print_map(res, a.all)
+        print_brief(res, a.template)
 
 
 if __name__ == "__main__":

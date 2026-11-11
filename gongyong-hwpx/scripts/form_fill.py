@@ -64,6 +64,7 @@ class Ctx:
         self.tbl_id = max((int(t.get("id", "0")) for t in sec.iter(T("hp:tbl"))), default=1000000000) + 1
         self.z = max((int(t.get("zOrder", "0")) for t in sec.iter(T("hp:tbl"))), default=0) + 1
         self.image_seq = 0
+        self.inner = []  # 칸 안 표 (표가 든 문단, 표, 칸 폭, 계획에 widths가 있나) — 다 채운 뒤 본문 표 규칙을 건다(fit_inner)
 
 
 def _is_int(x):
@@ -267,7 +268,9 @@ def set_row_heights(tbl, ctx, spare=INNER_SPARE):
 
 
 def inner_table(item, proto, cid, ctx, width, border, tpid, where):
-    """칸 안 표 문단 — 첫 줄은 머리(회색 바탕·굵게·가운데), 글자는 보고글보다 1pt 작게."""
+    """칸 안 표 문단 — 첫 줄은 머리(회색 바탕·굵게·가운데, 머리 칸 표시), 글자는 보고글보다 1pt 작게. 칸 글은 본문 표처럼 가운데에서
+    시작하고(사용자 2026-11-11 '본문표에 적용된 스킬 … 모두 적용'), 칸 너비·금액·수량 오른쪽·날짜·번호 가운데·'·' 줄 등은
+    다 채운 뒤 fit_inner가 작성 모드의 표 맞춤(fit_tables)으로 맞춘다."""
     rows = item["table"]
     if not (isinstance(rows, list) and rows and all(isinstance(r, list) and r for r in rows)):
         raise FormError(f"{where}: table은 줄 목록의 목록이어야 합니다([[\"구분\", \"값\"], [\"가\", \"1\"]]).")
@@ -284,7 +287,6 @@ def inner_table(item, proto, cid, ctx, width, border, tpid, where):
     left, center = hedit.para_align(line, "LEFT"), hedit.para_align(line, "CENTER")
     body = rows[1:] if item.get("head", True) else rows
     plain = lambda v: re.sub(r"\*\*", "", str(v)).strip()  # noqa: E731
-    short = [all(len(plain(r[c])) <= INNER_SHORT or plain(r[c])[:1].isdigit() for r in body) for c in range(n)]  # 짧은 말·숫자 열은 가운데
     aligns = item.get("align")
     if aligns is not None and not (isinstance(aligns, list) and all(isinstance(x, str) for x in aligns)):
         raise FormError(f"{where}: align은 칸마다 \"left\"·\"center\"·\"right\"로 적은 목록이어야 합니다.")
@@ -297,10 +299,14 @@ def inner_table(item, proto, cid, ctx, width, border, tpid, where):
         for c, text in enumerate(row):
             if not isinstance(text, (str, int, float)):
                 raise FormError(f"{where}: 칸 안 표의 칸은 글이어야 합니다({r + 1}줄 {c + 1}칸).")
-            al = (aligns[c].upper() if aligns and c < len(aligns) else ("CENTER" if head or short[c] else "LEFT"))
+            al = aligns[c].upper() if aligns and c < len(aligns) else "CENTER"  # 본문 표처럼 가운데(옛 판: 긴 글 열은 왼쪽)
             pid = hedit.para_align(line, al) if al in ("LEFT", "CENTER", "RIGHT") else left
-            cp = make_para(proto, str(text), small_bold if head else small, small_bold, center if head else pid)
-            new_cell(tr, r, c, width // n, grey if head else border, [cp])
+            # 칸 글의 줄 바꿈은 줄마다 문단으로(본문 표와 같게 — 한 문단 안 줄 바꿈이면 둘째 '· 항목'이 첫 줄 글 밑으로 들어감)
+            cps = [make_para(proto, part, small_bold if head else small, small_bold, center if head else pid)
+                   for part in (str(text).split("\n") or [""])]
+            cell = new_cell(tr, r, c, width // n, grey if head else border, cps)
+            if head:
+                cell.set("header", "1")  # 머리 칸 — 본문 표 규칙(데이터 표)이 알아보게
     grid = table_grid(tbl)
     given = item.get("widths")
     if given is not None:
@@ -318,7 +324,41 @@ def inner_table(item, proto, cid, ctx, width, border, tpid, where):
     for _, c, _, _, tc in grid:
         tc.find(T("hp:cellSz")).set("width", str(ws[c]))
     set_row_heights(tbl, ctx)
+    ctx.inner.append((holder, tbl, width, given is not None))
     return holder
+
+
+def fit_inner(ctx):
+    """칸 안 표에 본문 표 규칙(작성 모드 fit_tables — 칸 너비를 내용에 맞추기·옆 열 폭 빌리기·금액·수량 열 오른쪽 + 1.5mm·날짜·번호 가운데·
+    '·' 줄·칸 글 줄 균형·한 줄로 입력·표 안 날짜 붙이기·△·■ 제목·단위 줄·표 밑 ※ 등)을 건다 — 같은 문서에 한 번 더 걸어 고정점으로.
+    칸 안 표는 한글이 줄 높이를 늘리지 않으므로 끝에 줄 높이를 글에 맞춘다. 알림을 돌려줌."""
+    if not ctx.inner:
+        return []
+    from build import Builder
+    from fit import Fitter
+    b = Builder(ctx.pkg)
+    b.fixed_widths |= {tbl for _, tbl, _, fixed in ctx.inner if fixed}
+    f = Fitter(b)
+    targets = [(holder, tbl, width) for holder, tbl, width, _ in ctx.inner]
+    f.fit_tables(inner=targets)
+    f.fit_tables(again=True, inner=targets)
+    for _, tbl, _, _ in ctx.inner:
+        fit_row_heights(tbl, f.lay)
+    return f.notes
+
+
+def fit_row_heights(tbl, lay, spare=INNER_SPARE):
+    """칸 안 표 줄 높이 = 글 + 칸 위아래 여백 + 여유(칸 너비가 바뀐 뒤 — 줄이 줄면 줄 높이도 줄임)."""
+    rows = {}
+    for r, c, _, _, tc in table_grid(tbl):
+        sz = tc.find(T("hp:cellSz"))
+        cm = tc.find(T("hp:cellMargin"))
+        inner = int(sz.get("width")) - int(cm.get("left")) - int(cm.get("right"))
+        need = sum(lay.para_height(cp, inner)[0] for cp in cell_paras(tc)) + int(cm.get("top")) + int(cm.get("bottom")) + spare
+        rows[r] = max(rows.get(r, 0), int(need))
+    for r, c, _, _, tc in table_grid(tbl):
+        tc.find(T("hp:cellSz")).set("height", str(rows[r]))
+    tbl.find(T("hp:sz")).set("height", str(sum(rows.values())))
 
 
 def _add_image(ctx, data, ext):
@@ -464,6 +504,17 @@ def fill_cell(tc, spec, ctx, tbl, where):
         if isinstance(line, dict):
             kw = dict(proto=proto, cid=cid, ctx=ctx, width=width, border=border, tpid=tpid, where=f"{where} {n}번째 줄")
             if "table" in line:
+                for key in ("title", "unit"):  # 본문 표처럼 ■ 제목·기준·단위 줄(모양은 fit_inner가 본문 규칙대로)
+                    v = line.get(key)
+                    if v is not None and not (isinstance(v, str) and v.strip()):
+                        raise FormError(f"{where} {n}번째 줄: {key}는 글이어야 합니다.")
+                if line.get("title"):
+                    t = line["title"].strip()
+                    made.append(make_para(proto, t if t.startswith("■") else "■ " + t, bold, bold,
+                                          hedit.para_align(hedit.para_hang(hedit.para_margin(pid0, "left", 0), 0), "LEFT")))
+                if line.get("unit"):
+                    made.append(make_para(proto, line["unit"].strip(), cid, bold,
+                                          hedit.para_align(hedit.para_hang(hedit.para_margin(pid0, "left", 0), 0), "RIGHT")))
                 made.append(inner_table(line, **kw))
             else:
                 made.extend(inner_images(line, **kw))
@@ -561,6 +612,8 @@ def fill(path, plan, out, base_dir=None):
         fill_cell(tc, spec, ctx, tbl, where)
         if "lines" in spec and plan.get("repeat_head", True):
             repeat_head(tbl)
+    for note in fit_inner(ctx):  # 칸 안 표에 본문 표 규칙
+        print("알림(칸 안 표): " + str(note))
     # 양식 구간 떼기
     keep = plan.get("keep")
     drop = set(plan.get("drop") or [])

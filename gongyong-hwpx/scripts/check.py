@@ -138,6 +138,9 @@ def check_table(tbl):
         return errs + [f"표 칸 {len(lost)}개에 자리 정보(cellAddr)가 없습니다."]
     seen = {}
     for r, c, rs, cs, tc in table_grid(tbl):
+        if r < 0 or c < 0 or rs < 1 or cs < 1:  # 음수 자리·0칸 합침 — 개수만 세면 깨진 표가 통과함(검토 2026-11-12)
+            errs.append(f"표 칸 자리 정보가 틀림: 줄 {r}, 칸 {c}, 합침 {rs}×{cs}")
+            continue
         for rr in range(r, r + rs):
             for cc in range(c, c + cs):
                 if rr >= rows or cc >= cols:

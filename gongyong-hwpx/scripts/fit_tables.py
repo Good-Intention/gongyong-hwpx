@@ -597,7 +597,7 @@ class TableFit:
                 unified += 1
         return joined, unified, three
 
-    def _cell_pad(self, tbl):
+    def _cell_pad(self, tbl, sides_only=False):
         """표의 각 칸은 위아래·양옆에 약간의 공간을 둔다(사용자 원칙 2026-11-01 — 아주 공간이 없는 경우만 빼고):
         칸 안 여백이 CELL_VPAD·CELL_HPAD보다 작으면 그만큼으로. 한 줄 칸은 줄 높이가 넉넉해 그대로 보이고, 두세 줄 칸
         글이 위아래 칸 선에 붙지 않게 된다. 넓혔으면 1."""
@@ -609,7 +609,8 @@ class TableFit:
         for el in boxes:
             if el is None:
                 continue
-            for k, low in (("top", CELL_VPAD), ("bottom", CELL_VPAD), ("left", CELL_HPAD), ("right", CELL_HPAD)):
+            for k, low in (((("left", CELL_HPAD), ("right", CELL_HPAD)) if sides_only else
+                             (("top", CELL_VPAD), ("bottom", CELL_VPAD), ("left", CELL_HPAD), ("right", CELL_HPAD)))):
                 if int(el.get(k, "0")) < low - 1:
                     self.pad_orig.setdefault(tbl, []).append((el, k, el.get(k, "0")))
                     el.set(k, str(int(round(low))))
@@ -845,7 +846,7 @@ class TableFit:
                 n += 1
         return n
 
-    def _note_gap(self, p, tbl):
+    def _note_gap(self, p, tbl, inner=False):
         """표 바로 뒤 글 문단과 표 사이를 표 바깥 여백 아래로 띄운다. 글자처럼 취급하지 않은 표 바로 뒤에서는 한글이
         문단 위 간격을 쓰지 않아(실측) 다음 글이 표 아랫선에 붙는다.
         - ※·* 설명: NOTE_GAP(2mm — 표에 딸린 설명이라 가깝게)
@@ -868,6 +869,16 @@ class TableFit:
             return 0
         if text.startswith(("※", "*")):
             kind, gap = 1, NOTE_GAP
+            if inner:  # 칸 안 표(글자처럼 취급)는 표 문단 줄 간격 여분·아래 간격이 따로 붙는다 — 그만큼 빼서 표와 ※ 사이가 1.5mm(사용자 2026-11-11 '당구장표와 표의 간격이 넓은')
+                pp = self.st.para.get(p.get("paraPrIDRef"), {})
+                tr = next((r for r in para_runs(p) if r.find(T("hp:tbl")) is not None), None)
+                size = self.st.char.get(tr.get("charPrIDRef"), {}).get("size", 10) * 100 if tr is not None else 1000
+                extra = max(0.0, self.lay.line_pitch(p, size) - size) + pp.get("next", 0)
+                gap = max(0.0, INNER_NOTE_GAP - extra)
+                if abs(int(om.get("bottom", "0")) - gap) <= 1:
+                    return 0
+                om.set("bottom", str(int(round(gap))))
+                return kind
         else:
             pos = tbl.find(T("hp:pos"))
             if (UNIT_RE.match(text) or tbl in self.b.flow_tables
@@ -1042,10 +1053,24 @@ class TableFit:
                 r.set("charPrIDRef", self.b.hedit.char_size(cid, d))
         return True
 
-    def fit_tables(self, again=False):
+    def _fit_targets(self, inner):
+        """맞출 표: (표가 든 문단, 표, 쓸 수 있는 폭, 칸 안 표인가). inner를 주면 그 칸 안 표들만(양식 칸 채우기 — 사용자 2026-11-11
+        '표안의 표에는 본문표에 적용된 스킬이 적용되지 않고 있는거 같네요. 모두 적용시켜주세요')."""
+        if inner is not None:
+            return [(p, tbl, avail, True) for p, tbl, avail in inner]
+        out = []
+        for p in self.paras():
+            pp = self.st.para.get(p.get("paraPrIDRef"), {})
+            for tbl in para_tables(p):
+                out.append((p, tbl, self.body_w - pp.get("left", 0) - pp.get("right", 0), False))
+        return out
+
+    def fit_tables(self, again=False, inner=None):
         """끝선 맞추기·표 글자 크기(10~12pt)·칸 너비를 내용에 맞추기·숫자 칸 자간 자동 줄임·표 위 기준·단위 줄.
         again=True는 같은 문서에 한 번 더 거는 것(자간·한 줄로 입력·폭 빌리기 뒤 다시 재도 같은 결과가 되게 — 만든 문서가
-        다듬기의 고정점이 되게, 2026-11-04): 칸 여백 원본은 그대로 두고, 알림은 마지막 상태로 본 '남은 칸'만 다시 적는다."""
+        다듬기의 고정점이 되게, 2026-11-04): 칸 여백 원본은 그대로 두고, 알림은 마지막 상태로 본 '남은 칸'만 다시 적는다.
+        inner: 칸 안 표 [(표가 든 칸 문단, 표, 쓸 수 있는 폭)] — 본문 표 규칙을 그대로 걸되, 표 글자 크기(보고글 −1pt — 양식 칸 채우기 규칙)·
+        칸 위아래 여백(정돈이 1mm — 사용자 결정)·쪽 경계 나눔(칸 안 표는 글자처럼 취급)·그림·상자 손질은 빼고(양옆 여백은 본문 표와 같게)."""
         edge, cols, squeezed, wraps, near, units, notes, captions, boxes_left, images = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
         colon_tight = 0
         shrunk, left, cut_words, dot_breaks, bullets, balanced, note_font = [], [], [], 0, 0, 0, 0
@@ -1054,10 +1079,8 @@ class TableFit:
         self.long_titles = []
         if not again:
             self.pad_orig = {}
-        for p in self.paras():
-            for tbl in para_tables(p):
-                pp = self.st.para.get(p.get("paraPrIDRef"), {})
-                avail = self.body_w - pp.get("left", 0) - pp.get("right", 0)
+        for p, tbl, avail, is_inner in self._fit_targets(inner):
+            if True:
                 width = self.lay.table_width(tbl)
                 grid = table_grid(tbl)
                 n = int(tbl.get("colCnt", "1"))
@@ -1070,19 +1093,21 @@ class TableFit:
                 for r, c, rs, cs, tc in grid:
                     if r == 0 and cs == 1:
                         cur[c] = int(tc.find(T("hp:cellSz")).get("width", "0"))
-                if self._is_data_table(tbl) and tbl.get("pageBreak") == "CELL":
+                if self._is_data_table(tbl) and tbl.get("pageBreak") == "CELL" and not is_inner:
                     tbl.set("pageBreak", "TABLE")  # 쪽 경계에서 줄 사이로만 나눔('CELL'은 한 줄이 두 쪽으로 갈라짐, 한글 실측)
-                box_blanks += self._box_blanks(tbl, grid)
+                if not is_inner:
+                    box_blanks += self._box_blanks(tbl, grid)
                 grid = table_grid(tbl)
-                padded += self._cell_pad(tbl)
-                figures += self._figure_sides(tbl)
+                padded += self._cell_pad(tbl, sides_only=is_inner)
+                if not is_inner:
+                    figures += self._figure_sides(tbl)
                 self._tight_dates(tbl)
                 self._bind_parens(tbl)
                 j, u, th = self._dot_columns(tbl)
                 name_joined, desc_dots = name_joined + j, desc_dots + u
                 three_info += th
                 bullets += self._bullet_cells(tbl)
-                font = self._fit_font(tbl, grid, n, merged, total, cur, width)
+                font = None if is_inner else self._fit_font(tbl, grid, n, merged, total, cur, width)
                 if font and font[1] != font[0]:
                     shrunk.append(font)
                     self._bullet_cells(tbl)  # 글자가 작아졌으니 둘째 줄 들여쓰기(기호 폭)를 다시 잼
@@ -1103,8 +1128,9 @@ class TableFit:
                         sz.set("width", str(int(round(int(sz.get("width", "0")) * f))))
                     tbl.find(T("hp:sz")).set("width", str(int(total)))
                 self._narrow_cells(tbl, table_grid(tbl), self.lay.table_width(tbl))
-                captions += self._caption_box(tbl, table_grid(tbl), self.lay.table_width(tbl))
-                images += self._image_layout(tbl, table_grid(tbl), self.lay.table_width(tbl))
+                if not is_inner:
+                    captions += self._caption_box(tbl, table_grid(tbl), self.lay.table_width(tbl))
+                    images += self._image_layout(tbl, table_grid(tbl), self.lay.table_width(tbl))
                 # 숫자 열(내용 칸 대부분이 숫자·날짜)의 숫자 칸: 금액과 수량 숫자(대수·건수·명·%·쪽 수 등)는 오른쪽 정렬 + 오른쪽
                 # 1.5mm(자릿수가 위아래로 맞게 — 사용자 2026-11-05 '대수·건수·명·%도 오른쪽', 옛 2026-10-31 '금액 아닌 숫자는 가운데'를
                 # 바꿈). 날짜·기간(시기·기한) 열과 연번·연도 같은 번호 열은 가운데. 글이 섞인 열의 숫자 하나는 그대로.
@@ -1187,10 +1213,11 @@ class TableFit:
                 bal, dot = self._balance_breaks(tbl)
                 balanced += bal
                 dot_breaks += dot
-                boxes_left += self._box_justify(tbl, table_grid(tbl))  # 줄 균형(가운데·왼쪽 정렬 글만, 인용 칸은 뺌) 뒤에
+                if not is_inner:
+                    boxes_left += self._box_justify(tbl, table_grid(tbl))  # 줄 균형(가운데·왼쪽 정렬 글만, 인용 칸은 뺌) 뒤에
                 units += self._fit_unit(p, self._main_size(tbl))
                 titles += self._fit_title(p, tbl, self._main_size(tbl))
-                g = self._note_gap(p, tbl)
+                g = self._note_gap(p, tbl, inner=is_inner)
                 notes += g == 1
                 text_gaps += g == 2
                 note_font += self._fit_notes(p, tbl)
