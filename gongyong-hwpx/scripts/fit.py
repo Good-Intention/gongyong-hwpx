@@ -44,6 +44,21 @@ class Fitter(LineFit, TableFit, PageFit):
                         out.append((cp, w))
         return out
 
+    def quote_boxes(self):
+        """제목 걸친 상자(조문 발췌 등) 본문 칸의 글 문단과 그 칸 안쪽 폭. text_boxes와 따로 둔다 — 인용 글이라 화살표·연결어·끝 줄
+        내리기 같은 줄 바꿈 넣기와 '낱말 빼기' 알림을 쓰지 않고, 자간으로만 끝선을 맞춘다(fit_quotes, 사용자 2026-11-10)."""
+        out = []
+        for p in self.paras():
+            for tbl in para_tables(p):
+                tc = self._caption_content(tbl, table_grid(tbl))
+                if tc is None:
+                    continue
+                w = int(tc.find(T("hp:cellSz")).get("width", "0")) - self._cell_margin(tbl, tc)
+                for cp in cell_paras(tc):
+                    if para_text(cp).strip() and not para_tables(cp):
+                        out.append((cp, w))
+        return out
+
     def summary_paras(self):
         """요약 상자(제목 상자 뒤 첫 한 칸 상자) 안 문단 — 줄 바꿈을 넣지 않는 곳(style-guide). 없으면 빈 묶음."""
         paras = self.paras()

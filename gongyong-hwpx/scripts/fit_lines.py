@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """줄 맞춤(Fitter의 일부): 자간으로 끝 줄 당기기·빈칸 큰 줄 넓히기·화살표·연결어·끝 줄 내리기."""
 from fit_base import *  # noqa: F401,F403 — 상수·공통 함수(HWPUNIT_PER_MM, T, re, copy …)
+from hwpx_lib import edit_run_text, plain_run  # noqa: E402
+from layout import FW_EM  # noqa: E402
 
 
 class LineFit:
@@ -51,17 +53,111 @@ class LineFit:
         if done:
             self.notes.append(f"마지막 줄에 짧은 낱말만 남던 문단 {len(done)}개는 자간을 조금 줄여"
                               f"({pct_range(done)}) 한 줄을 줄였습니다.")
+        self.fit_quotes()
         self.widen_sparse()
 
+    @staticmethod
+    def _orphan(cs, ls):
+        """마지막 줄에 짧은 낱말 하나만 남는가."""
+        s, e, used, _ = ls[-1]
+        return (len(ls) > 1 and used < ls[0][3] * SHORT_LAST
+                and len("".join(c[0] for c in cs[s:e]).split()) <= 1)
+
+    @staticmethod
+    def _quote_score(cs, ls):
+        """끝 줄을 뺀 줄들 가운데 가장 덜 찬 줄의 채움 비율(한 줄이면 1.0). 줄 바꿈으로 끝나는 줄은 한글이 벌리지 않아 뺀다."""
+        fills = [used / avail for _, e, used, avail in ls[:-1]
+                 if avail and "\n" not in (cs[e - 1][0] if e else "", cs[e][0] if e < len(cs) else "")]
+        return min(fills) if fills else 1.0
+
+    def _quote_hang(self, p):
+        """조문 상자의 항·호·목 번호 줄(①·1.·가. 등)은 왼쪽 끝에서 시작하고 둘째 줄을 기호 뒤 첫 글자 밑에(사용자 2026-11-10 견본 두 벌을 보고
+        '1번 내어쓰기'). 기호 뒤 보통 빈칸은 고정폭으로(양쪽 정렬에서 늘어나면 첫 줄 글 시작이 밀림 — 정돈과 같은 바꾸기). '제○조(…)' 줄은 그대로.
+        내어쓰기를 바꿨으면 True."""
+        k = len(split_marker(para_text(p))[0])
+        if not k:
+            return False
+        pos = 0
+        for r in para_runs(p):
+            t = run_text(r)
+            start, pos = pos, pos + len(t)
+            if start >= k:
+                break
+            if r.find(T("hp:t")) is None or not plain_run(r):
+                continue
+            face = self.st.char.get(r.get("charPrIDRef"), {}).get("font")
+            fw = FW * max(1, round(self.lay.m.em(face, " ") / FW_EM))
+            cut = min(len(t), k - start)
+            new = t[:cut].replace(" ", fw) + t[cut:]
+            if new != t:
+                edit_run_text(r, new, self.b.tab_proto)
+        k = len(split_marker(para_text(p))[0])
+        hang = sum(c[1] for c in self.lay.chars(p)[:k])
+        pp = self.st.para.get(p.get("paraPrIDRef"), {})
+        if abs(-pp.get("intent", 0) - hang) <= 1:
+            return False
+        # 왼쪽 여백은 그대로 — 계획에서 앞 빈칸으로 들여 쓴 호 줄('  1. …')은 만들기 끝에 그 빈칸이 여백으로 옮겨짐(one_space).
+        # 표 칸 글머리표 규칙의 1.5mm 띄움은 조문 상자에 걸지 않으므로(_bullet_cells) 견본 여백(0)에서 시작
+        p.set("paraPrIDRef", self.b.hedit.para_hang(p.get("paraPrIDRef"), hang))
+        return True
+
+    def fit_quotes(self):
+        """제목 걸친 상자(조문 발췌) 안 인용 글은 양쪽 정렬이라, 줄이 덜 차면 그만큼 낱말 사이가 벌어진다(사용자 2026-11-10 '조문 상자 안의
+        끝도 양끝이 맞아야 한다. 글자 간격을 줄이거나 늘려서. 이 그림에서 「예산안을」은 올릴 수 있었다'). 인용 글이라 줄 바꿈을 넣거나
+        낱말을 빼지 않고 자간만 바꾼다 — 자간을 하한(FLOOR)~상한(WIDEN_MAX)으로 바꿔 보며 끝 줄을 뺀 줄 가운데 가장 덜 찬 줄을 잰다.
+        그 줄이 이미 97%(PULL) 차면 그대로, 아니면 97%에 닿는 값 가운데 가장 덜 바꾸는 값, 닿는 값이 없으면 가장 많이 차는 값
+        (0.5%p 안이면 덜 바꾸는 값). 끝 줄에 외톨이 낱말이 새로 생기는 값은 뺀다. 되풀이해도 같다(지금 값이 늘 후보)."""
+        done, hung = [], 0
+        for p, box_w in self.quote_boxes():
+            if not self.checked(p) or self.st.para.get(p.get("paraPrIDRef"), {}).get("align") not in ("JUSTIFY", "DISTRIBUTE"):
+                continue
+            hung += self._quote_hang(p)  # 줄 나눔이 바뀌므로 자간을 재기 전에
+            chs, lines = self.lay.para_lines(p, box_w)
+            if not lines:
+                continue
+            was_orphan = self._orphan(chs, lines)
+            cur = self._content_spacing(p)
+            # 조문 글은 '② ' '1. '까지 한 조각이라, 머리 조각을 떼지 않으면 자간이 하나도 안 바뀜(머리 뒤 조각만 바꾸는 규칙) —
+            # 떼어 본 사본으로 재고, 바꿀 때만 원본을 뗀다
+            head = head_length(para_text(p))
+            q = copy.deepcopy(p)
+            if head:
+                self.b._split_run_at(q, head)
+            scored = []
+            for d in range(FLOOR - cur, WIDEN_MAX - cur + 1):
+                c2, l2 = self.lay.para_lines(q, box_w, delta=d, shrink=SLACK, floor=FLOOR)
+                if not l2 or len(l2) > len(lines) or (self._orphan(c2, l2) and not was_orphan):
+                    continue  # 줄 수는 늘리지 않음(정돈 quote_fit과 같은 셈)
+                scored.append((self._quote_score(c2, l2), d))
+            if not scored:
+                continue
+            # 목표는 줄마다 PULL(97%) — 이미 차 있으면 그대로, 못 미치면 닿는 값 가운데 가장 덜 바꾸는 값, 끝내 못 닿으면 가장 많이 차는
+            # 값(0.5%p 안이면 덜 바꾸는 값). '가장 많이 차는 값'만 고르면 98% 찬 문단도 0.5%p를 더 채우려 -18%로 조였음(시안 회귀 bsc)
+            top = max(s for s, _ in scored)
+            goal = min(top, PULL) - 0.005
+            d = min((d for s, d in scored if s >= goal), key=lambda v: (abs(v), v))
+            if d:
+                if head:
+                    self.b._split_run_at(p, head)
+                self.set_delta(p, d)
+                done.append(self._content_spacing(p))
+        if done:
+            span = pct_range(done) if min(done) * max(done) >= 0 else f"{min(done):+d}~{max(done):+d}%"
+            self.notes.append(f"제목 걸친 상자(조문 발췌) 안 글 {len(done)}문단은 양쪽 정렬로 두고 자간을 바꿔({span}) "
+                              "줄마다 끝선까지 고르게 채웠습니다(인용 글·줄 바꿈은 그대로).")
+        if hung:
+            self.notes.append(f"제목 걸친 상자(조문 발췌)의 항·호 번호 줄 {hung}개는 왼쪽 끝에서 시작하고 둘째 줄을 기호 뒤 첫 글자 밑에 맞췄습니다.")
+
     def fill_ends(self):
-        """끝선에 조금 못 미친 한 줄·끝 줄을 자간으로 끝선에(fill_last_line, 정돈과 같음). □ 제목·줄 바꿈·탭 문단은 그대로(로마자 번호 줄은 채움)."""
+        """끝선에 조금 못 미친 한 줄·끝 줄을 자간으로 끝선에(fill_last_line, 정돈과 같음). □ 제목·줄 바꿈·탭 문단은 그대로(로마자 번호 줄은 채움).
+        제목 걸친 상자(조문 발췌) 안 인용 글도 대상(fit_quotes 뒤 끝 줄, 사용자 2026-11-10)."""
         got = []
 
         def split(q, k):
             self.b._split_run_at(q, k)
             return True
 
-        for p, box_w in self.text_boxes():
+        for p, box_w in self.text_boxes() + self.quote_boxes():
             text = para_text(p)
             box = marker_level(text) == 1 and split_marker(text)[1][:1] in "□■◇◆"  # □ 제목은 그대로, 로마자 번호 줄은 채움
             if "\n" in text or "\t" in text or box or not self.checked(p):

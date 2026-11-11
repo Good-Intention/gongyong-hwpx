@@ -482,7 +482,9 @@ class PageFit:
         1) 참고 표 줄 높이를 글에 맞춰 줄인다(글자 높이 + 2.5mm까지) — 한 장에 들어갈 여지를 만든다.
         2) 참고 머리표·□ 제목에서 시작하는 덩어리(제목 + 표 + ※)를 차례로 쪽에 담는다: 앞 덩어리와 한 쪽에 다 들어가면
            쪽 나눔을 빼고 빈 줄 하나를 두어 이어 붙이고(참고가 달라도), 안 들어가면 새 쪽에서 시작한다.
-        3) 덩어리가 다 들어간 쪽은 남는 높이를 그 쪽 표의 줄마다 똑같이 나눠 더해(줄마다 5mm까지) 쪽을 채운다."""
+        3) 덩어리가 다 들어간 쪽은 남는 높이를 그 쪽 표의 줄마다 똑같이 나눠 더해(줄마다 5mm까지) 쪽을 채운다.
+        자료 표가 없어도(조문 상자 + 글만인 참고) 2)는 한다 — 1)·3)만 표가 있을 때(사용자 2026-11-10 '참고 2개가 한 페이지에 들어가면
+        한 페이지에 두 개 다 넣어도 된다'). 계획의 참고 머리표 page_break보다 앞선다."""
         paras = self.paras()
         start = next((i for i, p in enumerate(paras) if self._is_ref_head(p)), None)
         if start is None:
@@ -509,9 +511,7 @@ class PageFit:
             while len(body) > 1 and self._blank(body[-1]):
                 tail.insert(0, body.pop())
             ch["body"], ch["tail"] = body, tail
-        tables = [t for p in region for t in para_tables(p) if self._is_data_table(t)]
-        if not tables:
-            return
+        tables = [t for p in region for t in para_tables(p) if self._is_data_table(t)]  # 없어도 2) 쪽에 담기는 함
         heads_set = {ch["body"][0] for ch in chunks}
         for p in region:  # 덩어리 안에 force_breaks가 넣은 쪽 나눔은 다시 정한다
             if p in self.forced and p not in heads_set:
@@ -521,13 +521,33 @@ class PageFit:
             self._set_rows(t, [self._main_size(t) * 100 + ROW_PAD] * int(t.get("rowCnt", "1")))
         sp = self.b._block_spacer()
         sp_h = self.lay.para_height(self.b.protos[sp], self.body_w)[0] if sp is not None else 0
+        sizes = [self._block_height(ch["body"], lim) for ch in chunks]
+
+        def gap_before(k):
+            prev_tail = chunks[k - 1]["tail"]
+            return sum(self.lay.para_height(b, self.body_w)[0] for b in prev_tail) if prev_tail else sp_h
+
+        def whole_ref_fits(k, y):
+            """참고 머리표로 시작하는 덩어리 k: 그 참고 전체(다음 참고 머리표 앞까지)가 지금 쪽에 다 들어가는가 — 참고 하나가
+            앞 쪽 끝과 다음 쪽으로 갈라지지 않게(사용자 2026-11-10 '참고 2개가 한 페이지에 들어가면 한 페이지에')."""
+            for j in range(k, len(chunks)):
+                if j > k and self._is_ref_head(chunks[j]["body"][0]):
+                    break
+                if sizes[j][0] != 1:
+                    return False
+                y += gap_before(j) + sizes[j][1]
+                if y > lim:
+                    return False
+            return True
+
         pages = []  # 2) 쪽에 담기
         for k, ch in enumerate(chunks):
-            npg, last = self._block_height(ch["body"], lim)
+            npg, last = sizes[k]
             if npg == 1 and pages:
-                prev_tail = chunks[k - 1]["tail"]
-                gap = sum(self.lay.para_height(b, self.body_w)[0] for b in prev_tail) if prev_tail else sp_h
-                if pages[-1]["y"] + gap + last <= lim:
+                gap = gap_before(k)
+                if self._is_ref_head(ch["body"][0]) and not whole_ref_fits(k, pages[-1]["y"]):
+                    pass  # 새 참고가 다 들어가지 않으면 새 쪽에서
+                elif pages[-1]["y"] + gap + last <= lim:
                     pages[-1]["chunks"].append(k)
                     pages[-1]["y"] += gap + last
                     continue
@@ -543,10 +563,13 @@ class PageFit:
                             if b.getparent() is not None:
                                 b.getparent().remove(b)
                     continue
+                moved = head.get("pageBreak") == "1" or head in self.forced  # 쪽 나눔을 빼서 앞 쪽으로 올린 덩어리만 알림
                 head.set("pageBreak", "0")
                 self.forced.discard(head)
                 if not chunks[k - 1]["tail"] and sp is not None:
                     head.addprevious(self.b.clone(sp, "참고 쪽 빈 줄"))
+                if not moved:
+                    continue
                 if self._is_ref_head(head):
                     name = para_text(cell_paras(table_grid(para_tables(head)[0])[0][4])[0]).strip()
                 else:
@@ -558,6 +581,8 @@ class PageFit:
             # 앞 쪽에서 넘어온 긴 표(여러 쪽 덩어리)의 꼬리가 있는 쪽은 이 쪽에 다 들어간 덩어리의 표만 늘린다
             own = pg["chunks"][1:] if pg["split"] else pg["chunks"]
             tbls = [t for k in own for p in chunks[k]["body"] for t in para_tables(p) if self._is_data_table(t)]
+            if not tbls:
+                continue
             first = chunks[pg["chunks"][0]]["body"][0]
             last_p = chunks[pg["chunks"][-1]]["body"][-1]
             seg = allp[allp.index(first):allp.index(last_p) + 1]
@@ -565,7 +590,7 @@ class PageFit:
                 filled.append(f"{pi + 1}번째 참고 쪽 +{self._last_add / HWPUNIT_PER_MM:.1f}mm")
         msg = []
         if joined:
-            msg.append(f"작은 표가 있는 참고 덩어리 {len(joined)}개는 앞 덩어리와 한 쪽에 모았습니다("
+            msg.append(f"참고 덩어리 {len(joined)}개는 앞 덩어리와 한 쪽에 들어가 모았습니다("
                        + ", ".join(f"‘{t}’" for t in joined) + ")")
         if filled:
             msg.append("참고 쪽은 표 줄 높이를 글에 맞춘 뒤 남는 높이를 줄마다 나눠 쪽을 채웠습니다(" + ", ".join(filled) + ")")

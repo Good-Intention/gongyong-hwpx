@@ -135,7 +135,7 @@ class TableFit:
         (고르게 나눈 문단 수, 가운데점 뒤에서 나눈 수)."""
         balanced, dots = 0, 0
         grid = table_grid(tbl)
-        cap = self._caption_content(tbl, grid)  # 제목 걸친 상자의 인용문(조례 조문 등)은 줄을 채운 채 왼쪽 정렬(_box_left)
+        cap = self._caption_content(tbl, grid)  # 제목 걸친 상자의 인용문(조례 조문 등)은 줄을 나누지 않고 양쪽 정렬·자간으로 끝선에(_box_justify·fit_quotes)
         for r, c, rs, cs, tc in grid:
             if tc is cap:
                 continue
@@ -530,7 +530,10 @@ class TableFit:
         n = 0
         if tbl.get("rowCnt") == "1" and tbl.get("colCnt") == "1":
             return 0  # 한 칸 상자(요약·표지 개요 상자)의 □·○ 줄은 견본 문단 모양(내어쓰기) 그대로
+        cap = self._caption_content(tbl, table_grid(tbl))
         for tc in tbl.iter(T("hp:tc")):
+            if tc is cap:
+                continue  # 제목 걸친 상자(조문 발췌)의 ②·1. 줄은 왼쪽 끝에서 — 내어쓰기는 fit_quotes(사용자 2026-11-10 '왜 한칸 떠 있나요' → 답 '1번 내어쓰기')
             for cp in cell_paras(tc):
                 m = BULLET_RE.match(para_text(cp))
                 if not m:
@@ -826,17 +829,19 @@ class TableFit:
             cp.getparent().remove(cp)
         return len(empty)
 
-    def _box_left(self, tbl, grid):
-        """제목 걸친 상자 본문 칸 글(법령 조문 등 인용)은 왼쪽 정렬: 글을 고칠 수 없는 인용이라 양쪽 정렬로 낱말 사이가
-        벌어지지 않게(맑은 고딕은 어림 폭이 한글과 조금 달라 자간 당기기로는 못 맞춤, 2026-11-01 실측). 바꾼 문단 수."""
+    def _box_justify(self, tbl, grid):
+        """제목 걸친 상자 본문 칸 글(법령 조문 등 인용)은 양쪽 정렬 — 끝선은 줄 맞춤이 자간으로 맞춘다(fit_quotes, 사용자 2026-11-10
+        '조문 상자 안의 끝도 양끝이 맞아야 한다. 글자 간격을 줄이거나 늘려서'). 옛 판(2026-11-01)은 맑은 고딕 어림이 한글과 달라
+        왼쪽 정렬로 바꿨으나, 그 뒤 맑은 고딕 빈칸 폭을 바로잡아 한글 대조 글꼴(font_widths.json _한글대조)이 됐다.
+        견본이 왼쪽·가운데 정렬인 문단만 바꾼다. 바꾼 문단 수."""
         cap = self._caption_content(tbl, grid)
         if cap is None:
             return 0
         n = 0
         for cp in cell_paras(cap):
             pid = cp.get("paraPrIDRef")
-            if para_text(cp).strip() and self.st.para.get(pid, {}).get("align") in ("JUSTIFY", "DISTRIBUTE"):
-                cp.set("paraPrIDRef", self.b.hedit.para_align(pid, "LEFT"))
+            if para_text(cp).strip() and self.st.para.get(pid, {}).get("align") in ("LEFT", "CENTER"):
+                cp.set("paraPrIDRef", self.b.hedit.para_align(pid, "JUSTIFY"))
                 n += 1
         return n
 
@@ -1182,7 +1187,7 @@ class TableFit:
                 bal, dot = self._balance_breaks(tbl)
                 balanced += bal
                 dot_breaks += dot
-                boxes_left += self._box_left(tbl, table_grid(tbl))  # 줄 균형(가운데·왼쪽 정렬 글만) 뒤에
+                boxes_left += self._box_justify(tbl, table_grid(tbl))  # 줄 균형(가운데·왼쪽 정렬 글만, 인용 칸은 뺌) 뒤에
                 units += self._fit_unit(p, self._main_size(tbl))
                 titles += self._fit_title(p, tbl, self._main_size(tbl))
                 g = self._note_gap(p, tbl)
@@ -1232,7 +1237,7 @@ class TableFit:
         if images:
             msg.append(f"배경 그림이 든 표 {images}개는 칸 너비·줄 높이를 그림 비율에 맞췄습니다(한 줄에 그림이 여럿이면 높이가 같게)")
         if boxes_left:
-            msg.append(f"제목 걸친 상자 안 글 {boxes_left}문단은 왼쪽 정렬로 했습니다(인용 글 낱말 사이가 벌어지지 않게)")
+            msg.append(f"제목 걸친 상자 안 글 {boxes_left}문단은 양쪽 정렬로 했습니다(끝선은 자간으로 맞춤)")
         if box_blanks:
             msg.append(f"제목 걸친 상자(조문 발췌 등) 안 빈 줄 {box_blanks}개를 뺐습니다")
         if notes:

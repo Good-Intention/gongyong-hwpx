@@ -40,6 +40,7 @@ from layout import FIT_FLOOR, FW_EM, Layout, Metrics, spacing_after  # noqa: E40
 from spaces import compact_fw, lead_to_margin  # noqa: E402
 from build_base import DATE_LINE_RE, SKILL_VERSION, read_doc_meta  # noqa: E402
 from fit_base import CONNECTORS, fill_last_line  # noqa: E402
+from fit_tables import TableFit  # noqa: E402 — 제목 걸친 상자 찾기(_caption_content)를 작성 모드와 같게
 
 FW = "⎵"  # 고정폭 빈칸(1/4 글자, 양쪽 정렬 때 늘어나지 않음)
 O_GAP_DEFAULT = 600  # ○ 위 간격 기본(6pt) — 문서에 ○ 위 간격을 쓴 곳이 없을 때(기본 양식 값)
@@ -112,8 +113,13 @@ def flat(text):
 
 
 class Tidier:
-    def __init__(self, path, keep_o=True, gaps=None, blank_mm=None, all_rules=False, gap_cap=None, no_lines=False, no_indent=False):
+    def __init__(self, path, keep_o=True, gaps=None, blank_mm=None, all_rules=False, gap_cap=None, no_lines=False, no_indent=False,
+                 hang_at=None):
         self.path = path
+        # 둘째 줄 기준을 사용자가 밝힘(--hang-at): '기호'(머리 기호 뒤 첫 글자) 또는 '이름표'(이름표·쌍점 뒤, 없으면 기호 뒤).
+        # 밝히면 기존 내어쓰기의 0.4글자 허용 없이 그 자리에 정확히, 한 줄 문단에도 같은 값(사용자 2026-11-10)
+        self.hang_at = hang_at
+        self._hang_log, self._hang_skip = [], {}  # 맞추거나 둔 문단(끝에 다시 대조), 기준을 밝혔을 때 못 맞춘 문단 → 까닭
         # 쪽 상한(--max-pages)을 맞출 때: ○ 위 간격 상한(0이면 넣지 않음), 표 칸 줄 간격 넓히기·○ 들이기 끄기
         self.gap_cap, self.no_lines, self.no_indent = gap_cap, no_lines, no_indent
         self.doc_changes = []  # 문단이 아닌 문서 설정을 바꾼 것
@@ -144,6 +150,8 @@ class Tidier:
         self.orig_marks = {p: text_marks(p) for p in self.all_paras()}
         self.eol_ok = set()  # 끝 줄 균형으로 빈칸 ↔ 줄 바꿈을 바꾼 문단(글자 비교에서 그 바꿈만 허용)
         self.page_of = self._orig_pages()
+        # 제목 걸친 상자(조문 발췌 등) 안 인용 글 — 자간·양쪽 정렬만(quote_fit), 줄 바꿈 넣기·빈칸 당기기·끝 줄 내리기는 걸지 않음(작성 모드와 같게)
+        self._quote_ps = {cp for tc, _ in self._quote_cells() for cp in cell_paras(tc)}
         self.host = {cp: p for p in self.body if para_tables(p) for cp in p.iter(T("hp:p")) if cp is not p}  # 표 칸 문단 → 표가 든 본문 문단
         self.host_pages = self._host_pages()
         # 이 스킬의 작성 모드로 만든 문서(content.hpf 표시 made=판) — 작성 규칙이 맞춘 내어쓰기(낫표 당김·화살표 줄 포함)·
@@ -475,39 +483,74 @@ class Tidier:
         pre, mark, t = self.split(text)
         return {k for k in (len(pre) if mark else 0, 0 if self._fake(t, pre) else label_content(t), label_colon(t)) if k}
 
+    @staticmethod
+    def _em_at(chs, k):
+        """허용치를 잴 글자 폭: k번째 글자부터 폭이 있는 첫 글자(줄 바꿈은 폭 0이라 건너뜀 — '·↵안전PC'에서 허용치가 0이 되어 0.01mm 차이로도
+        두 번째 정돈마다 다시 맞추던 것, 2026-11-10). 없으면 1000."""
+        return next((c[1] for c in chs[k:] if c[1] > 0), 1000)
+
+    def _hang_at(self, p, box_w, in_cell):
+        """둘째 줄을 맞출 글자 위치를 재는 함수 — 기준을 '기호'로 밝히면 머리 기호 뒤 첫 글자만(이름표·쌍점 뒤를 대신 인정하지 않음)."""
+        if self.hang_at == "기호":
+            return lambda x: len(self.split(x)[0])
+        return (lambda x: self._cell_head_at(p, x, box_w)) if in_cell else self.head_at
+
     def _hang_one(self, p, box_w, in_cell=False):
-        """문단 하나의 둘째 줄을 맞춘다. 돌려주는 것: 'done'·'indent'(첫 줄 들여쓰기를 바꿔 맞춤)·'break'(줄 바꿈 문단)·None."""
+        """문단 하나의 둘째 줄을 맞춘다. 돌려주는 것: 'done'·'indent'(첫 줄 들여쓰기를 바꿔 맞춤)·'fw'(머리 빈칸만 고정폭으로, 내어쓰기는 그대로)·
+        'break'(줄 바꿈 문단)·'tab'·'grew'·None. 기준을 밝히면(self.hang_at) 0.4글자 허용 없이 그 자리에 정확히, 한 줄 문단에도 걸어 두고
+        (나중에 글이 늘어도 맞게), 맞추지 못한 문단은 까닭을 _hang_skip에 남긴다(사용자 2026-11-10)."""
         text = para_text(p)
         lv = self.level(text)
-        at = (lambda x: self._cell_head_at(p, x, box_w)) if in_cell else self.head_at
+        strict = self.hang_at
+        at = self._hang_at(p, box_w, in_cell)
         k = at(text)
         if not k or (lv == 1 and not in_cell and not self._is_number(text)) or k >= len(text):
             return None  # 본문 □ 제목은 양식이 맡음 — 표 칸의 □·■(체크 칸 항목 등)와 로마자 번호 줄은 둘째 줄을 글자 첫머리에
         pp = self.styles.para.get(p.get("paraPrIDRef"), {})
         if pp.get("align") in ("CENTER", "RIGHT"):
             return None
+        indent = max(0, pp.get("intent", 0))  # 첫 줄 들여쓰기(양수)
+        cur = -pp.get("intent", 0) if not indent else 0
+        chs, lines0 = self.lay.para_lines(p, box_w)
+
+        def near(cs, j):
+            """지금 내어쓰기가 글자 위치 j(머리 폭)와 0.4글자 안인가 — 작성자가 한글에서 눈으로 맞춘 값은 어림과 1mm쯤 다를 수 있다
+            (사용자 원고: 23.2~23.7mm, 어림 22.7mm)."""
+            return cur > 0 and abs(cur - sum(c[1] for c in cs[:j])) <= 0.4 * self._em_at(cs, j)
+
         if self.made and pp.get("intent", 0) < 0:
-            return None  # 작성 모드가 이미 내어쓰기를 맞춘 문단(낫표 당김·화살표 줄 등 작성 규칙의 자리) — 그대로
+            # 작성 모드가 이미 내어쓰기를 맞춘 문단(낫표 당김·화살표 줄 등 작성 규칙의 자리) — 그대로. 기준을 밝히면 기호·이름표·쌍점 자리에
+            # 맞춰 둔 문단만 그 기준으로 다시 맞추고, 그 밖의 자리(화살표 뒤 등)는 작성 규칙이라 그대로 두고 알림
+            if not strict:
+                return None
+            if not any(near(chs, j) for j in self.aligned_spots(text)):
+                self._hang_skip[p] = "작성 규칙이 맞춘 자리(화살표 뒤 등)"
+                return None
         if re.search(r"\n[ ⎵⍽　]+", text):
             # 줄 바꿈(Shift+Enter) 뒤 빈칸으로 둘째 줄을 맞춘 문단 — 내어쓰기를 걸면 빈칸만큼 두 번 들어감. 글을 바꿔야 해서 그대로.
             # (줄 바꿈 뒤가 바로 글이면 한글은 그 줄도 둘째 줄로 내어쓰므로 아래에서 보통대로 맞춤 — 실험: 작성 도구가 끝 줄
             # 균형으로 넣은 줄 바꿈을 건너뛰어 '보강, 산책로 정비'가 왼쪽 끝에 남았음)
+            if strict:
+                self._hang_skip[p] = "줄 바꿈(Shift+Enter) 뒤 빈칸으로 둘째 줄을 맞춘 문단(글을 바꿔야 함)"
             return "break"
-        if self.lines_of(p, box_w) < 2 and not self.near_wrap(p, box_w):
+        if not strict and self.lines_of(p, box_w) < 2 and not self.near_wrap(p, box_w):
             return None
         if "\t" in text[:k]:
             # 머리 기호 뒤를 탭으로 띄운 문단 — 탭이 닿는 자리는 문서의 기본 탭 간격·내어쓰기 자동 탭에 따라 달라 어림하면
             # 오히려 어긋남(실험: 둘째 줄이 2~7mm 어긋나거나 쌍점 항목은 내어쓰기를 못 함). 그대로 두고 알림
+            if strict:
+                self._hang_skip[p] = "머리 기호 뒤를 탭으로 띄운 문단(탭 자리는 문서 설정마다 달라 어림하지 않음)"
             return "tab"
-        indent = max(0, pp.get("intent", 0))  # 첫 줄 들여쓰기(양수)
-        cur = -pp.get("intent", 0) if not indent else 0
-        chs, lines0 = self.lay.para_lines(p, box_w)
         n0 = len(lines0)
-        # 작성자가 한글에서 눈으로 맞춘 값은 어림과 1mm쯤 다를 수 있다(사용자 원고: 23.2~23.7mm, 어림 22.7mm) — 0.4글자 안이면 그대로
-        if cur > 0 and any(abs(cur - sum(c[1] for c in chs[:j])) <= 0.4 * (chs[j][1] if j < len(chs) else 1000)
-                           for j in self.aligned_spots(text)):
+        # 양쪽 정렬이면 머리(기호·이름표 앞뒤)의 보통 빈칸이 늘어나 첫 줄 글 시작이 밀린다 — 그런 빈칸이 남아 있으면 내어쓰기가 허용치 안이어도
+        # '이미 맞춤'으로 보지 않고 먼저 고정폭 빈칸으로 바꾼 뒤 판단(사용자 2026-11-10 구동안내서: ○ 13.20pt·- 7.60pt 내어쓰기가 계산 폭
+        # 14.55·8.83pt와 허용치 안이라 건너뛰어, 기호 뒤 보통 빈칸이 양쪽 정렬로 늘어남)
+        stretchy = " " in text[:k] and pp.get("align") in ("JUSTIFY", "DISTRIBUTE", None)
+        if not strict and not stretchy and any(near(chs, j) for j in self.aligned_spots(text)):
             return None  # 작성자가 이미 머리 기호·이름표·쌍점 뒤에 맞춰 둔 문단
         if sum(c[1] for c in chs[:k]) + indent > box_w * HANG_MAX:
+            if strict:
+                self._hang_skip[p] = f"머리(이름표)가 본문 폭의 {HANG_MAX:.0%}를 넘어 내어쓰면 글 자리가 너무 좁음"
             return None
         pid0 = p.get("paraPrIDRef")
         state0 = self._runs_state(p)
@@ -528,6 +571,7 @@ class Tidier:
             return True
 
         # 머리 기호 앞뒤 보통 빈칸을 고정폭 빈칸으로(첫 줄이 양쪽 정렬로 늘어나도 내용 시작 자리가 그대로)
+        text0 = text
         pos = 0
         for r in para_runs(p):
             t = run_text(r)
@@ -540,16 +584,31 @@ class Tidier:
                 edit_run_text(r, new, self.tab_proto)
         text = para_text(p)
         k = at(text)
+        if stretchy and " " in text[:k]:
+            # 형광펜 등 표시가 있는 조각이라 바꾸지 못한 빈칸 — 양쪽 정렬에서 늘어날 수 있어 '맞춤'으로 볼 수 없음
+            self._restore_runs(p, state0)
+            self._hang_skip[p] = "머리 빈칸이 표시(형광펜 등) 조각 안이라 고정폭으로 바꾸지 못함 — 양쪽 정렬에서 늘어날 수 있음"
+            return None
+        converted = text != text0
         kind = "머리 기호" if k == len(self.split(text)[0]) else self.head_kind(text)
         chs, _ = self.lay.para_lines(p, box_w)
         hang = sum(c[1] for c in chs[:k])
-        em = chs[k][1] if k < len(chs) else 1000
+        em = self._em_at(chs, k)
+        fw_note = "머리 기호 뒤 빈칸을 고정폭으로(양쪽 정렬에서 늘어나지 않게"
+        if not strict and not indent and converted and any(near(chs, j) for j in self.aligned_spots(text)):
+            # 빈칸을 고정폭으로 바꾼 뒤에도 작성자 내어쓰기가 허용치 안 — 내어쓰기는 그대로(작성자 서식), 빈칸만 바꿈
+            if grew():
+                return "grew"
+            self.mark(p, fw_note + ", 내어쓰기는 그대로)")
+            self._hang_log.append((p, box_w, in_cell, "kept"))
+            return "fw"
         if indent:
             # 첫 줄 들여쓰기 Y → 왼쪽 여백을 Y만큼 늘리고 내어쓰기로(첫 줄 자리는 그대로, 둘째 줄은 내용 첫 글자 밑)
             pid = self.hedit.para_margin(p.get("paraPrIDRef"), "left", pp.get("left", 0) + indent)
             p.set("paraPrIDRef", self.hedit.para_hang(pid, hang))
             if grew():
                 return "grew"
+            self._hang_log.append((p, box_w, in_cell, "set"))
             if p in getattr(self, "_lead_moved", ()):
                 # 줄머리 빈칸을 옮기며 생긴 첫 줄 들여쓰기 — 작성자가 둔 들여쓰기가 아님
                 self.mark(p, f"둘째 줄을 {kind} 뒤 첫 글자에(내어쓰기 {hang / HWPUNIT_PER_MM:.1f}mm)")
@@ -558,13 +617,149 @@ class Tidier:
                          f"(내어쓰기 {hang / HWPUNIT_PER_MM:.1f}mm)")
             return "indent"
         if abs(cur - hang) <= 0.05 * em:
-            return None
+            self._hang_log.append((p, box_w, in_cell, "set"))
+            if not converted:
+                return None
+            if grew():
+                return "grew"
+            self.mark(p, fw_note + ")")
+            return "fw"
         p.set("paraPrIDRef", self.hedit.para_hang(p.get("paraPrIDRef"), hang))
         if grew():
             return "grew"
+        self._hang_log.append((p, box_w, in_cell, "set"))
         self.mark(p, f"둘째 줄을 {kind} 뒤 첫 글자에"
                      f"(내어쓰기 {cur / HWPUNIT_PER_MM:.1f} → {hang / HWPUNIT_PER_MM:.1f}mm)")
         return "done"
+
+    def _where(self, p):
+        """문단 자리 글('3쪽'·'2쪽 표 칸') — 알림용(쪽은 원본 기준)."""
+        host = self.host.get(p)
+        return f"{self.host_pages.get(host, '?쪽')} 표 칸" if host is not None else f"{self.page_of.get(p) or '?'}쪽"
+
+    def hang_verify(self):
+        """정돈 끝(빈칸 정리·폭 손질 뒤 최종 상태)에 둘째 줄을 맞춘 문단의 내어쓰기를 기준 자리와 다시 대조한다 — 어긋나면 다시 맞추고,
+        그러면 줄이 늘어나는 문단은 그대로 두고 알린다(사용자 2026-11-10). 작성자 내어쓰기를 허용치 안이라 둔 문단('kept')은 대조하지 않음."""
+        fixed, stuck, checked = [], [], 0
+        seen = set()
+        for p, w, in_cell, how in self._hang_log:
+            if p in seen or how != "set" or p.getparent() is None:
+                continue
+            seen.add(p)
+            text = para_text(p)
+            k = self._hang_at(p, w, in_cell)(text)
+            if not k or k >= len(text):
+                continue
+            chs = self.lay.chars(p)
+            hang = sum(c[1] for c in chs[:k])
+            em = self._em_at(chs, k)
+            pid0 = p.get("paraPrIDRef")
+            cur = -self.styles.para.get(pid0, {}).get("intent", 0)
+            checked += 1
+            if abs(cur - hang) <= 0.05 * em:
+                continue
+            n0 = len(self.lay.para_lines(p, w)[1])
+            p.set("paraPrIDRef", self.hedit.para_hang(pid0, hang))
+            if len(self.lay.para_lines(p, w)[1]) > n0:
+                p.set("paraPrIDRef", pid0)
+                stuck.append(p)
+                continue
+            self.mark(p, f"끝에 다시 대조해 내어쓰기 {cur / HWPUNIT_PER_MM:.1f} → {hang / HWPUNIT_PER_MM:.1f}mm")
+            fixed.append(p)
+        if fixed:
+            self.notes.append(f"정돈 끝에 둘째 줄 자리를 다시 대조해 어긋난 문단 {len(fixed)}개를 다시 맞췄습니다(앞 단계의 빈칸·폭 손질로 머리 폭이 바뀜).")
+        if stuck:
+            self.notes.append(f"정돈 끝에 다시 대조했더니 둘째 줄 자리가 어긋난 문단 {len(stuck)}개 — 다시 맞추면 줄이 늘어나 그대로 두었습니다: "
+                              + ", ".join(f"‘{self.name(p)}…’({self._where(p)})" for p in stuck[:5]))
+        if self.hang_at and checked and not fixed and not stuck:
+            self.notes.append(f"정돈 끝에 둘째 줄을 맞춘 문단 {checked}개를 다시 대조했습니다 — 모두 기준 자리와 같음(도구 어림, 한글 화면은 따로 확인).")
+
+    def _quote_cells(self):
+        """제목 걸친 상자(조문 발췌 등) 본문 칸마다 (칸, 칸 안쪽 폭) — 작성 모드 fit.quote_boxes와 같은 칸."""
+        out = []
+        for sec in self.secs:
+            for tbl in sec.iter(T("hp:tbl")):
+                cap = TableFit._caption_content(tbl, table_grid(tbl))
+                w = next((w for tc, w, _ in self._cells(tbl) if tc is cap), 0) if cap is not None else 0
+                if w > 0:
+                    out.append((cap, w))
+        return out
+
+    @staticmethod
+    def _quote_orphan(cs, ls):
+        """마지막 줄에 짧은 낱말 하나만 남는가(작성 모드 fit_lines._orphan과 같은 셈)."""
+        s, e, used, _ = ls[-1]
+        return len(ls) > 1 and used < ls[0][3] * 0.25 and len("".join(c[0] for c in cs[s:e]).split()) <= 1
+
+    def _quote_score(self, cs, ls):
+        """끝 줄을 뺀 줄 가운데 가장 덜 찬 줄의 채움(한 줄이면 1.0) — 줄 바꿈으로 끝나는 줄은 한글이 벌리지 않아 뺀다."""
+        fills = [used / avail for _, e, used, avail in ls[:-1] if avail and self._ends_break(cs, e) is None]
+        return min(fills) if fills else 1.0
+
+    def quote_align(self):
+        """조문 상자 인용 글의 왼쪽·가운데 정렬을 양쪽 정렬로 — 둘째 줄 맞춤(hangs)보다 먼저 해야 그 단계가 양쪽 정렬에서 늘어나는 머리 빈칸을
+        고정폭으로 바꾼다(나중에 바꾸면 두 번째 정돈에서야 바뀜 — 105쪽 예산 문서 시험 2026-11-10). 자간은 quote_fit이 나중에."""
+        self._quote_aligned = 0
+        for tc, _ in self._quote_cells():
+            for p in cell_paras(tc):
+                text = para_text(p)
+                if para_tables(p) or para_pics(p) or not text.strip() or "\t" in text or not self.fonts_ok(p):
+                    continue
+                pid = p.get("paraPrIDRef")
+                if self.styles.para.get(pid, {}).get("align") in ("LEFT", "CENTER"):
+                    p.set("paraPrIDRef", self.hedit.para_align(pid, "JUSTIFY"))
+                    self.mark(p, "조문 상자 글을 양쪽 정렬로(끝선은 자간으로)")
+                    self._quote_aligned += 1
+
+    def quote_fit(self):
+        """제목 걸친 상자(조문 발췌 등) 안 인용 글은 양쪽 정렬로 두고 자간만 바꿔 줄마다 끝선까지 고르게 — 작성 모드 fit_quotes와 같은 셈
+        (사용자 2026-11-10 '조문 상자 안의 끝도 양끝이 맞아야 한다. 글자 간격을 줄이거나 늘려서', 정돈에도 같은 규칙 — 답 '1').
+        자간을 -18~+5%로 바꿔 보며 끝 줄을 뺀 줄 가운데 가장 덜 찬 줄이 97%(PULL)에 닿는 값 가운데 가장 덜 바꾸는 값, 못 닿으면 가장 많이 차는 값.
+        줄 수는 늘리지 않고, 끝 줄에 외톨이 낱말이 새로 생기는 값은 뺀다. 인용 글이라 줄 바꿈 넣기·빈칸 당기기·끝 줄 내리기는 걸지 않는다
+        (sparse_lines·short_lines·connector_lines·fill_broken에서 뺌). 낱말 사이가 조금 벌어지는 줄도 양쪽 정렬 그대로(사용자 2026-11-10 '이대로 두기')."""
+        aligned, spaced = getattr(self, "_quote_aligned", 0), []
+        for tc, w in self._quote_cells():
+            for p in cell_paras(tc):
+                text = para_text(p)
+                if para_tables(p) or para_pics(p) or not text.strip() or "\t" in text or not self.fonts_ok(p):
+                    continue
+                if self.styles.para.get(p.get("paraPrIDRef"), {}).get("align") not in ("JUSTIFY", "DISTRIBUTE"):
+                    continue
+                chs, lines = self.lay.para_lines(p, w)
+                if not lines:
+                    continue
+                n0, was = len(lines), self._quote_orphan(chs, lines)
+                cur = self._content_spacing(p)
+                head = self.head_len(text)
+                q = copy.deepcopy(p)  # '② '·'1. '까지 한 조각인 조문은 머리를 떼야 자간이 바뀜 — 사본으로 재고, 바꿀 때만 원본을 뗌
+                if head and not self._split_at(q, head):
+                    continue
+                scored = []
+                for d in range(FIT_FLOOR - cur, WIDEN_MAX - cur + 1):
+                    c2, l2 = self.lay.para_lines(q, w, delta=d, shrink=SLACK)
+                    if not l2 or len(l2) > n0 or (self._quote_orphan(c2, l2) and not was):
+                        continue
+                    scored.append((self._quote_score(c2, l2), d))
+                if not scored:
+                    continue
+                top = max(s for s, _ in scored)
+                d = min((d for s, d in scored if s >= min(top, PULL) - 0.005), key=lambda v: (abs(v), v))
+                if not d:
+                    continue
+                state = self._runs_state(p)
+                if head and not self._split_at(p, head):
+                    continue
+                old = self._set_delta(self._content_runs(p, head, len(para_text(p))), d)
+                if not old or len(self.lay.para_lines(p, w)[1]) > n0:
+                    self._undo(old)
+                    self._restore_runs(p, state)
+                    continue
+                spaced.append(d)
+                self.mark(p, f"조문 상자 글 자간 {d:+d}%로 줄마다 끝선까지 고르게")
+        if aligned or spaced:
+            span = f"자간을 바꿔({pct_range(spaced) if min(spaced) * max(spaced) >= 0 else f'{min(spaced):+d}~{max(spaced):+d}%'}) " if spaced else ""
+            self.notes.append(f"제목 걸친 상자(조문 발췌 등) 안 글을 양쪽 정렬로 두고({aligned}문단 바꿈) {span}줄마다 끝선까지 고르게 채웠습니다"
+                              f"{f'({len(spaced)}문단)' if spaced else ''} — 인용 글·줄 바꿈은 그대로.")
 
     def hangs(self):
         got = Counter()
@@ -584,14 +779,27 @@ class Tidier:
                             continue
                         cells[self._hang_one(cp, w, in_cell=True)] += 1
         n = got["done"] + got["indent"]
+        spot = {"기호": "머리 기호 뒤", "이름표": "이름표·쌍점(없으면 머리 기호) 뒤"}.get(self.hang_at, "이름표·쌍점·머리 기호 뒤")
+        lines = "머리 기호 문단(한 줄 문단 포함 — 고르신 기준)" if self.hang_at else "두 줄 이상인 머리 기호 문단"
         if n:
-            self.notes.append(f"두 줄 이상인 머리 기호 문단 {n}개의 둘째 줄을 이름표·쌍점·머리 기호 뒤 첫 글자에 맞췄습니다"
+            self.notes.append(f"{lines} {n}개의 둘째 줄을 {spot} 첫 글자에 맞췄습니다"
                               + (f"(첫 줄 들여쓰기를 왼쪽 여백으로 옮긴 것 {got['indent']}개)" if got["indent"] else "") + ".")
         c = cells["done"] + cells["indent"]
         if c:
-            self.notes.append(f"표 칸 안 두 줄 이상인 항목 {c}개의 둘째 줄을 머리 기호 뒤 첫 글자에 맞췄습니다.")
+            self.notes.append(f"표 칸 안 {'' if self.hang_at else '두 줄 이상인 '}항목 {c}개의 둘째 줄을 {spot if self.hang_at else '머리 기호 뒤'} 첫 글자에 맞췄습니다.")
+        f = got["fw"] + cells["fw"]
+        if f:
+            self.notes.append(f"양쪽 정렬 문단 {f}개는 머리 기호 뒤 보통 빈칸을 고정폭 빈칸으로 바꿨습니다(줄마다 늘어나 첫 줄 글 시작이 밀리지 않게 — "
+                              "내어쓰기가 이미 맞던 문단은 내어쓰기 그대로).")
+        skip = [p for p in self._hang_skip if self._hang_skip[p]]
+        if skip:
+            self.notes.append(f"둘째 줄을 맞추지 못한 문단 {len(skip)}개 — 자리와 까닭: "
+                              + "; ".join(f"‘{self.name(p)}…’({self._where(p)}) {self._hang_skip[p]}" for p in skip[:6])
+                              + (f" 외 {len(skip) - 6}개" if len(skip) > 6 else ""))
+            for p in skip:
+                self._hang_skip[p] = ""  # 두 번째 hangs()에서 같은 알림을 되풀이하지 않게
         tb = got["tab"] + cells["tab"]
-        if tb:
+        if tb and not self.hang_at:  # 기준을 밝혔으면 위 '맞추지 못한 문단'에 자리와 함께 적음
             self.notes.append(f"머리 기호 뒤를 탭으로 띄운 문단 {tb}개는 둘째 줄을 맞추지 않았습니다 — 탭이 닿는 자리는 문서 설정마다 달라 "
                               "어림하지 않음(한글에서 확인).")
         b = got["break"] + cells["break"]
@@ -880,8 +1088,8 @@ class Tidier:
                 if para_tables(p) or para_pics(p) or not text.strip() or "\n" in text or "\t" in text:
                     continue
                 lv = self.level(text)
-                if (lv == 1 and not self._is_number(text)) or (scope != "본문" and not lv):
-                    continue
+                if (lv == 1 and not self._is_number(text)) or (scope != "본문" and not lv and p not in self._quote_ps):
+                    continue  # 칸의 머리 기호 없는 글은 그대로 — 조문 상자 인용 글은 끝 줄도 끝선에(작성 모드와 같게)
                 if self.styles.para.get(p.get("paraPrIDRef"), {}).get("align") not in ("JUSTIFY", "DISTRIBUTE", None) or not self.fonts_ok(p):
                     continue
                 res = fill_last_line(self.lay, self.styles, self.hedit, p, w, self.head_len(text), self._split_at)
@@ -1268,7 +1476,8 @@ class Tidier:
             self.notes.append(f"자간을 줄여 자리가 난 문단 {n}개도 둘째 줄을 맞췄습니다.")
         stuck = [x[0] for x in self._hang_retry]
         if stuck:
-            self.notes.append(f"둘째 줄을 맞추면 줄이 늘어나 그대로 둔 문단 {len(stuck)}개(예: ‘{self.name(stuck[0])}…’) — 낱말을 줄이면 맞출 수 있음.")
+            where = ", ".join(f"‘{self.name(p)}…’({self._where(p)})" for p in stuck[:5]) if self.hang_at else f"예: ‘{self.name(stuck[0])}…’"
+            self.notes.append(f"둘째 줄을 맞추면 줄이 늘어나(쪽 수를 지키려고) 맞추지 않고 되돌린 문단 {len(stuck)}개({where}) — 낱말을 줄이면 맞출 수 있음.")
 
     @staticmethod
     def _runs_state(p):
@@ -1373,6 +1582,8 @@ class Tidier:
                 text = para_text(p)
                 if para_tables(p) or para_pics(p) or re.search(r"\n[ ⎵⍽　]+", text) or "\t" in text or not text.strip():
                     continue
+                if p in self._quote_ps:
+                    continue  # 조문 상자 인용 글은 quote_fit이 자간으로만
                 if self.styles.para.get(p.get("paraPrIDRef"), {}).get("align") not in ("JUSTIFY", "DISTRIBUTE", None):
                     continue
                 if not self.fonts_ok(p):
@@ -1490,8 +1701,8 @@ class Tidier:
         self._lowered = {}
         for paras, body_w, _ in self.blocks():
             for p in paras:
-                if para_tables(p) or para_pics(p) or "\n" in para_text(p) or "\t" in para_text(p):
-                    continue
+                if para_tables(p) or para_pics(p) or "\n" in para_text(p) or "\t" in para_text(p) or p in self._quote_ps:
+                    continue  # 조문 상자 인용 글은 끝 줄을 내리지 않음(줄 바꿈 넣기 없음 — quote_fit)
                 if self.styles.para.get(p.get("paraPrIDRef"), {}).get("align") not in ("JUSTIFY", "DISTRIBUTE", "LEFT", None):
                     continue
                 chs, lines = self.lay.para_lines(p, body_w)
@@ -1701,6 +1912,8 @@ class Tidier:
                 text = para_text(p)
                 if para_tables(p) or para_pics(p) or "\t" in text or not text.strip() or re.search(r"\n[ ⎵⍽　]+", text):
                     continue
+                if p in self._quote_ps:
+                    continue  # 조문 상자 인용 글에는 줄 바꿈을 넣지 않음
                 if self.styles.para.get(p.get("paraPrIDRef"), {}).get("align") not in ("JUSTIFY", "DISTRIBUTE", "LEFT", None):
                     continue
                 for _try in range(4):
@@ -1735,6 +1948,8 @@ class Tidier:
                 text = para_text(p)
                 if "\n" not in text or "\t" in text or para_tables(p) or para_pics(p) or re.search(r"\n[ ⎵⍽　]+", text):
                     continue
+                if p in self._quote_ps:
+                    continue  # 조문 상자 인용 글은 quote_fit이 자간으로만
                 if not self.fonts_ok(p):
                     continue
                 head = self.head_len(text)
@@ -2065,9 +2280,12 @@ class Tidier:
         if self.made:
             # 작성 모드로 만든 문서: 작성 규칙이 맞춘 것은 그대로, 사람이 더한 줄(내어쓰기 없음)·줄 나눔·빈칸만
             self.leading()
+            self.quote_align()  # 옛 판(왼쪽 정렬 조문 상자)으로 만든 문서도 지금 규칙대로 — 지금 판으로 만든 문서는 바뀌는 것 없음
             self.hangs()
             self.hangs_again()
+            self.quote_fit()
             self.one_space()
+            self.hang_verify()
             self.notes.insert(0, f"이 스킬의 작성 모드로 만든 문서(판 {self.made})라 작성 규칙이 맞춘 끝 줄·이름표·내어쓰기·칸·간격은 "
                                  "그대로 두고, 내어쓰기가 없는 문단(만든 뒤 더한 줄)·글자 단위 줄 나눔·빈칸만 손봤습니다 — "
                                  "글을 크게 고쳤으면 계획을 고쳐 다시 만드는 것이 정확합니다(모두 다시 맞추려면 --all).")
@@ -2077,10 +2295,12 @@ class Tidier:
             self.labels()
             self.leading()  # 머리 자간을 같은 수준 값으로 맞춘 뒤에 — 그래야 줄머리 폭(여백)도 위아래 같은 값(○ 자리 한 줄로)
             self.cell_justify()  # 빈칸 벌어진 줄 맞춤(양쪽 맞춤 글만 봄)보다 먼저
+            self.quote_align()  # 둘째 줄 맞춤보다 먼저(양쪽 정렬이어야 머리 빈칸을 고정폭으로 바꿈)
             self.cell_indent()  # 줄 나눔이 바뀔 수 있어 줄 맞춤 단계보다 먼저
             self.hangs()
             self.sparse_lines()
             self.hangs_again()
+            self.quote_fit()  # 둘째 줄 맞춤(내어쓰기)이 정해진 뒤 — 조문 상자 인용 글은 자간으로만
             self.short_lines()
             self.connector_lines()
             self.fill_broken()
@@ -2093,6 +2313,7 @@ class Tidier:
             self.cell_gaps()
             self.cell_keep()
             self.one_space()
+            self.hang_verify()  # 맨 끝 — 빈칸 정리·폭 손질이 끝난 상태로 둘째 줄 자리를 다시 대조
         now = self.line_counts()
         grown = [p for p, k in lines0.items() if now.get(p, k) > k]
         if grown:
@@ -2242,6 +2463,9 @@ def main():
     ap.add_argument("--blank-mm", type=float, help="□ 앞 빈 줄 높이가 제각각일 때 이 높이(mm)에 가장 가까운 빈 줄로 모두 맞춤")
     ap.add_argument("--all", action="store_true",
                     help="이 스킬의 작성 모드로 만든 문서도 정돈 규칙으로 모두 다시 맞춤(기본은 작성 규칙이 맞춘 것을 그대로 둠)")
+    ap.add_argument("--hang-at", choices=("기호", "이름표"),
+                    help="사용자가 둘째 줄 기준을 밝혔을 때만: 기호(머리 기호 뒤 첫 글자) 또는 이름표(이름표·쌍점 뒤, 없으면 기호 뒤) — "
+                         "기존 내어쓰기를 허용치로 두지 않고 그 자리에 정확히, 한 줄 문단에도")
     a = ap.parse_args()
     if not a.path.lower().endswith(".hwpx"):
         raise SystemExit("정돈은 한글(HWPX) 파일만 받습니다. PDF·그림 문서는 '옮겨 쓰기'(내용 그대로 새로 만들기)로 하세요."
@@ -2250,7 +2474,7 @@ def main():
     if same_path(out, a.path):
         raise SystemExit("결과를 원본과 같은 이름으로 저장하지 않습니다 — 다른 이름을 주세요.")
     sys.exit(tidy_file(a.path, out, keep_o=not a.no_keep_o, gaps=[int(round(a.gap * 100))] if a.gap else None, blank_mm=a.blank_mm,
-                       all_rules=a.all, max_pages=a.max_pages))
+                       all_rules=a.all, max_pages=a.max_pages, hang_at=a.hang_at))
 
 
 if __name__ == "__main__":
