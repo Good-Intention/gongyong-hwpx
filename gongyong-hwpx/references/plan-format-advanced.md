@@ -47,6 +47,7 @@
 | `paren_small` | 부연설명 괄호 작게(pt 수, 기본 2, 끄려면 0) |
 | `colons` | 쌍점 앞뒤 한 칸·내어쓰기 |
 | `label_hang` | 이름표 뒤 내어쓰기 |
+| `omit_dots` | 괄호 생략 표시 (중략)·(후략)을 `···`로(옮겨 쓰기처럼 글을 그대로 둘 때 false) |
 | `keep_numbers` | 숫자 꾸밈말 묶음 빈칸 |
 | `square_small` | □ 기호 2pt 작게 |
 | `date_gap` | 날짜·부서 줄 아래(요약 상자 위) 1pt |
