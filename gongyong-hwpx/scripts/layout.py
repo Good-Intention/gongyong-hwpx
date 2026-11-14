@@ -120,6 +120,9 @@ class Metrics:
         return 1.0
 
 
+CHARS_CACHE = True  # 글자 폭 저장소 켜기(시험에서 끄고 견줌)
+
+
 class Layout:
     """문단·표의 줄 수와 높이, 문서의 쪽 나눔을 어림한다(단위 HWPUNIT, 1mm ≈ 283.5)."""
 
@@ -134,18 +137,22 @@ class Layout:
         # row_nocache: 안이 높이를 바꾸는 표(그래프 상자)
         self.row_cache = None
         self.row_nocache = set()
+        self._chars = {}  # 글자 폭 저장소 — 조각(모양 번호·글)이 같으면 다시 재지 않음(정돈 속도 2026-11-15: 같은 문단을 수만 번 쟀음)
 
     # ------------------------------------------------------------ 글자 폭
     def chars(self, p, delta=0, floor=FIT_FLOOR):
         """문단의 글자 목록: [(글자, 폭, 크기, 위첨자 여부, 자간 빼기 전 폭)]. delta는 모든 조각에 더해 볼 자간(%).
         자간은 floor(겹치지 않는 한계) 밑으로 내리지 않는다. 이미 그보다 좁은 조각(따옴표 등)은 그대로 둔다.
         마지막 칸(자간 빼기 전 폭)은 줄 끝 글자에 쓴다 — 한글은 줄 끝 글자를 자간을 줄이기 전 제 폭으로 센다(wrap)."""
-        out = []
+        runs = [r for r in para_runs(p) if r.find(T("hp:tbl")) is None]
         head = self.head_of(para_text(p)) if delta else 0
+        key = (tuple((r.get("charPrIDRef"), run_text(r)) for r in runs), delta, floor, head)  # 머리 길이도(표 조각 글이 들 수 있음 — Codex 검토)
+        got = self._chars.get(key) if CHARS_CACHE else None
+        if got is not None:
+            return list(got)
+        out = []
         pos = 0
-        for r in para_runs(p):
-            if r.find(T("hp:tbl")) is not None:
-                continue
+        for r in runs:
             c = self.st.char.get(r.get("charPrIDRef"), {})
             size = c.get("size", 10) * 100
             sup = c.get("superscript") or c.get("subscript")
@@ -185,6 +192,8 @@ class Layout:
                         w0 = k * self.m.em(c.get("font"), base, c.get("bold")) * ratio
                         w = w0 * (1 + sp)
                 out.append((ch, w, size, sup, w0))
+        if CHARS_CACHE:
+            self._chars[key] = tuple(out)
         return out
 
     @staticmethod

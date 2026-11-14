@@ -15,6 +15,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import proofread  # noqa: E402
 from hwpx_lib import (NUM_CHARS, T, Package, cell_paras, fix_note, head_length, is_struct, marker_level, note_is_fix, page_info,  # noqa: E402
                       para_pics, para_runs, para_tables, para_text, run_text, split_marker, table_grid, is_table_title)
 from build import (SKILL_VERSION, print_citations, BASIS_MISSING, BASIS_TITLE_RE, DATE_LINE_RE, OMIT_KEYS, ROMAN, SUMMARY_END_MSG, SUMMARY_END_RE, BuildError, Builder,  # noqa: E402
@@ -32,6 +33,7 @@ class Inspector:
         self.path = path
         self.pkg = Package(path)
         self.b = Builder(self.pkg)
+        self.b.find_law_paras()  # 상자 없는 참고 근거법령 조문 줄 — 만들기와 같은 인용 글 취급
         # 일부러 뺀 요소: --omit 또는 만들 때 남긴 표시(omit=date,summary …)
         self.omit = set(omit) | {k for k in read_doc_meta(self.pkg).get("omit", "").split(",") if k in OMIT_KEYS}
         self.doc_type = doc_type  # 계획의 doc_type과 같은 뜻(--doc-type)
@@ -178,6 +180,8 @@ class Inspector:
         self.polish += t.change_lines()
         if self.polish:
             self.polish.append(f"정돈하면 어림 쪽 수 {before}쪽 → {after}쪽")
+        # 글을 바꿔야 하는 것(원문 번호 앞 기호·괄호 생략 표시)은 정돈도 알리기만 — 검사만도 참고로(사용자 2026-11-15)
+        self.info += [n for n in t.notes if n.startswith(("원문 번호(", "괄호 생략 표시"))]
 
     def dry_fit(self, tables=True):
         """작성 도구의 맞춤을 한 번 걸어 보고(저장하지 않음) 글을 고쳐야 풀리는 것만 '고쳐야 함'으로."""
@@ -224,6 +228,7 @@ class Inspector:
         self.tidy_preview()
         # 만들 때(또는 --omit) 일부러 뺀다고 한 요소의 지적은 알림으로 — 근거법령 검사를 끈 문서(--no-basis·문서 종류)의 근거법령 지적도
         off = self.omit | ({"basis"} if self._basis_skip() else set())
+        off |= {k for k in read_doc_meta(self.pkg).get("sample", "").split(",") if k == "counts"}  # 견본 먼저로 낮춘 항목 수(만들 때와 같게)
         if off:
             moved = [w for w in self.fix if getattr(w, "kind", None) in off]
             self.fix = [w for w in self.fix if w not in moved]
@@ -265,6 +270,7 @@ def main():
     for w in ins.polish or ["없음"]:
         print(" - " + w)
     print_citations(para_text(p) for p in ins.b.sec.iter(T("hp:p")))
+    proofread.print_report(ins.pkg)  # 수치·맞춤법 — 고치지 않고 알림(사용자 2026-11-15)
     print("## 참고")
     for w in ins.info:
         print(" - " + w)

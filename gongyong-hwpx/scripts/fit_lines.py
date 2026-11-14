@@ -90,7 +90,7 @@ class LineFit:
                 if t[lead:]:
                     break
             size = next((self.st.char.get(r.get("charPrIDRef"), {}).get("size", 10) for r in para_runs(p) if run_text(r).strip()), 10)
-            want = int(round(lvl * size * 100))
+            want = int(round(self.b.law_paras.get(p, 0) + lvl * size * 100))  # 상자 없는 참고 근거법령은 ○ 글자 자리부터
             pp = self.st.para.get(p.get("paraPrIDRef"), {})
             if abs(pp.get("left", 0) - want) > 1:
                 p.set("paraPrIDRef", self.b.hedit.para_margin(p.get("paraPrIDRef"), "left", want))
@@ -163,10 +163,11 @@ class LineFit:
                 done.append(self._content_spacing(p))
         if done:
             span = pct_range(done) if min(done) * max(done) >= 0 else f"{min(done):+d}~{max(done):+d}%"
-            self.notes.append(f"제목 걸친 상자(조문 발췌) 안 글 {len(done)}문단은 양쪽 정렬로 두고 자간을 바꿔({span}) "
+            self.notes.append(f"조문 발췌(제목 걸친 상자·참고 근거법령) 글 {len(done)}문단은 양쪽 정렬로 두고 자간을 바꿔({span}) "
                               "줄마다 끝선까지 고르게 채웠습니다(인용 글·줄 바꿈은 그대로).")
         if hung:
-            self.notes.append(f"제목 걸친 상자(조문 발췌)의 항·호 번호 줄 {hung}개는 왼쪽 끝에서 시작하고 둘째 줄을 기호 뒤 첫 글자 밑에 맞췄습니다.")
+            self.notes.append(f"조문 발췌(제목 걸친 상자·참고 근거법령)의 항·호·목 번호 줄 {hung}개는 항은 조문 왼쪽 끝, 호 두 칸·목 네 칸 들이고 "
+                              "둘째 줄을 번호 뒤 첫 글자 밑에 맞췄습니다.")
 
     def fill_ends(self):
         """끝선에 조금 못 미친 한 줄·끝 줄을 자간으로 끝선에(fill_last_line, 정돈과 같음). □ 제목·줄 바꿈·탭 문단은 그대로(로마자 번호 줄은 채움).
@@ -287,7 +288,8 @@ class LineFit:
             self.notes.append(fix_note(f"그래도 빈칸이 크게 벌어지는 줄이 남은 문단 {len(loose)}개 — 긴 낱말이 다음 줄로 넘어감. "
                               "낱말을 줄이거나 순서를 바꾸거나 두 줄로 나누면 좋아집니다: "
                               + ", ".join(f"‘{t}…’" for t in loose)))
-        self.report_cut_hints()
+        if not getattr(self, "defer_hints", False):
+            self.report_cut_hints()
         # 내리기로도 못 고친(끝 줄 바로 위에 나눌 빈칸이 없는 등) 문단은 글을 고쳐야 하므로 '고쳐야 함'으로 알린다
         short = []
         for p, box_w in self.text_boxes():
@@ -511,6 +513,7 @@ class LineFit:
             if best is None or best[0] > 3:
                 continue
             idx = best[1]
+            n_hints = len(self.cut_hints)
             self._cut_hint(p, box_w, lines)
             saved = [(r, r.get("charPrIDRef"), copy.deepcopy(list(r))) for r in para_runs(p)]
             self._insert_breaks(p, [(0, 0, "space", idx)])
@@ -523,6 +526,9 @@ class LineFit:
                         r.append(k)
                     r.set("charPrIDRef", cid)
                 continue
+            if getattr(self, "defer_hints", False):
+                # 만들기: 내린 문단의 후보는 맞춤을 다 끝낸 문서에서 다시 잼(검사만과 같은 셈 — 뒤 단계가 머리 빈칸 폭을 바꿔 달라졌음, 2026-11-15)
+                del self.cut_hints[n_hints:]
             done.append(best[2])
         if done:
             self.notes.append(f"자간으로 올릴 수 없던 짧은 끝 줄(한두 낱말) {len(done)}곳은 위 줄 낱말을 함께 내려 "

@@ -35,7 +35,8 @@ from style_profile import P as PROFILE  # noqa: E402 — 기준값(assets/profil
 from hwpx_lib import (UNIT_RE, COMPOSE_CHAR, HWPUNIT_PER_MM, INVISIBLE_RE, KEYCAP_RE, T, HeaderEdit, Package, Styles, cell_paras, clean_chars, drop_linesegs, etree, insert_marker_gap,  # noqa: E402
                       clear_print_method, edit_run_text, fake_label, head_length, is_blank, is_table_title, label_colon, label_content, marker_level,
                       page_info, para_pics, para_runs, para_tables, para_text, plain_run, run_tabs, run_text, set_run_text,
-                      split_marker, table_grid, text_marks, pct_range, is_num_char, same_path, tight_marker_end, quote_indent)
+                      split_marker, table_grid, text_marks, pct_range, is_num_char, same_path, tight_marker_end, quote_indent,
+                      is_narrative, OMIT_MARK_RE, label_long)
 from layout import FIT_FLOOR, FW_EM, Layout, Metrics, spacing_after  # noqa: E402
 from spaces import compact_fw, lead_to_margin  # noqa: E402
 from build_base import DATE_LINE_RE, SKILL_VERSION, read_doc_meta  # noqa: E402
@@ -467,22 +468,23 @@ class Tidier:
             return 3
         return lv
 
-    def head_at(self, text):
+    def head_at(self, text, narrative=True):
         """둘째 줄을 맞출 자리: 괄호 이름표 뒤 → '항목 : ' 쌍점 뒤 → 머리 기호 뒤 첫 글자. 머리 기호가 없으면 0.
         쌍점 이름표는 사용자 원칙(쌍점 뒤 처음 시작하는 글자에 아랫줄을 맞춤) — 사람이 쓴 15쪽 계획서 시험에서 원본이 그렇게 맞춰 있었음."""
         pre, mark, t = self.split(text)
         if not mark:
             return 0
-        return (0 if self._fake(t, pre) else label_content(t)) or label_colon(t) or len(pre)
+        # 서술형(문장) 글은 이름표 ')' 뒤가 아니라 '(' 자리(머리 기호 뒤)에(사용자 2026-11-15) — 쌍점 꼴은 그대로
+        return (0 if self._fake(t, pre) or (narrative and is_narrative(t)) else label_content(t)) or label_colon(t) or len(pre)
 
     @staticmethod
     def _fake(t, pre):
         m = LABEL_RE.match(t[len(pre):])
         return bool(m) and fake_label(m.group("core"), t[len(pre) + m.end():])
 
-    def _cell_head_at(self, p, text, box_w):
+    def _cell_head_at(self, p, text, box_w, narrative=True):
         """표 칸의 둘째 줄 자리 — 이름표·쌍점 뒤가 칸 폭에 비해 깊으면 머리 기호 뒤."""
-        k = self.head_at(text)
+        k = self.head_at(text, narrative)
         pre = self.split(text)[0]
         if k > len(pre) and sum(c[1] for c in self.lay.chars(p)[:k]) > box_w * CELL_HANG_MAX:
             return len(pre)
@@ -509,6 +511,8 @@ class Tidier:
         """둘째 줄을 맞출 글자 위치를 재는 함수 — 기준을 '기호'로 밝히면 머리 기호 뒤 첫 글자만(이름표·쌍점 뒤를 대신 인정하지 않음)."""
         if self.hang_at == "기호":
             return lambda x: len(self.split(x)[0])
+        if self.hang_at == "이름표":  # 밝힌 기준이 서술형 자동 판정보다 먼저(Codex 검토) — 표 칸의 깊이 규칙은 그대로
+            return (lambda x: self._cell_head_at(p, x, box_w, narrative=False)) if in_cell else (lambda x: self.head_at(x, narrative=False))
         return (lambda x: self._cell_head_at(p, x, box_w)) if in_cell else self.head_at
 
     def _hang_one(self, p, box_w, in_cell=False):
@@ -570,6 +574,17 @@ class Tidier:
             return None
         pid0 = p.get("paraPrIDRef")
         state0 = self._runs_state(p)
+        lab0 = label_content(text)
+        if (self.hang_at != "이름표" and lab0 and k == lab0 and not label_colon(text) and not near(chs, lab0)
+                and (cur <= 0 or near(chs, len(self.split(text)[0])))):  # 작성자가 이름표 쪽에 맞춰 둔 문단(이름표 폭이 바뀌어도)은 그대로
+            # 개조식이라도 이름표 뒤로 넘어간 둘째 줄이 길면(줄 폭의 절반 이상·셋째 줄까지) 이름표 '(' 자리(머리 기호 뒤)에
+            # (사용자 2026-11-15) — 작성자가 이미 이름표 뒤에 맞춰 둔 문단은 그대로(작성자 서식)
+            p.set("paraPrIDRef", self.hedit.para_hang(pid0, sum(c[1] for c in chs[:lab0])))
+            long_label = label_long(*self.lay.para_lines(p, box_w))
+            p.set("paraPrIDRef", pid0)
+            if long_label:
+                at = lambda x: len(self.split(x)[0])  # noqa: E731 — 빈칸을 고정폭으로 바꾼 뒤 다시 잴 때도 같은 기준
+                k = at(text)
 
         def grew():
             """맞췄더니 줄이 늘었으면 되돌림 — 2줄이 3줄이 되어 1쪽 문서가 2쪽이 됨(평가 2026-11-09). 표 칸은 먼저 내용 자간으로 줄 수를 지켜 본다
@@ -1719,12 +1734,19 @@ class Tidier:
             return self._end_cells
         out = set()
         for sec in self.secs:
-            for p in [x for x in sec if x.tag == T("hp:p")]:
+            paras = [x for x in sec if x.tag == T("hp:p")]
+            ends = None  # 구역마다 쪽 어림 한 번(옛 판은 표마다 문서 전체를 다시 셈 — 읽기만 하는 단계라 결과 같음, 정돈 속도 2026-11-15)
+            for k, p in enumerate(paras):
                 for tbl in para_tables(p):
                     if tbl.get("pageBreak") not in ("TABLE", "CELL") or not any(
                             self._wide(tc, w) and len(cell_paras(tc)) >= 2 for tc, w, _ in self._cells(tbl)):
                         continue
-                    for r in self._row_ends_page(tbl):
+                    if ends is None:
+                        body_w, body_h = self.box(sec)
+                        self.lay.paginate(paras, body_w, body_h)
+                        ends = {kk: [r for r in range(len(pos) - 1) if pos[r + 1][0] > pos[r][2]]
+                                for kk, pos in self.lay.row_pos.items() if pos}
+                    for r in (ends.get(k, []) if para_tables(p)[0] is tbl else self._row_ends_page(tbl)):
                         tcs = self._row_cells(tbl, r)
                         top = [tc for tc in tcs if tc.find(T("hp:subList")) is not None and tc.find(T("hp:subList")).get("vertAlign") == "TOP"]
                         out |= set(top)
@@ -2820,6 +2842,8 @@ class Tidier:
         if grown:
             self.notes.append(f"정돈 뒤 줄 수가 늘어난 문단 {len(grown)}개(예: ‘{self.name(grown[0])}…’) — 둘째 줄 맞춤·글자 크기 맞춤 때문일 수 있음(한글에서 확인).")
         self.grown = grown
+        if not self._round:
+            self._quote_notices()
         for p in self.touched:
             drop_linesegs(p)
         marked = sum(1 for m in self.orig_marks.values() if any(not k.startswith("tab:") for k in m))
@@ -2836,27 +2860,73 @@ class Tidier:
                 after = self._settle(out, after)
         return before, after, bad
 
+    def _quote_notices(self):
+        """글을 바꾸는 일이라 정돈은 하지 않고 알리기만(사용자 2026-11-15 ‘알리기만’): 원문 번호(①·1.·가.·제○조) 앞에 머리 기호(-·○)를
+        겹쳐 쓴 줄, 괄호 생략 표시 (중략)·(후략) — 새로 만들면 기호 없이 원문 번호로, 생략은 ···로 쓴다."""
+        double, omit = [], 0
+        for p in self.all_paras():
+            t = para_text(p)
+            if re.match(r"[ ⎵⍽]*[-·•∙ㆍ○◦][ ⎵⍽]+(?:[①-⑳]|\d{1,2}\.[ ⎵⍽](?!\d)|[가-하]\.[ ⎵⍽]|제\d+조)", t):
+                double.append(p)
+            omit += len(OMIT_MARK_RE.findall(t))
+        if double:
+            self.notes.append(f"원문 번호(①·1.·가.·제○조) 앞에 머리 기호를 겹쳐 쓴 줄 {len(double)}개(예: ‘{self.name(double[0])}…’) — "
+                              "글을 바꾸는 일이라 그대로 두었습니다. 참고 근거법령은 기호 없이 원문 번호로 쓰는 것이 원칙입니다(새로 만들면 그렇게 나옴).")
+        if omit:
+            self.notes.append(f"괄호 생략 표시 (중략)·(후략) {omit}곳 — 원칙은 중점 세 개(···)지만 글을 바꾸는 일이라 그대로 두었습니다"
+                              "(새로 만들면 ···로 나옴).")
+
     @staticmethod
     def _state(pkg):
-        """보이는 상태 — 문단·글자 모양은 번호 대신 실제 값으로(값이 같은 새 모양 번호로 바뀐 것은 같은 것으로), 줄 배치 기록은 뺌."""
+        """보이는 상태 — 문단·글자 모양은 번호 대신 실제 값으로(값이 같은 새 모양 번호로 바뀐 것은 같은 것으로), 줄 배치 기록은 뺌.
+        같은 글자 모양(값)의 이웃 조각 글은 하나로 친다 — 조각만 나뉜 것은 보이는 차이가 아님(105쪽 문서에서 두 번 정돈 확인이 그 때문에
+        되풀이돼 17초 → 46초, 정돈 속도 2026-11-15)."""
         st = Styles(pkg.xml("Contents/header.xml"))
         ref = {"paraPrIDRef": st.para, "charPrIDRef": st.char}
         out = []
+
+        def look(el):
+            attrs = []
+            for k, v in sorted(el.attrib.items()):
+                if k in ref:
+                    v = tuple(sorted((a, str(b)) for a, b in ref[k].get(v, {}).items()))
+                elif k in ("id", "instid"):
+                    continue
+                attrs.append((k, v))
+            return tuple(attrs)
+
+        def plain(r):  # 글만 든 조각(hp:t 하나, 안에 다른 것 없음)
+            return len(r) == 1 and r[0].tag == T("hp:t") and not len(r[0])
+
         for n in pkg.sections():
             stack = [pkg.xml(n)]
             while stack:
                 el = stack.pop()
+                if isinstance(el, tuple):  # 하나로 친 글 조각들
+                    out.append(el)
+                    continue
                 if not isinstance(el.tag, str) or el.tag == T("hp:linesegarray"):
                     continue
-                attrs = []
-                for k, v in sorted(el.attrib.items()):
-                    if k in ref:
-                        v = tuple(sorted((a, str(b)) for a, b in ref[k].get(v, {}).items()))
-                    elif k in ("id", "instid"):
-                        continue
-                    attrs.append((k, v))
-                out.append((el.tag, tuple(attrs), el.text or "", el.tail or ""))
-                stack.extend(reversed(list(el)))
+                kids = list(el)
+                out.append((el.tag, look(el), el.text or "", el.tail or ""))
+                if el.tag == T("hp:p"):
+                    merged, i = [], 0
+                    while i < len(kids):
+                        k = kids[i]
+                        if k.tag == T("hp:run") and plain(k):
+                            a, text, j = look(k), k[0].text or "", i + 1
+                            while j < len(kids) and kids[j].tag == T("hp:run") and plain(kids[j]) and look(kids[j]) == a:
+                                text += kids[j][0].text or ""
+                                j += 1
+                            if text or not para_text(el).strip():  # 빈 조각은 빈 문단에서만 봄(빈 줄 높이 = 그 글자 크기, Codex 검토)
+                                merged.append(("run+", a, text))
+                            i = j
+                            continue
+                        merged.append(k)
+                        i += 1
+                    stack.extend(reversed(merged))
+                    continue
+                stack.extend(reversed(kids))
         return out
 
     def _settle(self, out, after):
@@ -3004,6 +3074,8 @@ class Tidier:
         if holes:
             print(" - 아래가 크게 빈 쪽: " + ", ".join(f"{k}쪽 {mm:.0f}mm" for k, mm in holes)
                   + " — 칸 안 표·그림은 쪽에서 나뉘지 않아 통째로 밀림. ○ 차례를 바꾸거나 그 표를 작게 하면 채울 수 있음")
+        import proofread
+        proofread.print_report(self.pkg)  # 수치·맞춤법 — 정돈은 글을 바꾸지 않으니 알리기만(사용자 2026-11-15)
 
 
 def tidy_file(path, out, max_pages=None, **base):

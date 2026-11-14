@@ -10,12 +10,14 @@
     {"table": [[…], …]}             like 없는 표 블록 = 견본의 표(칸 수가 같은 표 먼저)
 번호를 쓴 블록({"like": 7, …})은 그대로 둔다 — 섞어 써도 된다. build.Builder.build가 맨 먼저 expand_plan을 부른다.
 """
+import os
 import re
 
 from analyze import guess_role
 from build_base import DATE_LINE_RE, LABEL_RE, BuildError, number_family
 from fit_base import cover_end
-from hwpx_lib import UNIT_RE, cell_text, fake_label, marker_kind, marker_level, para_tables, para_text, split_marker, table_grid
+from hwpx_lib import (UNIT_RE, Package, T, cell_text, fake_label, marker_kind, marker_level, para_tables, para_text,
+                      split_marker, table_grid)
 
 HEAD_RE = re.compile(r"^\s*(제목|날짜|요약)\s*[:：]\s*(.*)$", re.S)
 REF_RE = re.compile(r"^\s*\[\s*((?:참고|붙임|별첨|첨부)\s*\d*)\s*\]\s*(.*)$", re.S)
@@ -165,6 +167,24 @@ def _is_table_block(blk):
     return isinstance(blk, dict) and ("table" in blk or "flow" in blk)
 
 
+_BASIC_SECTION = []
+
+
+def _is_bundled_basic(pkg):
+    """견본이 이 스킬의 기본 양식 그대로인가(본문 XML 바이트가 같음). 기본 양식은 견본이 아니라 사용자 원칙을 따른다
+    (따르는 차례: 요청 → 견본 → 원칙 — 사용자 2026-11-12)."""
+    if not _BASIC_SECTION:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "basic_report.hwpx")
+        basic = Package(path)
+        _BASIC_SECTION.append(basic.data.get(basic.sections()[0]))
+    secs = pkg.sections()
+    return bool(secs) and pkg.data.get(secs[0]) == _BASIC_SECTION[0]
+
+
+def _blank_proto(p):
+    return not para_tables(p) and not para_text(p).strip() and next(p.iter(T("hp:pic")), None) is None
+
+
 def expand_plan(plan, b):
     """글로 쓴 블록·like 없는 표 블록을 번호 블록으로 바꾼 계획을 돌려준다(없으면 받은 그대로). b는 Builder."""
     blocks = plan.get("blocks") if isinstance(plan, dict) else plan
@@ -175,6 +195,7 @@ def expand_plan(plan, b):
     roles = Roles(b)
     how = "{\"like\": 번호, \"text\": …}"
     out, ctx, in_body, pending = [], None, False, {}
+    keep_head_blanks = not _is_bundled_basic(b.pkg)  # 올린 견본의 날짜 줄·요약 상자 사이 빈 줄은 견본대로 둔다
 
     def flush_pending(n, blk=None):
         """■ 제목 줄·(단위 : …) 줄은 바로 다음 표 블록의 title·unit으로."""
@@ -236,7 +257,14 @@ def expand_plan(plan, b):
             if idx is None:
                 raise BuildError(f"{where}: 견본에서 {HEAD_NAMES[key]} 자리를 찾지 못했습니다 — 양식 지도(analyze.py)에서 "
                                  f"그 문단 번호를 찾아 {how} 꼴로 쓰세요.")
-            out.append({"like": idx, "text": val, "_src": n})
+            # 바로 앞 머리 블록(제목·날짜)과 이 머리 블록 사이의 견본 문단이 모두 빈 줄이면 견본처럼 그 빈 줄을 둔다
+            # (예: 날짜 줄과 요약 상자 사이 좁은 빈 줄 — 기본 양식은 원칙대로 '사이 빈 줄 없이')
+            prev = out[-1].get("like") if out and isinstance(out[-1], dict) and out[-1].get("_head") else None
+            if keep_head_blanks and isinstance(prev, int) and prev + 1 < idx \
+                    and all(_blank_proto(roles.protos[k]) for k in range(prev + 1, idx)):
+                out[-1] = {k: v for k, v in out[-1].items() if k != "_head"}
+                out += [{"like": k, "_src": n} for k in range(prev + 1, idx)]
+            out.append({"like": idx, "text": val, "_src": n, "_head": True})
             continue
         m = REF_RE.match(s)
         if m:
@@ -281,4 +309,5 @@ def expand_plan(plan, b):
         picked = ", ".join(f"{k} → {'·'.join(map(str, v))}번" for k, v in roles.multi.items())
         b.warn(f"기호로 쓴 블록은 견본에서 같은 기호 문단을 골랐습니다(같은 기호 문단이 여럿인 것: {picked}) — "
                "다른 모양을 쓰려면 그 블록만 {\"like\": 번호, …}로.")
+    out = [{k: v for k, v in x.items() if k != "_head"} if isinstance(x, dict) else x for x in out]
     return dict(plan, blocks=out) if isinstance(plan, dict) else out

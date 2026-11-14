@@ -31,10 +31,16 @@ NS = {
 }
 
 
+_TAGS = {}
+
+
 def T(name):
-    """'hp:p' 같은 이름을 lxml 태그('{주소}p')로 바꾼다."""
-    prefix, local = name.split(":")
-    return "{%s}%s" % (NS[prefix], local)
+    """'hp:p' 같은 이름을 lxml 태그('{주소}p')로 바꾼다(한 번 바꾼 이름은 저장 — 정돈 한 번에 200만 번 넘게 불림, 정돈 속도 2026-11-15)."""
+    tag = _TAGS.get(name)
+    if tag is None:
+        prefix, local = name.split(":")
+        tag = _TAGS[name] = "{%s}%s" % (NS[prefix], local)
+    return tag
 
 
 def local(el):
@@ -551,6 +557,25 @@ class HeaderEdit:
             self.cache[key] = new.get("id")
         return self.cache[key]
 
+    def char_bold(self, cid):
+        """굵게만 더한 글자 모양(이미 굵으면 그대로). hh:bold는 hh:offset·hh:italic 바로 뒤(한글 저장본과 같은 차례)."""
+        if self.styles.char.get(cid, {}).get("bold"):
+            return cid
+        key = ("bold", cid)
+        if key not in self.cache:
+            new = self._clone("hh:charProperties", "hh:charPr", cid)
+            after = new.find(T("hh:italic"))
+            if after is None:
+                after = new.find(T("hh:offset"))
+            bold = etree.Element(T("hh:bold"))
+            if after is not None:
+                after.addnext(bold)
+            else:
+                new.append(bold)
+            self.styles.char[new.get("id")] = self.styles._char(new)
+            self.cache[key] = new.get("id")
+        return self.cache[key]
+
     def char_like(self, cid, src, size_pt):
         """cid 모양(굵게·위 첨자·자간 등)은 그대로 두고 글꼴은 src 글자 모양 것, 크기는 size_pt로 바꾼 글자 모양.
         표 바로 밑 ※ 줄을 표 글씨(맑은 고딕·표 글자 크기)로 맞출 때 쓴다(사용자 원칙 2026-11-01)."""
@@ -647,8 +672,11 @@ COMPOSE_CHAR = "\uFDD0"  # 글자 겹치기(hp:compose — 네모 숫자 등)가
 _XML_BAD_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")  # XML에 쓸 수 없는 글자(붙여 넣은 글의 조종 문자 — 그대로 쓰면 저장에서 멈춤)
 
 
+_HP_T, _HP_COMPOSE, _HP_RUN = "{%s}t" % NS["hp"], "{%s}compose" % NS["hp"], "{%s}run" % NS["hp"]
+
+
 def run_text(run):
-    return "".join(t_text(t) if t.tag == T("hp:t") else COMPOSE_CHAR for t in run if t.tag in (T("hp:t"), T("hp:compose")))
+    return "".join(t_text(t) if t.tag == _HP_T else COMPOSE_CHAR for t in run if t.tag == _HP_T or t.tag == _HP_COMPOSE)
 
 
 def run_objects(run):
@@ -665,7 +693,7 @@ def run_objects(run):
 
 
 def para_runs(p):
-    return [r for r in p if r.tag == T("hp:run")]
+    return [r for r in p if r.tag == _HP_RUN]
 
 
 def is_struct(ch):
@@ -1038,7 +1066,38 @@ def label_colon(text):
     return 0
 
 
-NOT_LABEL = {"선택", "참고", "예시", "필수", "공통", "비고", "별첨", "주", "사", "재", "유", "합", "학", "의", "복", "가칭"}  # 괄호로 쓰지만 항목 이름이 아닌 말('(주) 대구상사'를 (   주   )로 벌리면 안 됨)
+NOT_LABEL = {"선택", "참고", "예시", "필수", "공통", "비고", "별첨", "주", "사", "재", "유", "합", "학", "의", "복", "가칭", "중략", "전략", "후략", "생략"}  # 괄호로 쓰지만 항목 이름이 아닌 말('(주) 대구상사'를 (   주   )로 벌리면 안 됨)
+
+
+OMIT_MARK_RE = re.compile(r"[(（〈<]\s*(?:중|전|후|생)\s*략\s*[)）〉>]")  # 괄호 생략 표시 (중략)·(전략)·(후략)·(생략)
+OMIT_DOTS = "···"  # 생략은 중점 세 개(사용자 2026-11-15 '중략 전략 후략은 괄호로 하지말고 앞이나 뒤 중점 각 세개씩으로')
+
+
+_TAIL_RE = re.compile(r"[ ⎵⍽]*(?:\([^()]*\)|···|…|\.{3})[ ⎵⍽]*$")
+_NARRATIVE_RE = re.compile(r"(?:다|[어아여해돼세에예죠]요|까|는지|은지|인지|할지|을지)[.?!]?$|\?$")  # '필요·수요·개요'는 개조식(Codex 검토)
+
+
+def is_narrative(text):
+    """글이 서술형(문장)으로 끝나는가 — '~다.'·'~니다.'·'~는지?'·'?'. 끝의 괄호(인용 출처 '(「하천법」 … 관련)')·생략 표시는 빼고 본다.
+    개조식(명사형 '~함·~음·~됨', 명사)은 아님. 괄호 이름표 뒤 둘째 줄 자리를 가른다(사용자 2026-11-15 '서술형이면 제목의 (에 맞추는게
+    맞다. 개조식이면 )에 맞추는게 맞다')."""
+    t = text.rstrip(" ⎵⍽")
+    while True:
+        t2 = _TAIL_RE.sub("", t)
+        if t2 == t or not t2:
+            break
+        t = t2
+    return bool(_NARRATIVE_RE.search(t))
+
+
+LABEL_LONG = 0.5  # 이름표 뒤로 넘어간 둘째 줄이 줄 폭의 이만큼 이상이면 '(' 자리에(사용자 2026-11-15 '50%이상')
+
+
+def label_long(chs, lines):
+    """이름표 뒤에 맞춰 잰 줄들(Layout.para_lines 결과)에서 둘째 줄이 긴가 — 셋째 줄까지 가거나, 둘째 줄 글이 첫 줄 폭의 절반 이상."""
+    if len(lines) >= 3:
+        return True
+    return len(lines) == 2 and lines[1][2] >= LABEL_LONG * lines[0][3]
 
 
 def fake_label(core, rest):
@@ -1054,6 +1113,8 @@ def label_content(text):
     pre, mark, body = split_marker(text)
     if not re.match(r"\([^()\n]{1,12}\)", body if mark else text):
         return 0
+    if OMIT_MARK_RE.match(body if mark else text):
+        return 0  # (중략)은 이름표가 아님 — 둘째 줄을 그 뒤에 맞추면 붕 뜸(사용자 2026-11-15)
     j = _base_head(text)
     while j < len(text) and text[j] in " ⎵⍽":
         j += 1

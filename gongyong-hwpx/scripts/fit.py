@@ -30,7 +30,7 @@ class Fitter(LineFit, TableFit, PageFit):
         for p in self.paras():
             tables = para_tables(p)
             if not tables:
-                if para_text(p).strip():
+                if para_text(p).strip() and p not in self.b.law_paras:  # 참고 근거법령 조문은 인용 글(quote_boxes)
                     out.append((p, self.body_w))
                 continue
             for tbl in tables:
@@ -49,6 +49,9 @@ class Fitter(LineFit, TableFit, PageFit):
         내리기 같은 줄 바꿈 넣기와 '낱말 빼기' 알림을 쓰지 않고, 자간으로만 끝선을 맞춘다(fit_quotes, 사용자 2026-11-10)."""
         out = []
         for p in self.paras():
+            if p in self.b.law_paras:  # 상자 없이 둔 참고 근거법령 조문 줄(build_rules.law_refs) — 본문 폭에서
+                out.append((p, self.body_w))
+                continue
             for tbl in para_tables(p):
                 tc = self._caption_content(tbl, table_grid(tbl))
                 if tc is None:

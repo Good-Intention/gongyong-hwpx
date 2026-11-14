@@ -25,6 +25,7 @@ from hwpx_lib import COMPOSE_CHAR, read_plan, same_path  # noqa: E402
 from build_fill import FillPart  # noqa: E402
 from build_rules import RulesPart  # noqa: E402
 from plan_text import expand_plan  # noqa: E402
+import proofread  # noqa: E402
 from spaces import compact_fw, lead_to_margin  # noqa: E402
 
 
@@ -33,6 +34,9 @@ class Builder(FillPart, RulesPart):
         self.pkg = pkg
         self.base_dir = base_dir  # 계획 파일이 있는 폴더(그림 파일의 상대 경로 기준)
         self.image_seq = 0
+        self.sample_free = set()  # 올린 견본이 원칙과 다르게 둔 모양·자리(sample_ways)
+        self.law_notes = set()  # 참고 근거법령 아래 ※·* 줄(law_refs가 크기·자리를 맞춤 — small_notes는 건너뜀)
+        self.law_paras = {}  # 참고 근거법령 조문 줄 → ○ 글자 자리(law_refs) — 인용 글이라 조문 상자처럼 다룸
         self.image_cells = set()  # 배경 그림을 넣은 칸(줄 높이를 늘리지 않음 — 비율 유지)
         self.flow_tables = set()  # 투명 선 도표 표(fit이 칸 너비를 다시 나누지 않음)
         self.flow_bottom = {}  # 도표 표 → 맨 아래 빈 줄 칸 크기(뒤가 글 문단이면 높임)
@@ -230,6 +234,8 @@ class Builder(FillPart, RulesPart):
         opts = plan if isinstance(plan, dict) else {}
         self.fit_base = self.made_reset()  # 이 스킬이 만든 문서를 견본으로 쓸 때 앞 판의 맞춤값을 되돌리고, 맞추기 전 기준값을 잼
         blocks = [dict(b, _src=b.get("_src", n + 1)) if isinstance(b, dict) else b for n, b in enumerate(blocks)]
+        if opts.get("omit_dots", True):
+            self.omit_dots(blocks)  # (중략)·(후략) → ··· — 이름표 맞추기가 (중략)을 이름표로 벌리기 전에
         blocks = self.table_units(blocks)  # 이름표 맞추기 등이 '(기준 : …)'을 괄호 이름표로 다루기 전에
         self.doc_type = str(opts.get("doc_type") or "").strip()
         omit = opts.get("omit") or []
@@ -241,6 +247,13 @@ class Builder(FillPart, RulesPart):
         self.omit = set(omit)
         self.basis_searched = bool(opts.get("basis_searched"))  # 둘째 근거를 찾아봤지만 없음 → ○ 하나여도 알림만
         self.basis_off = not opts.get("basis_first", True) or basis_exempt(self.doc_type) or "basis" in self.omit
+        self.sample_free = self.sample_ways()  # 올린 견본이 원칙과 다르게 둔 모양·자리 — 견본 먼저(사용자 2026-11-15)
+        if not self.basis_off and "basis" in self.sample_free:
+            self.basis_off = True
+            self.warn("견본이 근거를 첫 □가 아닌 곳(다른 □ 안 ○ (근거) 등)에 두어 계획에 쓴 자리를 그대로 두었습니다"
+                      "(따르는 차례: 요청 → 견본 → 원칙 — 근거법령 1번으로 옮기지 않음).")
+        if "counts" in self.sample_free:
+            self.warn("견본에 ○·- 항목이 하나뿐이거나 다섯을 넘는 곳이 있어, 항목 수(2~5개) 지적은 알림으로 낮췄습니다(견본 먼저).")
         if not self.basis_off:
             blocks = self.basis_first(blocks)
         elif basis_exempt(self.doc_type):
@@ -279,6 +292,7 @@ class Builder(FillPart, RulesPart):
             self.table_titles(out)
         self.flow_steps(out)
         self.check_endings(out)
+        out = self.law_refs(out)  # 참고 근거법령은 상자·머리 기호 없이 원문 번호로(사용자 2026-11-15 시안 B) — 법령 이름 ○를 빼므로 아래 알림 앞에
         self.ref_bullets(out)
         if opts.get("keep_groups", True):
             self.keep_groups(out)
@@ -329,6 +343,7 @@ class Builder(FillPart, RulesPart):
         if opts.get("fit", True):
             f = Fitter(self)
             f.push = opts.get("push_down", True)  # 끝 줄 한두 낱말 내리기(끄면 올리기만)
+            f.defer_hints = True  # '한 줄 줄이기 후보'는 맞춤을 다 끝낸 뒤 검사만과 같은 셈으로(fit_lines)
             f.fit_tables()
             f.fit_tables(again=True)  # 한 번 더: 자간·한 줄로 입력·폭 빌리기 뒤 다시 재도 같은 결과가 되게(다듬기의 고정점)
             f.fit_lines()
@@ -346,6 +361,8 @@ class Builder(FillPart, RulesPart):
                 f.pull_corners()  # 맨 마지막: 내어쓰기를 다시 재는 단계들 뒤에(아랫줄은 그대로, 낫표만 당김)
             if opts.get("line_fill", True):
                 f.fill_ends()  # 낫표 당기기로 줄어든 폭까지 보고 끝선에
+            f.rescan_hints = True  # 내린 두 줄 문단의 '한 줄 줄이기 후보'를 다 맞춘 문서에서(검사만과 같게)
+            f.report_cut_hints()
             self.fit_notes = f.notes + [f.report()]
             shrunk = [f._main_size(t) for t, d in getattr(f, "page_shrink", {}).items() if d]
             self.table_pt = min(shrunk) if shrunk else None  # 한 장에 넣으려 줄인 표 글자 — 문서에 남겨 검사만이 다시 키우는 것으로 보지 않게
@@ -448,6 +465,8 @@ class Builder(FillPart, RulesPart):
             meta.update({k: v for k, v in (("doc_type", self.doc_type), ("basis", "off")) if v})
         if getattr(self, "basis_searched", False):
             meta["basis_searched"] = "yes"
+        if getattr(self, "sample_free", None):
+            meta["sample"] = ",".join(sorted(self.sample_free))  # 견본이 원칙과 달리 둔 것 — 검사만도 같은 판단
         meta.update(getattr(self, "fit_base", None) or {})
         fit_line = self.fit_line_mark()
         if fit_line:
@@ -487,7 +506,7 @@ def main():
     errors, notes, outline = check(a.out)
     # 뺀다고 한 요소의 지적은 알림으로 — 근거법령 검사를 끈 문서("basis_first": false·근거법령 없이 시작하는 doc_type)의 근거법령
     # 지적도(설명서는 '끄면 근거법령 검사도 건너뜀'인데 부연설명·○ 하나 지적이 '고쳐야 함'으로 남았음, 검토 2026-11-12)
-    off = b.omit | ({"basis"} if getattr(b, "basis_off", False) else set())
+    off = b.omit | ({"basis"} if getattr(b, "basis_off", False) else set()) | (getattr(b, "sample_free", set()) & {"counts"})
     fix = [w for w in b.warnings + b.fit_notes if note_is_fix(w, off)]
     info = [w for w in b.warnings + b.fit_notes if not note_is_fix(w, off)]
     pages = next((w for w in info if w.startswith("어림 쪽 수")), "")
@@ -507,6 +526,7 @@ def main():
         print(" - " + tell)
     if not a.brief:  # 전하기 전 마지막 판에서만
         print_citations(para_text(p) for p in b.sec.iter(T("hp:p")))
+    proofread.print_report(b.pkg)  # 수치·맞춤법 — 고치지 않고 알림(사용자 2026-11-15)
     print_report(errors, notes, None if a.brief else outline)
     # 끝 번호: 0 = 고칠 것 없음, 1 = 구조 검사 문제(파일을 쓰면 안 됨), 3 = 파일은 만들었고 '고쳐야 함'이 남음
     sys.exit(1 if errors else 3 if (fix or notes) else 0)

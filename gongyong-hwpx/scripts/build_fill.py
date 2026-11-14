@@ -156,9 +156,19 @@ class FillPart:
             body = NUMWORD_RE.sub("\\1\u237d", body)
         if self.colons:
             body = space_colons(body)
-        if len(re.findall(r"\*\*", body)) % 2 or len(re.findall(r"\^\^", body)) % 2:
+        unpaired = len(re.findall(r"\*\*", body)) % 2 or len(re.findall(r"\^\^", body)) % 2
+        if unpaired:
             self.warn(f"{where}: 짝이 없는 **(또는 ^^)가 있어 글자 그대로 찍힙니다 — 짝을 맞추거나 지우세요: ‘{body[:24]}…’", level="fix")
+        parts = []
         for part in MARKUP_RE.split(body):
+            if part.startswith("**") and part.endswith("**") and len(part) > 4 and "^^" in part[2:-2]:
+                # 굵은 조각 안 위 첨자(굵은 이름표 '(기득하천사용자^^*^^)') — 굵게 / 위 첨자 / 굵게로 나눔(사용자 2026-11-15
+                # '볼드체에 첨자 *가 들어갈때 이상': 통째로 굵게 넣어 ^^*^^가 글자 그대로 찍혔음)
+                parts += [f"**{x}**" if not x.startswith("^^") else x
+                          for x in re.split(r"(\^\^.+?\^\^)", part[2:-2]) if x]
+            else:
+                parts.append(part)
+        for part in parts:
             if not part:
                 continue
             src = normal
@@ -174,6 +184,9 @@ class FillPart:
                     src = sup
                 else:
                     self.warn(f"{where}: 견본 문단에 위 첨자 조각이 없어 ^^…^^ 부분을 보통 글씨로 넣었습니다.", level="fix")
+            if ("**" in part or "^^" in part) and not unpaired:
+                self.warn(f"{where}: 굵게(**)·위 첨자(^^) 표시가 글자 그대로 남았습니다 — 표시를 겹치거나 짝을 어긋나게 쓰지 마세요: "
+                          f"‘{part[:24]}’", level="fix")
             new_runs.append(self._mk(src, part))
         if not new_runs:
             new_runs.append(self._mk(normal, ""))

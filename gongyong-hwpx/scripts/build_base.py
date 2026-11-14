@@ -32,7 +32,7 @@ from hwpx_lib import (HWPUNIT_PER_MM, NUM_CHARS, UNIT_RE, T, HeaderEdit, Package
                       cell_paras,
                       drop_linesegs, indexed_runs, is_blank, is_struct, label_colon, label_content, marker_level, new_id,
                       page_info, para_pics, para_runs, para_tables, para_text, run_objects, run_text, set_run_text, space_colons,
-                      Note, clear_print_method, fake_label, fix_note, head_length, note_is_fix, pct_range,
+                      Note, clear_print_method, fake_label, fix_note, head_length, note_is_fix, pct_range, OMIT_MARK_RE, OMIT_DOTS, is_narrative, label_long, quote_indent,
                       split_marker,
                       table_grid, TABLE_TITLE_MARK, is_table_title)
 from check import check, print_report  # noqa: E402
@@ -109,7 +109,7 @@ MID_DOTS = "·ㆍ"
 # — 계획의 "doc_type"이 이 꼴이면 근거법령 검사(맨 앞으로 옮기기·'근거법령이 없습니다')를 건너뛴다(사용자 2026-11-07 '충돌이 있는
 # 근거법령부분은 특정 보고에서는 빼도록 조정합시다'). 검사만(review)은 만든 문서에 남긴 표시나 제목 상자 글로도 알아본다.
 BASIS_EXEMPT_RE = re.compile(r"회의\s*자료|보도\s*자료|보도\s*(관련\s*)?대응|언론|답변서?|주간\s*(업무)?\s*보고|사업\s*설명서")
-SKILL_VERSION = "2.13"  # 만든 문서에 남기는 판(meta made=…) — 판을 올릴 때 README '지금 판'과 함께 바꿈
+SKILL_VERSION = "2.14"  # 만든 문서에 남기는 판(meta made=…) — 판을 올릴 때 README '지금 판'과 함께 바꿈
 # 계획 "omit": 사용자가 일부러 뺀 요소 — 그 요소의 '고쳐야 함'을 알림으로 낮춘다(평가 2026-11-08 '사용자가 일부러 뺀 것을
 # 선언할 길이 없다 — 날짜 줄·요약 상자를 빼라고 해도 끝 번호 3'). 키 → 보이는 이름. 알림이 키를 kind로 든다(fix_note)
 OMIT_KEYS = {"date": "날짜·부서 줄", "summary": "요약 상자", "basis": "근거법령", "table_title": "■ 표 제목"}
