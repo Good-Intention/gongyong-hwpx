@@ -2,6 +2,7 @@
 """사용자 원칙(Builder의 일부): 묶음 유지·줄 바꿈, 괄호 이름표 폭, 쌍점·이름표 내어쓰기, □·■ 제목, 항목 수·근거법령·표 제목 검사, 설명글·괄호 작게, 따옴표 붙이기, 번호·빈 줄·단위 줄, 근거법령 1번."""
 from build_base import *  # noqa: F401,F403 — 상수·공통 함수·BuildError
 from hwpx_lib import _base_head  # noqa: E402,F401 — 밑줄 이름은 *로 안 넘어옴
+from fit_base import LAW_ARTICLE_GAP, LAW_LINE, LAW_NAME_GAP  # noqa: E402 — 참고 근거법령 줄 간격·위 여백(쪽 맞춤과 같은 값)
 
 
 class RulesPart:
@@ -884,10 +885,13 @@ class RulesPart:
                 break
         res, in_law, name_pt, names, lines = [], False, None, 0, 0
         last_law = False  # 바로 앞이 상자 없는 법령 줄인가 — 조문 상자(표) 아래 ※ 출처는 상자 왼쪽 끝 그대로
+        ref_names, first_article = 0, True  # 이 참고의 법령 이름 줄 수, 다음 조 줄이 법령 이름 바로 밑 첫 조인가
+        kinds = []  # (문단, 'name'|'article'|'item'|'note') — 조 묶음째 쪽 나눔(아래)
         for p in out:
             if para_tables(p):
                 if self._is_ref_head(p):
                     in_law = bool(re.search(r"법령|조문|법규", self._ref_title(p)))
+                    ref_names, first_article = 0, True
                 res.append(p)
                 last_law = False
                 continue
@@ -909,8 +913,10 @@ class RulesPart:
                 ws = len(text) - len(text.lstrip(" ⎵⍽"))
                 if ws:
                     self._keep_chars(p, ws, len(text))
-                p.set("paraPrIDRef", self.hedit.para_margin(p.get("paraPrIDRef"), "left", o_x1))
+                pid = self.hedit.para_margin(p.get("paraPrIDRef"), "left", o_x1)
+                p.set("paraPrIDRef", self.hedit.para_line(pid, LAW_LINE))  # 조문과 같은 줄 간격(사용자 2026-11-18 고친 판)
                 self.law_notes.add(p)
+                kinds.append((p, "note"))
                 res.append(p)
                 continue
             if mark and marker_level(text) == 1:
@@ -933,10 +939,15 @@ class RulesPart:
                     r.set("charPrIDRef", self.hedit.char_bold(r.get("charPrIDRef")))
                 pid = self.hedit.para_margin(p.get("paraPrIDRef"), "left", o_left)
                 pid = self.hedit.para_hang(pid, 0)
-                p.set("paraPrIDRef", self.hedit.para_keep_next(pid))
                 name_pt = self._main_pt(p)
+                if ref_names:  # 두 번째 법령부터 위를 조문 글 한 줄만큼(쪽 맨 위에서는 한글·어림 모두 위 여백을 두지 않음)
+                    pid = self.hedit.para_margin(pid, "prev", int(round((name_pt - 1) * LAW_LINE * LAW_NAME_GAP)))
+                p.set("paraPrIDRef", self.hedit.para_keep_next(pid))
+                kinds.append((p, "name"))
                 res.append(p)
                 names += 1
+                ref_names += 1
+                first_article = True
                 last_law = True
                 if tail is None:
                     continue
@@ -957,7 +968,12 @@ class RulesPart:
             size = self._main_pt(p)
             step = lvl if lvl is not None else dot_lvl
             pid = self.hedit.para_margin(p.get("paraPrIDRef"), "left", int(round(o_x1 + (step or 0) * size * 100)))
-            pid = self.hedit.para_margin(pid, "prev", 100 if step is not None else 200)
+            # 위 여백: 항·호·목 1pt, 법령 이름 바로 밑 첫 조 2pt, 같은 법령의 두 번째 조부터는 조 묶음이 보이게 더(사용자 2026-11-18)
+            pid = self.hedit.para_margin(pid, "prev", 100 if step is not None else 200 if first_article else LAW_ARTICLE_GAP)
+            pid = self.hedit.para_line(pid, LAW_LINE)
+            kinds.append((p, "item" if step is not None else "article"))
+            if step is None:
+                first_article = False
             hang = 0
             if dot_lvl is not None:
                 font = self._body_font_of(p)
@@ -968,6 +984,11 @@ class RulesPart:
             res.append(p)
             lines += 1
             last_law = True
+        # 조 단위로 쪽을 나눔(사용자 2026-11-18 물음 — '조 제목만 홀로 남지 않게, 조와 조 사이에서'): 조 줄과 그 조의 항·호·목은
+        # 마지막 줄 앞까지 '다음 문단과 함께'. v2.14는 법령 이름 줄에만 걸어 조 제목만 쪽 끝에 남았음(검토보고 4쪽)
+        for (p, kind), nxt in zip(kinds, kinds[1:] + [(None, None)]):
+            if kind in ("article", "item") and nxt[1] == "item" and nxt[0] is res[res.index(p) + 1]:
+                p.set("paraPrIDRef", self.hedit.para_keep_next(p.get("paraPrIDRef")))
         if names or lines:
             self.warn(f"참고 근거법령 {names}개 법령·조문 {lines}줄은 상자·머리 기호 없이 원문 번호로 두었습니다"
                       "(법령 이름은 굵게, 항·호·목은 번호대로 들임 — 사용자 원칙).")
@@ -1142,7 +1163,9 @@ class RulesPart:
             if p.tag != T("hp:p") or para_tables(p):
                 continue
             text = para_text(p)
-            if marker_level(text) not in (2, 3) and p not in self.law_paras:  # 참고 근거법령 조문 줄도(시안 B — 조 제목 괄호까지 같게)
+            # 참고 근거법령 조문 줄은 괄호를 줄이지 않는다 — 원문 그대로 본문과 같은 크기(사용자 2026-11-18 '괄호안에 글자도 동일
+            # 사이즈처리(줄이기 없음)' — v2.14까지는 조 제목 괄호까지 2pt 작게 했음)
+            if marker_level(text) not in (2, 3) or p in self.law_paras:
                 continue
             spans, depth, quote, start = [], 0, 0, None
             for i in range(_base_head(text), len(text)):

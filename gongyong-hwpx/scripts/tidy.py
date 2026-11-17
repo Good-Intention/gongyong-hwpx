@@ -40,7 +40,8 @@ from hwpx_lib import (UNIT_RE, COMPOSE_CHAR, HWPUNIT_PER_MM, INVISIBLE_RE, KEYCA
 from layout import FIT_FLOOR, FW_EM, Layout, Metrics, spacing_after  # noqa: E402
 from spaces import compact_fw, lead_to_margin  # noqa: E402
 from build_base import DATE_LINE_RE, SKILL_VERSION, read_doc_meta  # noqa: E402
-from fit_base import CONNECTORS, fill_last_line  # noqa: E402
+from fit_base import CONNECTORS, REF_RE, fill_last_line  # noqa: E402
+from fit_lines import opener_cut  # noqa: E402 — 기호 앞 줄 바꿈 자리(작성 모드 opener_breaks와 같은 셈)
 from fit_tables import TableFit  # noqa: E402 — 제목 걸친 상자 찾기(_caption_content)를 작성 모드와 같게
 
 FW = "⎵"  # 고정폭 빈칸(1/4 글자, 양쪽 정렬 때 늘어나지 않음)
@@ -110,6 +111,22 @@ def letters(text):
 def _clean_text(text):
     """글자 비교 전에 clean_chars가 바꾼 것을 같게 — 보이지 않아야 하는 글자는 없는 셈, 키캡 숫자는 글자 겹치기 자리."""
     return INVISIBLE_RE.sub("", KEYCAP_RE.sub(COMPOSE_CHAR, text))
+
+
+def _only_breaks(a, b):
+    """b가 a에서 줄 바꿈만 달라졌는가: 빈칸 → 줄 바꿈(끝 줄 균형·연결어), 낱말 안에 줄 바꿈 끼움(여는 기호 앞 — opener_lines),
+    줄 바꿈 → 빈칸(줄 바꿈 풀기). 글자가 빠지거나 더해지면 False."""
+    i = j = 0
+    while i < len(a) and j < len(b):
+        if a[i] == b[j]:
+            i, j = i + 1, j + 1
+        elif b[j] == "\n" and a[i] == " " or b[j] == " " and a[i] == "\n":
+            i, j = i + 1, j + 1
+        elif b[j] == "\n":
+            j += 1
+        else:
+            return False
+    return i == len(a) and all(c == "\n" for c in b[j:])
 
 
 def flat(text):
@@ -2349,6 +2366,69 @@ class Tidier:
         if unsure:
             self.notes.append(f"끝 줄 두세 글자가 남은 문단 {unsure}개는 폭을 맞대어 보지 않은 글꼴이라 자간을 바꾸지 않았습니다(한글에서 확인).")
 
+    def narrow_short_lines(self):
+        """좁은 표 칸(본문 규칙을 쓰지 않는 칸 — _wide 아님)에도 끝 줄 두서너 자 규칙(사용자 2026-11-15 신청서 '예상 사용기간' 칸
+        '4주(기본) 필요 시 최대 / 8주' — '8주(두글자)가 내려와있다'): ① 칸 글 자간을 1%씩 줄여(-18%까지) 한 줄 덜 쓰게 올린다
+        ② 안 되면 윗줄 마지막 낱말 하나를 함께 내린다('필요 시 / 최대 8주' — 줄 바꿈) ③ 그래도 안 되면 알림만.
+        칸보다 긴 낱말 하나(글자 단위로 끊김)·조문 상자 인용 글·맞대어 보지 않은 글꼴은 그대로."""
+        pulled, pushed, cannot = [], [], []
+        for sec in self.secs:
+            for tbl in sec.iter(T("hp:tbl")):
+                for tc, w, _ in self._cells(tbl):
+                    if w <= 0 or self._wide(tc, w):
+                        continue
+                    for p in cell_paras(tc):
+                        text = para_text(p)
+                        if (para_tables(p) or para_pics(p) or "\n" in text or "\t" in text or not text.strip()
+                                or p in self._quote_ps or not self.fonts_ok(p)):
+                            continue
+                        chs, lines = self.lay.para_lines(p, w)
+                        if len(lines) < 2:
+                            continue
+                        tail = "".join(c[0] for c in chs[lines[-1][0]:lines[-1][1]]).strip()
+                        if not tail or " " in tail or self._tail_len(chs, lines[-1]) > SHORT_LAST:
+                            continue  # 끝 줄이 한 낱말 두서너 자일 때만
+                        if any(c[0] != " " for c in chs[lines[-2][1] - 1:lines[-2][1]]) and " " not in "".join(
+                                c[0] for c in chs[lines[-2][0]:lines[-2][1]]).strip():
+                            continue  # 윗줄이 낱말 하나(칸보다 긴 낱말이 글자 단위로 끊김)
+                        head = self.head_len(text)
+                        if head and not self._split_at(p, head):
+                            continue
+                        content = self._content_runs(p, head, len(text))
+                        n = len(lines)
+                        need = next((d for d in range(-1, FIT_FLOOR - 1, -1)
+                                     if len(self.lay.para_lines(p, w, delta=d, shrink=SLACK)[1]) < n), None)
+                        if need is not None:
+                            old = self._set_delta(content, need)
+                            if len(self.lay.para_lines(p, w)[1]) < n:
+                                self.mark(p, f"좁은 칸 끝 줄 ‘{tail}’ — 자간 {need:+d}%로 윗줄에")
+                                pulled.append(tail)
+                                continue
+                            self._undo(old)
+                        ps, pe = lines[-2][0], lines[-2][1]
+                        at = next((i for i in range(pe - 1, max(ps, head), -1)
+                                   if chs[i][0] == " " and chs[i - 1][0] not in (" ", "⎵", "⍽")
+                                   and "".join(c[0] for c in chs[ps:i]).strip()), None)  # 윗줄 마지막 낱말 앞 빈칸
+                        if at is None or not self._break_at(p, at):
+                            cannot.append(tail)
+                            continue
+                        c2, l2 = self.lay.para_lines(p, w)
+                        if len(l2) != n:
+                            self._swap_char(p, at, "\n", " ")
+                            cannot.append(tail)
+                            continue
+                        last = "".join(c[0] for c in c2[l2[-1][0]:l2[-1][1]]).strip()
+                        self.mark(p, f"좁은 칸 끝 줄 ‘{tail}’ — 윗줄 낱말을 함께 내림(끝 줄 ‘{last}’, 줄 바꿈)")
+                        pushed.append(last)
+        if pulled:
+            self.notes.append(f"좁은 표 칸에서 끝 줄에 두서너 자만 남던 칸 글 {len(pulled)}개는 자간을 줄여(-18%까지) 윗줄로 올렸습니다"
+                              f"(예: ‘{pulled[0]}’).")
+        if pushed:
+            self.notes.append(f"좁은 표 칸에서 올리지 못한 칸 글 {len(pushed)}개는 윗줄 마지막 낱말을 함께 내렸습니다(예: ‘{pushed[0]}’ — 줄 바꿈).")
+        if cannot:
+            self.notes.append(f"좁은 표 칸 끝 줄 두서너 자 {len(cannot)}곳은 올리지도 내리지도 못해 그대로 두었습니다(예: ‘{cannot[0]}’) — "
+                              "칸을 넓히거나 낱말을 줄이면 됨.")
+
     def _content_spacing(self, p):
         """머리 기호·이름표 뒤 내용 첫 글자의 자간(%)."""
         text = para_text(p)
@@ -2424,13 +2504,14 @@ class Tidier:
         """줄 끝에 화살표·연결어(+·및·또는·= 등)만 남으면 그 앞에서 줄을 바꿔 다음 줄 첫머리로 — 작성 모드와 같은 사용자 원칙, 표 칸에도(양식 시험 2026-11-09
         '… → 범위 → / 기간 → 확인'). 줄 수가 늘면 그대로. 윗줄 빈 곳은 다음 단계(fill_broken)가 자간으로 채운다."""
         n = 0
+        law = self._law_ref_paras()
         for paras, w, _ in self.blocks():
             for p in paras:
                 text = para_text(p)
                 if para_tables(p) or para_pics(p) or "\t" in text or not text.strip() or re.search(r"\n[ ⎵⍽　]+", text):
                     continue
-                if p in self._quote_ps:
-                    continue  # 조문 상자 인용 글에는 줄 바꿈을 넣지 않음
+                if p in self._quote_ps or p in law:
+                    continue  # 조문 상자 인용 글·참고 근거법령 원문에는 줄 바꿈을 넣지 않음(작성 모드와 같게 — --all 정돈이 '소하천구역⏎및'을 넣던 것, 2026-11-18)
                 if self.styles.para.get(p.get("paraPrIDRef"), {}).get("align") not in ("JUSTIFY", "DISTRIBUTE", "LEFT", None):
                     continue
                 for _try in range(4):
@@ -2453,6 +2534,76 @@ class Tidier:
                     n += 1
         if n:
             self.notes.append(f"줄 끝에 남던 화살표·연결어 {n}곳을 다음 줄 첫머리로 내렸습니다.")
+
+    def _law_ref_paras(self):
+        """참고 근거법령(참고 머리표 제목에 '법령'·'조문') 쪽의 본문 문단 — 원문 인용이라 줄 바꿈을 넣지 않는다(작성 모드 law_paras와 같은 뜻)."""
+        out, in_law = set(), False
+        for sec in self.secs:
+            for p in [x for x in sec if x.tag == T("hp:p")]:
+                tables = para_tables(p)
+                if tables:
+                    t = tables[0]
+                    if t.get("rowCnt") == "1" and t.get("colCnt") != "1":
+                        grid = table_grid(t)
+                        if grid and REF_RE.match(" ".join(para_text(cp) for cp in cell_paras(grid[0][4]))):
+                            title = " ".join(para_text(cp) for *_, tc in grid for cp in cell_paras(tc))
+                            in_law = bool(re.search(r"법령|조문|법규", title))
+                    continue
+                if in_law:
+                    out.add(p)
+        return out
+
+    def _newline_before(self, p, i):
+        """글자 위치 i 앞에서 줄을 바꾼다 — 앞이 보통 빈칸이면 그 빈칸을 줄 바꿈으로, 아니면('없음(대법원') 줄 바꿈을 끼움.
+        바꿨으면 되돌리기 함수를, 못 했으면 None."""
+        text = para_text(p)
+        if i > 0 and text[i - 1] == " ":
+            return (lambda: self._swap_char(p, i - 1, "\n", " ")) if self._break_at(p, i - 1) else None
+        pos = 0
+        for r in para_runs(p):
+            t = run_text(r)
+            if pos <= i < pos + len(t):
+                if not plain_run(r):
+                    return None
+                edit_run_text(r, t[:i - pos] + "\n" + t[i - pos:], self.tab_proto)
+                self.eol_ok.add(p)
+                return lambda: self._swap_char(p, i, "\n", "")
+            pos += len(t)
+        return None
+
+    def opener_lines(self):
+        """여는 기호(괄호·낫표·따옴표)·화살표로 시작하는 덩어리가 줄 끝에서 갈라지면 기호 앞에서 줄을 바꾼다 — 작성 모드
+        opener_breaks와 같은 규칙·같은 셈(fit_lines.opener_cut, 사용자 2026-11-15·18). 글은 바꾸지 않고 줄 바꿈만. 표 칸 보고서
+        글에도(신청서 '개발내용' 칸 '→ 사용자'), 조문 상자 인용 글·참고 근거법령 원문에는 넣지 않는다. 줄 수가 늘면 되돌린다."""
+        n = 0
+        law = self._law_ref_paras()
+        for paras, w, _ in self.blocks():
+            for p in paras:
+                text = para_text(p)
+                if para_tables(p) or para_pics(p) or "\t" in text or not text.strip() or re.search(r"\n[ ⎵⍽　]+", text):
+                    continue
+                if p in self._quote_ps or p in law or not self.fonts_ok(p):
+                    continue
+                if self.styles.para.get(p.get("paraPrIDRef"), {}).get("align") not in ("JUSTIFY", "DISTRIBUTE", "LEFT", None):
+                    continue
+                for _try in range(4):
+                    chs, lines = self.lay.para_lines(p, w)
+                    if len(lines) < 2:
+                        break
+                    hit = opener_cut(chs, lines, self.head_len(para_text(p)))
+                    if hit is None:
+                        break
+                    undo = self._newline_before(p, hit[1])
+                    if undo is None:
+                        break
+                    if len(self.lay.para_lines(p, w)[1]) > len(lines):
+                        undo()
+                        break
+                    self.mark(p, "기호로 시작하는 덩어리를 다음 줄 첫머리로")
+                    n += 1
+        if n:
+            self.notes.append(f"줄 끝에서 갈라지던 괄호·낫표·화살표 덩어리 {n}곳은 기호 앞에서 줄을 바꿔 다음 줄 첫머리로 내렸습니다"
+                              "(윗줄이 많이 비지 않을 때 — 사용자 원칙).")
 
     def fill_broken(self):
         """줄 바꿈(Shift+Enter)으로 끝나는 줄은 한글이 양쪽 정렬로 벌리지 않아 줄 끝이 빈다 — 끝 줄 균형을 맞추려고 넣은 줄 바꿈
@@ -2817,10 +2968,12 @@ class Tidier:
             self.quote_align()  # 둘째 줄 맞춤보다 먼저(양쪽 정렬이어야 머리 빈칸을 고정폭으로 바꿈)
             self.cell_indent()  # 줄 나눔이 바뀔 수 있어 줄 맞춤 단계보다 먼저
             self.hangs()
+            self.opener_lines()  # 빈칸 맞춤(자간 넓히기)보다 먼저 — 넓힌 뒤에는 윗줄이 차 보여 기호 앞 자리를 못 찾음(작성 모드와 같은 차례)
             self.sparse_lines()
             self.hangs_again()
             self.quote_fit()  # 둘째 줄 맞춤(내어쓰기)이 정해진 뒤 — 조문 상자 인용 글은 자간으로만
             self.short_lines()
+            self.narrow_short_lines()  # 좁은 표 칸 끝 줄 두서너 자(본문 규칙을 쓰지 않던 칸 — 사용자 2026-11-15)
             self.connector_lines()
             self.fill_broken()
             self.harmonize()
@@ -3031,8 +3184,8 @@ class Tidier:
         a, b = self.orig_text.get(p), para_text(p)
         if a is None:
             return True
-        if p in self.eol_ok:
-            a, b = a.replace("\n", " "), b.replace("\n", " ")
+        if p in self.eol_ok:  # 빈칸을 줄 바꿈으로 바꿨거나, 낱말 안 여는 기호 앞에 줄 바꿈만 끼운 것('없음⏎(대법원' — opener_lines)
+            return _only_breaks(flat(a), flat(b)) and self.orig_marks.get(p) == text_marks(p)
         return flat(a) == flat(b) and self.orig_marks.get(p) == text_marks(p)
 
     def change_lines(self, limit=80):

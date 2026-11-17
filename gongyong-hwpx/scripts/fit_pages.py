@@ -38,6 +38,7 @@ class PageFit:
         return len(used) * self.body_h * 10 + split + gaps, len(used)
 
     def fit_pages(self):
+        self.line_orig = getattr(self, "line_orig", {})
         kinds = self.spacer_kinds()
         narrow = min(kinds, key=kinds.get) if kinds else None
         segs, cur = [], []
@@ -64,6 +65,8 @@ class PageFit:
             summary_gap = self._summary_gap(seg)
             saved = {p: (p.get("paraPrIDRef"), [r.get("charPrIDRef") for r in para_runs(p)])
                      for p in spacers + texts + ([summary_gap] if summary_gap is not None else [])}
+            for p, (pid, _) in saved.items():  # 줄이기 전 문단 모양 — 자리가 남는 마지막 본문 쪽은 되돌림(spread_pages)
+                self.line_orig.setdefault(p, pid)
             figs = [(t, cells) for p in seg for t in para_tables(p) for cells in [self._figure_cells(t)] if cells]
             fig_h = {el: int(el.find(T("hp:cellSz" if el.tag == T("hp:tc") else "hp:sz")).get("height", "0"))
                      for t, cells in figs for el in [t, *cells]}
@@ -104,6 +107,8 @@ class PageFit:
                     pid = saved[p][0]
                     cur = self.st.para.get(pid, {}).get("line", 0)
                     new = cur - d if cur >= body else (v if cur > v else cur)
+                    if p in self.b.law_paras or p in self.b.law_notes:  # 참고 근거법령은 160%까지만(사용자 2026-11-18)
+                        new = max(new, min(cur, LAW_LINE_MIN))
                     if new != cur:
                         p.set("paraPrIDRef", self.b.hedit.para_line(pid, new))
 
@@ -245,9 +250,12 @@ class PageFit:
         lim = self.body_h - SAFETY
         base, used = self.lay.paginate(paras, self.body_w, lim, heads, BLOCK_GAP)
         done = []
-        for k in range(len(used) - 1):
+        for k in range(len(used)):
             nxt = next((i for i, (s, _) in enumerate(base) if s == k + 1), None)
-            if nxt is None or self._is_ref_head(paras[nxt]) or lim - used[k] < self.body_h * SPREAD_GAP:
+            if nxt is None or self._is_ref_head(paras[nxt]):
+                self._restore_lines(k, paras, heads, base, lim, done)  # 마지막 본문 쪽은 넓히지 않고 줄인 것만 되돌림
+                continue
+            if lim - used[k] < self.body_h * SPREAD_GAP:
                 continue
             if k == 0 and cover_end(paras) is not None:
                 continue  # 표지는 fit_cover가 맡음
@@ -294,9 +302,55 @@ class PageFit:
             else:
                 for t in tbls:
                     self._set_rows(t, rows0[t])
+        back = [d for d in done if d.endswith("되돌림")]
+        done = [d for d in done if not d.endswith("되돌림")]
         if done:
             self.notes.append("아래 끝선이 애매하게 빈 쪽은 그 쪽 줄 간격을 통째로 같은 만큼(표가 많은 쪽은 표 줄 높이) 늘려 빈 곳을 줄였습니다("
                               + ", ".join(done) + ").")
+        if back:
+            self.notes.append("자리가 남는 마지막 본문 쪽은 쪽 맞춤이 줄인 줄 간격을 앞 쪽과 같은 값으로 되돌렸습니다(" + ", ".join(back) + ").")
+
+    def _restore_lines(self, k, paras, heads, base, lim, done):
+        """마지막 본문 쪽(다음이 참고이거나 문서 끝)에서 쪽 맞춤(fit_pages)이 줄인 줄 간격을 본래 값까지 5%p씩 되돌린다 — 쪽이
+        바뀌지 않는 데까지(사용자 2026-11-18 고친 판: 새 쪽에서 시작해 3분의 1만 쓰는 '□ 조치계획' 쪽이 □ 160·○ 150·※ 140%로
+        줄어 있던 것을 앞 장과 같은 □ 180·○ 170%로). 넓히기(spread_pages)는 이 쪽에 하지 않는다 — 본래 값을 넘기지 않음."""
+        orig = getattr(self, "line_orig", {})
+        if any(self._is_ref_head(p) for i, p in enumerate(paras) if base[i][0] <= k):
+            return  # 참고 쪽은 fit_refs가 맡음
+        if k == 0 and cover_end(paras) is not None:
+            return
+
+        def line(pid):
+            return self.st.para.get(pid, {}).get("line", 0)
+
+        # 되돌릴 값: 본래 값, 앞 쪽에서 같은 모양 문단을 넓혔으면(spread_pages) 그 값까지 — 쪽마다 줄 간격이 달라 보이지 않게
+        # (고친 판은 1쪽과 같게 □ 180·○ 170%). 상한 LINE_CAP
+        peer = {}
+        for i, p in enumerate(paras):
+            if p in orig and base[i][0] != k:
+                peer[orig[p]] = max(peer.get(orig[p], 0), line(p.get("paraPrIDRef")))
+        want = {p: min(LINE_CAP, max(line(orig[p]), peer.get(orig[p], 0))) for p in orig}
+        texts = [p for i, p in enumerate(paras) if base[i] == (k, k) and p in orig and line(p.get("paraPrIDRef")) < want[p]]
+        if not texts:
+            return
+        saved = {p: p.get("paraPrIDRef") for p in texts}
+
+        def up(d):
+            for p in texts:
+                cur = line(saved[p])
+                v = min(want[p], cur + d)
+                p.set("paraPrIDRef", orig[p] if v == line(orig[p]) else self.b.hedit.para_line(saved[p], v) if v != cur else saved[p])
+
+        best = 0
+        for d in range(5, max(want[p] - line(saved[p]) for p in texts) + 1, 5):
+            up(d)
+            where, u = self.lay.paginate(paras, self.body_w, lim, heads, BLOCK_GAP)
+            if where != base or u[k] > lim:
+                break
+            best = d
+        up(best)
+        if best:
+            done.append(f"{k + 1}쪽 줄 간격 +{best} 되돌림")
 
     # ------------------------------------------------------------ 참고 쪽 채우기
     def _is_ref_head(self, p):
@@ -545,13 +599,16 @@ class PageFit:
             npg, last = sizes[k]
             if npg == 1 and pages:
                 gap = gap_before(k)
-                if self._is_ref_head(ch["body"][0]) and not whole_ref_fits(k, pages[-1]["y"]):
-                    pass  # 새 참고가 다 들어가지 않으면 새 쪽에서
+                if self._is_ref_head(ch["body"][0]) and (not pages[-1]["ref_top"] or not whole_ref_fits(k, pages[-1]["y"])):
+                    # 새 참고는 새 쪽에서 — 모으는 것은 앞 참고가 그 쪽 맨 위에서 시작한 쪽에, 다 들어갈 때만(사용자 2026-11-18:
+                    # 고친 판은 두 쪽에 걸친 참고1 끝 쪽 아래에 붙던 참고2를 새 쪽으로, 짧은 참고2·3은 한 쪽에 — 물음 '새 쪽, 짧은 것은 모음')
+                    pass
                 elif pages[-1]["y"] + gap + last <= lim:
                     pages[-1]["chunks"].append(k)
                     pages[-1]["y"] += gap + last
                     continue
-            pages.append({"chunks": [k], "y": last, "split": npg > 1})
+            pages.append({"chunks": [k], "y": last, "split": npg > 1,
+                          "ref_top": npg == 1 and self._is_ref_head(ch["body"][0])})
         joined = []
         for pi, pg in enumerate(pages):
             for j, k in enumerate(pg["chunks"]):

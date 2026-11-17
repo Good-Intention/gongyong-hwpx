@@ -5,6 +5,68 @@ from hwpx_lib import edit_run_text, plain_run, quote_indent  # noqa: E402
 from layout import FW_EM  # noqa: E402
 
 
+def loose_line(chs, s, e, used, avail):
+    """빈칸이 크게 벌어지는 줄인가: 덜 찬 줄(LOOSE 밑)이거나, 빈칸이 적어 빈칸 하나가 글자 폭의 SPREAD_EM배 넘게 늘어나는 줄
+    (소하천 문서 71번 — 87.7% 찼지만 빈칸 셋이 1.4글자씩 벌어짐, 검사만이 놓쳤음 2026-11-15)."""
+    if used / avail < LOOSE:
+        return True
+    seg = chs[s:e]
+    while seg and seg[-1][0] == " ":
+        seg = seg[:-1]
+    spaces = sum(1 for c in seg if c[0] == " ")
+    body = [c for c in seg if c[0] not in (" ", "⎵", "⍽", NL)]
+    if not body or spaces <= 0:
+        return False
+    em = max(c[2] for c in body)  # 글자 크기(HWPUNIT — chars의 셋째 칸은 1/100pt)
+    return (avail - used) / spaces / em >= SPREAD_EM
+
+
+def opener_cut(chs, lines, head):
+    """opener_breaks(작성)·opener_lines(정돈)가 줄을 바꿀 자리 (종류, 글자 번호) — 없으면 None. 윗줄부터 차례로 처음 걸리는 곳 하나."""
+    for li, (s0, e0, used, avail) in enumerate(lines[:-1]):
+        if e0 >= len(chs) or chs[e0 - 1][0] == NL or chs[e0][0] == NL:
+            continue
+        n_s, n_e = lines[li + 1][:2]
+        # ① 아랫줄 첫 낱말 '없음(대법원' — 기호 앞 글자를 윗줄로
+        k = n_s
+        while k < n_e and chs[k][0] not in (" ", NL) and chs[k][0] not in OPENERS:
+            k += 1
+        if n_s < k < n_e and chs[k][0] in OPENERS and n_s > head and chs[n_s - 1][0] == " ":
+            gain = sum(c[1] for c in chs[n_s - 1:k])  # 빈칸 + 기호 앞 글자
+            if used + gain <= avail * SLACK:
+                return "pull", k
+        # ② 윗줄 끝에서 열려 아랫줄에서 닫히는 괄호·낫표
+        depth, opened = 0, None
+        for i in range(max(s0, head), e0):
+            ch = chs[i][0]
+            if ch in OPENERS:
+                if depth == 0:
+                    opened = i
+                depth += 1
+            elif ch in CLOSERS and depth:
+                depth -= 1
+                if depth == 0:
+                    opened = None
+        if opened is not None and opened > max(s0, head):
+            a = opened
+            while a > s0 and chs[a - 1][0] == " ":
+                a -= 1
+            fill = sum(c[1] for c in chs[s0:a]) / avail
+            if a > max(s0, head) and (fill >= OPEN_FILL or (loose_line(chs, s0, e0, used, avail) and fill >= OPEN_FILL_LOOSE)):
+                return "open", opened
+        # ③ 윗줄 끝 '→ 한두 낱말'
+        seg = "".join(c[0] for c in chs[s0:e0]).rstrip()
+        words = seg.split(" ")
+        for w in range(2, min(4, len(words))):
+            if words[-w] in ARROWS:
+                a = s0 + len(" ".join(words[:-w]))  # 화살표 앞 빈칸 자리
+                fill = sum(c[1] for c in chs[s0:a]) / avail
+                if a > max(s0, head) + 1 and fill >= ARROW_FILL:
+                    return "arrow", a + 1
+                break
+    return None
+
+
 class LineFit:
     # ------------------------------------------------------------ 줄 맞춤
     def checked(self, p):
@@ -257,6 +319,8 @@ class LineFit:
         return pulled, widened
 
     def widen_sparse(self):
+        # 기호 앞 줄 바꿈이 먼저 — 넓히기(자간 +)가 윗줄을 채운 뒤에는 '앞 글자 올리기' 자리·'크게 벌어지는 줄'을 알아볼 수 없음
+        self.opener_breaks()
         pulled, widened = self._sparse_pass()
         if pulled:
             self.notes.append(f"다음 낱말이 넘어가 빈칸이 크게 벌어질 문단 {len(pulled)}개는 자간을 줄여"
@@ -278,8 +342,8 @@ class LineFit:
                 continue  # 가운데·왼쪽 정렬 줄은 낱말 사이가 벌어지지 않음
             chs, lines = self.lay.para_lines(p, box_w)
             # 줄 바꿈으로 끝나는 줄은 한글이 벌리지 않으므로 세지 않음(만든 뒤 검사만이 '빈칸 큰 줄'로 보던 것 — 평가 2026-11-09)
-            if any(used / avail < LOOSE and "\n" not in (chs[e - 1][0], chs[e][0] if e < len(chs) else "")
-                   for _, e, used, avail in lines[:-1]):
+            if any(self._loose(chs, s, e, used, avail) and "\n" not in (chs[e - 1][0], chs[e][0] if e < len(chs) else "")
+                   for s, e, used, avail in lines[:-1]):
                 text = para_text(p)
                 # 상자·표 칸 안 문단이면 밝힌다 — 같은 글이 본문에도 있으면 어느 쪽인지 알 수 없었음(시험 2026-11-12: 표지 개요 상자의 줄)
                 inside = "(상자·표 칸 안) " if any(a.tag == T("hp:tc") for a in p.iterancestors()) else ""
@@ -423,6 +487,61 @@ class LineFit:
         if done:
             self.notes.append(f"줄 끝에 남던 연결어·연결 기호(+·및·= 등) {done}곳은 다음 줄 첫머리로 내렸습니다.")
 
+    def opener_breaks(self):
+        """여는 기호(괄호·낫표·따옴표)·화살표로 시작하는 덩어리가 줄 끝에서 갈라지면 그 기호 앞에서 줄을 바꾼다(사용자 2026-11-15
+        '특수기호로 시작하는건 윗줄이 공백이 많지 않은 상황이라면 아랫줄로 내려서 표현하는게 깔끔하다(당연히 한줄에 다 넣는걸
+        선호하지만)', '화살표 사용자는 내려와야 보기 좋다'). 한 줄에 넣기(자간)는 앞 단계가 이미 해 봄. 한글은 어절 단위라
+        '없음(대법원'·'땅(건물'을 한 낱말로 보아 통째로 넘기거나 괄호를 윗줄 끝에서 연다.
+        ① 아랫줄 첫 낱말 '없음(대법원'의 기호 앞 글자가 윗줄에 들어가면 올리고 기호부터 내림
+        ② 윗줄 끝에서 열린 괄호·낫표가 아랫줄에서 닫히면 그 기호부터 내림 — 윗줄이 OPEN_FILL 넘게 차 있을 때, 또는 그대로 두면
+           빈칸이 크게 벌어지는 줄(LOOSE 밑)일 때(사용자 2026-11-18 물음 '괄호 앞에서 내림' — 줄 바꿈 앞 줄은 한글이 벌리지 않음)
+        ③ 윗줄 끝에 화살표 + 한두 낱말이 매달리면 화살표부터 내림 — 윗줄이 ARROW_FILL 넘게 남을 때(2026-11-04 '한 줄을 채우고
+           내려오는 게 좋다'는 그대로 — 긴 토막은 그대로 둠). 줄 수가 늘면 되돌린다. 요약 상자는 하지 않음(style-guide)."""
+        done = {"pull": 0, "open": 0, "arrow": 0}
+        summary = self.summary_paras()
+        for p, box_w in self.text_boxes():
+            if p in summary or not self.checked(p):
+                continue
+            if any(a.tag == T("hp:tc") for a in p.iterancestors()):
+                continue  # 상자·표 칸 안(제목·요약·본문 법령 상자 등)은 그대로 — 본문 글 줄만(사용자 2026-11-18 '본문 법령 상자는 기존 유지')
+            if self.st.para.get(p.get("paraPrIDRef"), {}).get("align") not in ("JUSTIFY", "DISTRIBUTE", "LEFT"):
+                continue
+            head = head_length(para_text(p))
+            for _ in range(4):
+                chs, lines = self.lay.para_lines(p, box_w)
+                if len(lines) < 2:
+                    break
+                hit = self._opener_cut(chs, lines, head)
+                if hit is None:
+                    break
+                kind, idx = hit
+                saved = [(r, r.get("charPrIDRef"), copy.deepcopy(list(r))) for r in para_runs(p)]
+                self._insert_breaks(p, [(0, 0, "space", idx)])
+                _, l2 = self.lay.para_lines(p, box_w)
+                if len(l2) > len(lines):
+                    for r, cid, kids in saved:
+                        for ch in list(r):
+                            r.remove(ch)
+                        for k in kids:
+                            r.append(k)
+                        r.set("charPrIDRef", cid)
+                    break
+                done[kind] += 1
+        msg = []
+        if done["pull"]:
+            msg.append(f"아랫줄 첫 낱말에 붙은 앞 글자를 윗줄로 올리고 괄호·낫표부터 내린 곳 {done['pull']}곳")
+        if done["open"]:
+            msg.append(f"윗줄 끝에서 열려 아랫줄에서 닫히던 괄호·낫표를 기호부터 다음 줄로 내린 곳 {done['open']}곳")
+        if done["arrow"]:
+            msg.append(f"줄 끝에 매달린 ‘화살표 + 한두 낱말’을 화살표부터 다음 줄로 내린 곳 {done['arrow']}곳")
+        if msg:
+            self.notes.append("; ".join(msg) + "(줄 바꿈 — 기호로 시작하는 덩어리는 아랫줄 첫머리로, 사용자 원칙).")
+
+    def _opener_cut(self, chs, lines, head):
+        return opener_cut(chs, lines, head)
+
+    def _loose(self, chs, s, e, used, avail):
+        return loose_line(chs, s, e, used, avail)
     def _arrow_hang(self, p, box_w, a, n_lines, restore):
         """화살표(글자 위치 a) 뒤 첫 글자 밑에 둘째 줄부터를 맞춘다: 그 앞 보통 빈칸은 고정폭 빈칸으로(첫 줄이 양쪽 정렬로
         늘어나도 화살표 뒤 글자 위치가 변하지 않게 — 쌍점·이름표 맞추기와 같은 방법), 내어쓰기 = 그 글자까지의 폭.
