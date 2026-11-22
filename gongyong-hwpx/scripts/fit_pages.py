@@ -139,7 +139,7 @@ class PageFit:
             lines_now = [self.st.para.get(saved[p][0], {}).get("line", 0) for p in texts]
             body = max(set(lines_now), key=lines_now.count) if lines_now else 0  # 본문 줄 간격(가장 많이 쓴 값)
             top = body  # 비용·단계는 본문 줄 간격 기준(제목 줄은 같은 폭만큼만 따라 낮춤 — line_to)
-            steps = list(range(top - 5, MIN_LINE - 1, -5)) if top > MIN_LINE else []
+            steps = list(range(top - 5, self.min_line - 1, -5)) if top > self.min_line else []
             # 바꾸는 정도(덜 바꿀수록 좋음): 줄 간격은 낮춘 %만큼, □ 사이 빈 줄 좁히기는 줄 간격 10%쯤으로 친다
             # — 같은 쪽 수라면 본문 140%보다 '빈 줄 좁힘 + 155%'가 덜 답답하다(2026-10-31)
             plans = [("그대로", 0, lambda: None)]
@@ -209,9 +209,15 @@ class PageFit:
         한글의 '다음 문단과 함께'는 표가 든 문단에서 묶음을 다 끌고 가지 않을 때가 있어(실측), 계산한 대로 쪽을 나눈다."""
         paras = self.paras()
         heads = self.heads()
-        # 쪽 맞춤(badness)과 같은 높이(본문 - SAFETY)로 나눈다 — 높이가 다르면 □ 블록 가운데에 쪽 나눔이 들어감(2026-10-31)
-        where, _ = self.lay.paginate(paras, self.body_w, self.body_h - SAFETY, heads, BLOCK_GAP)
-        targets = set(self.lay.moved)
+        # 쪽 맞춤(badness)과 같은 높이(본문 - SAFETY)로 나눈다 — 높이가 다르면 □ 블록 가운데에 쪽 나눔이 들어감(2026-10-31).
+        # 묶음 나누기가 마지막에 잰 어림을 그대로 씀(같은 문서를 한 번 더 재면 긴 표 문서에서 0.6초쯤 더 걸림)
+        where = self._loosen_chains(paras, heads)
+        if where is None:
+            where, _ = self.lay.paginate(paras, self.body_w, self.body_h - SAFETY, heads, BLOCK_GAP)
+        # 쪽 나눔은 묶음 머리(□·○·이름표 문단·표 묶음)에만 박는다 — 이어지는 '-' 문단(논증 둘째 문단 등)은 한글이 스스로 넘기게
+        # (받은 요청 2026-11-22 1번: 의뢰서 갑설 둘째 '-' 문단에 쪽 나눔이 박힘 — 문단 보호가 걸린 문단이 쪽 끝에 안 들어가 넘어간 것을
+        #  쪽 나눔으로 박으면 글을 고친 뒤에도 그 자리에 남음)
+        targets = {i for i in self.lay.moved if self._break_head(paras, i)}
         # 어림으로 쪽 맨 위에서 시작하는 □·참고 묶음도 쪽 나눔을 박아 둔다: 한글 쪽 내용이 어림보다 조금 짧으면
         # □ 제목과 표 머리 줄만 앞 쪽 끝에 남는 일이 있었음(2026-10-31 시험 문서 참고1)
         for i, p in enumerate(paras):
@@ -235,6 +241,76 @@ class PageFit:
                 k -= 1
         if n:
             self.notes.append(f"쪽 끝에 다 들어가지 않는 묶음 {n}곳은 묶음째 다음 쪽에서 시작하게 했습니다.")
+
+    def _keeps(self, p):
+        return self.st.para.get(p.get("paraPrIDRef"), {}).get("keep_next", False)
+
+    def _lead(self, p):
+        t = para_text(p)
+        return bool(para_tables(p)) or bool(UNIT_RE.match(t)) or t.lstrip().startswith("■")
+
+    def _break_head(self, paras, i):
+        """쪽 나눔을 박아도 되는 묶음 머리인가: 표·■ 제목·단위 줄, □·○, 참고 머리표, 이름표로 시작하는 문단((갑설)·〔부서 검토의견〕
+        ·'- (세부) …' 등), '질의…' 문단, 또는 묶음 안에 표가 든 것(한글의 '다음 문단과 함께'가 표를 다 끌고 가지 않을 때가 있음)."""
+        p = paras[i]
+        if self._lead(p) or self._is_ref_head(p):
+            return True
+        text = para_text(p)
+        if marker_level(text) in (1, 2):
+            return True
+        rest = split_marker(text)[2].lstrip(" ⎵⍽\t*")
+        if re.match(r"[(〔［\[][^)〕］\]\n]{1,14}[)〕］\]]", rest) or rest.startswith("질의"):
+            return True
+        j = i
+        while j + 1 < len(paras) and self._keeps(paras[j]) and paras[j + 1].get("pageBreak") != "1":
+            j += 1
+            if self._lead(paras[j]):
+                return True
+        return False
+
+    def _loosen_chains(self, paras, heads):
+        """'다음 문단과 함께'로 묶인 글 묶음(○와 그 아래 - 문단들)이 쪽 끝에 다 들어가지 않아 통째로 다음 쪽으로 가면 앞 쪽이
+        3분의 1 넘게 빌 때는 넘기지 않고 나눈다 — 머리 문단과 첫 아랫문단만 붙여 두고 그 아래 '-' 문단 사이의 묶음을 푼다
+        (받은 요청 2026-11-22 2번: 의뢰서 1쪽이 반쯤 빔). 표·■ 제목이 든 묶음은 그대로 통째로(사용자 원칙 2026-11-04 '큰 표는 밑으로
+        내려 한 장에'). □ 제목부터 이어진 묶음(□ → ○ → - …)도 같게 — □·○와 첫 '-'까지는 붙여 둠(의뢰서 '□ 자문 배경'이 통째로 넘어가
+        1쪽이 47%만 참, 2026-11-22 사용자 문서로 다시 만들어 봄)."""
+        lim = self.body_h - SAFETY
+        n = 0
+        for _ in range(8):
+            where, used = self.lay.paginate(paras, self.body_w, lim, heads, BLOCK_GAP)
+            hit = False
+            for i in list(self.lay.moved):
+                pg = where[i][0]
+                if pg < 1 or lim - used[pg - 1] <= self.body_h / 3:
+                    continue
+                j = i
+                while j + 1 < len(paras) and self._keeps(paras[j]) and paras[j + 1].get("pageBreak") != "1" \
+                        and paras[j + 1] not in heads:
+                    j += 1
+                chain = paras[i:j + 1]
+                if any(self._lead(p) for p in chain):
+                    continue
+                # 머리(□·○)와 첫 아랫문단(-·기호 없는 글 — 사이 빈 줄은 건너뜀)까지는 붙여 두고 그 뒤 묶음만 푼다. 머리가 '-'
+                # ('- (갑설) …'처럼 같은 수준 문단이 이어지는 묶음)면 머리부터 푼다 — 붙여 두면 긴 두 문단이 함께 넘어가 앞 쪽이 빔
+                if marker_level(para_text(paras[i])) in (1, 2):
+                    k0 = next((k for k in range(i + 1, j + 1) if para_text(paras[k]).strip()
+                               and marker_level(para_text(paras[k])) not in (1, 2)), j)
+                else:
+                    k0 = i
+                if j - k0 < 1:
+                    continue
+                for p in paras[k0:j]:
+                    p.set("paraPrIDRef", self.b.hedit.para_keep_off(p.get("paraPrIDRef")))
+                hit = True
+                n += 1
+            if not hit:
+                break
+        else:
+            where = None  # 여덟 번 다 풀었으면 마지막 어림이 지금 문서와 다름 — 부르는 쪽이 다시 잼
+        if n:
+            self.notes.append(f"쪽 끝에 다 들어가지 않는 글 묶음 {n}곳은 통째로 넘기면 앞 쪽이 3분의 1 넘게 비어, 넘기지 않고 "
+                              "아래 문단 사이에서 나눴습니다(머리 문단과 첫 아랫문단은 함께).")
+        return where  # 마지막에 잰 쪽 어림(그 뒤 바꾼 것 없음) — force_breaks가 다시 재지 않게
 
     @staticmethod
     def _blank(p):
@@ -264,14 +340,15 @@ class PageFit:
             # 줄 간격 140% 이상인 글·빈 줄만 — 날짜 줄(100%)·좁힌 빈 줄처럼 일부러 촘촘히 둔 줄은 건드리지 않는다
             texts = [p for i, p in enumerate(paras) if base[i] == (k, k) and not para_tables(p)
                      and self.st.para.get(p.get("paraPrIDRef"), {}).get("line_type") == "PERCENT"
-                     and self.st.para.get(p.get("paraPrIDRef"), {}).get("line", 0) >= MIN_LINE]
+                     and self.min_line <= self.st.para.get(p.get("paraPrIDRef"), {}).get("line", 0) < self.line_cap]
+            # (상한에 닿은 줄은 늘릴 수 없음 — 계획 line_pct로 정한 줄만 있는 쪽에 '줄 간격 +20'이라고 알리던 것)
             saved = {p: p.get("paraPrIDRef") for p in texts}
 
             def line_add(d):
                 for p in texts:
                     pid = saved[p]
                     cur = self.st.para.get(pid, {}).get("line", 0)
-                    v = max(cur, min(LINE_CAP, cur + d))  # 상한은 높일 때만 — 견본의 250% 제목 줄을 190%로 깎지 않음(평가 2026-11-09)
+                    v = max(cur, min(self.line_cap, cur + d))  # 상한은 높일 때만 — 견본의 250% 제목 줄을 190%로 깎지 않음(평가 2026-11-09)
                     p.set("paraPrIDRef", self.b.hedit.para_line(pid, v) if d and v != cur else pid)
 
             best = 0
@@ -329,7 +406,7 @@ class PageFit:
         for i, p in enumerate(paras):
             if p in orig and base[i][0] != k:
                 peer[orig[p]] = max(peer.get(orig[p], 0), line(p.get("paraPrIDRef")))
-        want = {p: min(LINE_CAP, max(line(orig[p]), peer.get(orig[p], 0))) for p in orig}
+        want = {p: min(self.line_cap, max(line(orig[p]), peer.get(orig[p], 0))) for p in orig}
         texts = [p for i, p in enumerate(paras) if base[i] == (k, k) and p in orig and line(p.get("paraPrIDRef")) < want[p]]
         if not texts:
             return

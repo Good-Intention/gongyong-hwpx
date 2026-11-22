@@ -389,6 +389,148 @@ class HeaderEdit:
             self.cache[key] = new.get("id")
         return self.cache[key]
 
+    LANGS = ("hangul", "latin", "hanja", "japanese", "other", "symbol", "user")
+
+    def import_para(self, src_head, src_p):
+        """다른 문서(머리 정보 src_head)의 문단 src_p를 이 문서로 옮긴 사본 — 쓰는 문단·글자 모양, 테두리·채우기, 탭을 새 번호로
+        더하고 글꼴은 같은 이름을 찾아(없으면 더해) 잇는다. 보이는 모양은 원래 문서와 같다(받은 요청 2026-11-22 16번 → 사용자 '기본
+        양식에서 가져옴': 참고 머리표가 없는 견본에 기본 양식의 참고 머리표를 가져옴)."""
+        p = copy.deepcopy(src_p)
+        maps = {}
+
+        def find(head, list_tag, item_tag, iid):
+            lst = head.find(".//" + T(list_tag))
+            return None if lst is None else next((x for x in lst.findall(T(item_tag)) if x.get("id") == iid), None)
+
+        def add(list_tag, item_tag, el):
+            lst = self.h.find(".//" + T(list_tag))
+            items = lst.findall(T(item_tag))
+            new = copy.deepcopy(el)
+            new.set("id", str(max([int(x.get("id")) for x in items] + [0]) + 1))
+            lst.append(new)
+            if lst.get("itemCnt") is not None:
+                lst.set("itemCnt", str(len(items) + 1))
+            return new
+
+        def border(iid):
+            key = ("bf", iid)
+            if key not in maps:
+                src = find(src_head, "hh:borderFills", "hh:borderFill", iid)
+                if src is None:
+                    maps[key] = iid
+                else:
+                    new = add("hh:borderFills", "hh:borderFill", src)
+                    maps[key] = new.get("id")
+                    self.styles.border[maps[key]] = self.styles._border(new)
+            return maps[key]
+
+        def font(lang, iid):
+            key = ("font", lang, iid)
+            if key not in maps:
+                sel = ".//" + T("hh:fontface") + f"[@lang='{lang.upper()}']"
+                sff, dff = src_head.find(sel), self.h.find(sel)
+                sf = next((f for f in sff.findall(T("hh:font")) if f.get("id") == iid), None) if sff is not None else None
+                if sf is None or dff is None:
+                    maps[key] = iid
+                else:
+                    have = dff.findall(T("hh:font"))
+                    hit = next((f for f in have if f.get("face") == sf.get("face")), None)
+                    if hit is None:
+                        hit = copy.deepcopy(sf)
+                        hit.set("id", str(max([int(f.get("id")) for f in have] + [-1]) + 1))
+                        dff.append(hit)
+                        dff.set("fontCnt", str(len(have) + 1))
+                        self.styles.fonts.setdefault(lang, {})[hit.get("id")] = hit.get("face")
+                    maps[key] = hit.get("id")
+            return maps[key]
+
+        def char(iid):
+            key = ("cp", iid)
+            if key not in maps:
+                src = find(src_head, "hh:charProperties", "hh:charPr", iid)
+                if src is None:
+                    maps[key] = iid
+                else:
+                    new = add("hh:charProperties", "hh:charPr", src)
+                    fr = new.find(T("hh:fontRef"))
+                    if fr is not None:
+                        for lang in self.LANGS:
+                            if fr.get(lang) is not None:
+                                fr.set(lang, font(lang, fr.get(lang)))
+                    if new.get("borderFillIDRef"):
+                        new.set("borderFillIDRef", border(new.get("borderFillIDRef")))
+                    maps[key] = new.get("id")
+                    self.styles.char[maps[key]] = self.styles._char(new)
+            return maps[key]
+
+        def tab(iid):
+            key = ("tab", iid)
+            if key not in maps:
+                src = find(src_head, "hh:tabProperties", "hh:tabPr", iid)
+                maps[key] = add("hh:tabProperties", "hh:tabPr", src).get("id") if src is not None else iid
+            return maps[key]
+
+        def para(iid):
+            key = ("pp", iid)
+            if key not in maps:
+                src = find(src_head, "hh:paraProperties", "hh:paraPr", iid)
+                if src is None:
+                    maps[key] = iid
+                else:
+                    new = add("hh:paraProperties", "hh:paraPr", src)
+                    if new.get("tabPrIDRef") is not None:
+                        new.set("tabPrIDRef", tab(new.get("tabPrIDRef")))
+                    for b in new.iter(T("hh:border")):
+                        b.set("borderFillIDRef", border(b.get("borderFillIDRef")))
+                    head = new.find(T("hh:heading"))
+                    if head is not None:  # 문단 번호·글머리표는 옮기지 않음(번호 목록 번호가 문서마다 다름)
+                        head.set("type", "NONE")
+                        head.set("idRef", "0")
+                        head.set("level", "0")
+                    maps[key] = new.get("id")
+                    self.styles.para[maps[key]] = self.styles._para(new)
+            return maps[key]
+
+        for el in p.iter():
+            if el.get("paraPrIDRef") is not None:
+                el.set("paraPrIDRef", para(el.get("paraPrIDRef")))
+            if el.get("charPrIDRef") is not None:
+                el.set("charPrIDRef", char(el.get("charPrIDRef")))
+            if el.get("borderFillIDRef") is not None:
+                el.set("borderFillIDRef", border(el.get("borderFillIDRef")))
+            if el.get("styleIDRef") is not None:
+                el.set("styleIDRef", "0")
+        return p
+
+    def para_keep_lines(self, pid):
+        """'문단 보호'(쪽 경계에서 문단을 나누지 않음)를 켠 문단 모양 — 서술식 문서의 ○ 제목 문단(의뢰서 '○ 질의사항 2 : …' 네 줄이
+        3줄·1줄로 두 쪽에 갈라지던 것, 2026-11-22 사용자 문서로 다시 만들어 봄)."""
+        src = self._para(pid)
+        brk = src.find(T("hh:breakSetting")) if src is not None else None
+        if brk is None or brk.get("keepLines") == "1":
+            return pid
+        key = ("keep_lines", pid)
+        if key not in self.cache:
+            new = self._clone("hh:paraProperties", "hh:paraPr", pid)
+            new.find(T("hh:breakSetting")).set("keepLines", "1")
+            self.styles.para[new.get("id")] = self.styles._para(new)
+            self.cache[key] = new.get("id")
+        return self.cache[key]
+
+    def para_keep_off(self, pid):
+        """'다음 문단과 함께'를 끈 문단 모양(쪽 맞춤이 묶음을 나눌 때 — 받은 요청 2026-11-22)."""
+        src = self._para(pid)
+        brk = src.find(T("hh:breakSetting")) if src is not None else None
+        if brk is None or brk.get("keepWithNext") != "1":
+            return pid
+        key = ("keep_off", pid)
+        if key not in self.cache:
+            new = self._clone("hh:paraProperties", "hh:paraPr", pid)
+            new.find(T("hh:breakSetting")).set("keepWithNext", "0")
+            self.styles.para[new.get("id")] = self.styles._para(new)
+            self.cache[key] = new.get("id")
+        return self.cache[key]
+
     def para_line(self, pid, value):
         """줄 간격(%)만 바꾼 문단 모양."""
         key = ("line", pid, value)

@@ -2,7 +2,7 @@
 """사용자 원칙(Builder의 일부): 묶음 유지·줄 바꿈, 괄호 이름표 폭, 쌍점·이름표 내어쓰기, □·■ 제목, 항목 수·근거법령·표 제목 검사, 설명글·괄호 작게, 따옴표 붙이기, 번호·빈 줄·단위 줄, 근거법령 1번."""
 from build_base import *  # noqa: F401,F403 — 상수·공통 함수·BuildError
 from hwpx_lib import _base_head  # noqa: E402,F401 — 밑줄 이름은 *로 안 넘어옴
-from fit_base import LAW_ARTICLE_GAP, LAW_LINE, LAW_NAME_GAP  # noqa: E402 — 참고 근거법령 줄 간격·위 여백(쪽 맞춤과 같은 값)
+from fit_base import CASE_LINE, DATE_HEAD_RE, LAW_ARTICLE_GAP, LAW_LINE, LAW_NAME_GAP  # noqa: E402 — 참고 근거법령 줄 간격·위 여백(쪽 맞춤과 같은 값)
 
 
 class RulesPart:
@@ -31,9 +31,14 @@ class RulesPart:
                     or (a == "T1" and b in (1, 2))
                     # 표 앞에 둔 빈 줄은 묶음을 끊지 않는다: ○ → (빈 줄) → 표
                     or (a in (1, 2, 3, 4, "T", "T1") and b == "blank" and c in member)
-                    or (a == "blank" and b in ("T", "T1") and i > 0 and lv_list[i - 1] in (1, 2, 3, 4, "T", "T1")))
+                    or (a == "blank" and b in ("T", "T1") and i > 0 and lv_list[i - 1] in (1, 2, 3, 4, "T", "T1"))
+                    # ○ 제목 → (빈 줄) → 아랫문단도 끊지 않는다 — 의뢰서 '○ 질의사항 1' 밑 빈 줄에서 묶음이 끊겨 질의 제목만 쪽 끝에
+                    # 홀로 남던 것(2026-11-22 사용자 문서로 다시 만들어 봄)
+                    or (a == "blank" and b in member and i > 0 and lv_list[i - 1] == 2))
             if keep:
                 out[i].set("paraPrIDRef", self.hedit.para_keep_next(out[i].get("paraPrIDRef")))
+                if a == 2 and getattr(self, "narrative", ""):  # 서술식 문서의 ○ 제목(질의사항 등)은 두 쪽에 갈라지지 않게
+                    out[i].set("paraPrIDRef", self.hedit.para_keep_lines(out[i].get("paraPrIDRef")))
 
     def word_wrap(self):
         """쓰는 문단 모양을 모두 어절(단어) 단위 줄 나눔으로 맞춘다."""
@@ -50,7 +55,7 @@ class RulesPart:
             raise BuildError(f"{where}: 블록마다 \"like\"(견본 문단 번호)가 있어야 합니다: {block!r}")
         known = {"like", "text", "runs", "table", "cells", "page_break", "marker", "header_rows", "body_like",
                  "last_like", "keep_header", "cols", "widths", "note", "unit", "_src", "_align", "flow", "arrow",
-                 "title", "rows"}
+                 "title", "rows", "_case"}
         if ("title" in block or "rows" in block) and "flow" not in block:
             raise BuildError(f"{where}: title은 표·도표 블록에만(표는 위 ■ 제목 줄, 도표는 < 제목 >), rows는 도표(flow) 블록에만 씁니다.")
         extra = set(block) - known
@@ -69,6 +74,8 @@ class RulesPart:
                 self.fill_runs(p, block["runs"], idx, where)
             elif "text" in block:
                 self.fill_text(p, block["text"], where, marker=block.get("marker", True))
+        if para_tables(p) and ("table" in block or "flow" in block):
+            self.data_tbls.update(para_tables(p))  # 계획이 줄·칸을 준 표 — 나머지 표는 견본(양식) 표(만든 문서 표시 form)
         if "page_break" in block:
             p.set("pageBreak", "1" if block["page_break"] else "0")
         if block.get("_align"):
@@ -158,6 +165,9 @@ class RulesPart:
 
         for n, b in enumerate(blocks):
             if not isinstance(b, dict) or not isinstance(b.get("like"), int) or not 0 <= b["like"] < len(self.protos):
+                continue
+            if b.get("_case"):  # 판례·해석례 발췌의 (판결요지)·(회신) 등은 인용 이름표 — 글자 그대로(받은 요청 2026-11-22 15번)
+                close(list(current))
                 continue
             proto = self.protos[b["like"]]
             if b.get("page_break"):
@@ -482,6 +492,43 @@ class RulesPart:
                           + ")은 그대로 새 기준으로 삼았습니다.")
         return {"base_line": ",".join(f"{k}:{lines[k]}" for k in sorted(lines)),
                 "base_sp": ",".join(f"{k}:{sps[k]}" for k in sorted(sps))}
+
+    def apply_line_pct(self, v):
+        """계획 "line_pct": 본문 줄 간격을 v%로 정한다(받은 요청 2026-11-22 — 의뢰서 190%를 견본 사본·기준값 파일 없이 한 줄로).
+        견본 ○·-·· 문단(없으면 기호 없는 글 문단)이 가장 많이 쓴 줄 간격을 본문으로 보고, 본문 둘레(±30%p — 견본마다 171~189%·만든 문서의 - 160%처럼
+        조금씩 다른 값)의 ○·-·기호 없는 글 문단은 모두 v로, 제목(□·Ⅰ.)·설명(*·※) 줄은 같은 폭만큼 옮겨 위계를 지킨다. 빈 줄·날짜 줄·
+        ■ 제목·단위 줄·표 칸은 그대로. 쪽 맞춤은 이 값을 줄이거나 늘리지 않는다(build.py가 Fitter에 알림). 돌려주는 것: 바꾼 문단 수."""
+        rows = []
+        for p in self.protos:
+            text = para_text(p)
+            pp = self.styles.para.get(p.get("paraPrIDRef"), {})
+            if (para_tables(p) or not text.strip() or pp.get("line_type", "PERCENT") != "PERCENT"
+                    or UNIT_RE.match(text) or text.lstrip().startswith("■") or DATE_HEAD_RE.match(text)):
+                continue
+            rows.append((p, marker_level(text), pp.get("line", 160)))
+        # 본문 기준은 ○ 줄(없으면 -, 그것도 없으면 기호 없는 글) — 만든 문서를 견본으로 쓰면 - 줄 기준값이 160으로 남아 있어
+        # 그것을 본문으로 잡으면 □ 190%가 220%로 올라갔음(의뢰서 시험 2026-11-22)
+        body_lines = next((ls for ls in ([line for _, lv, line in rows if lv == k] for k in (2, 3, 0)) if ls), [])
+        if not body_lines:
+            return 0
+        body = max(set(body_lines), key=body_lines.count)
+        n = 0
+        for p, lv, cur in rows:
+            if lv in (0, 2, 3):
+                new = v if abs(cur - body) <= 30 else cur
+            else:  # 제목·설명 줄: 본문과의 차이를 지킴(제목 +10 등)
+                new = max(100, min(300, cur + v - body))
+            if new != cur:
+                p.set("paraPrIDRef", self.hedit.para_line(p.get("paraPrIDRef"), new))
+                n += 1
+        # 맞추기 전 기준값(만든 문서 표시 base_line)도 새 값으로 — 이 문서를 다시 견본으로 쓸 때 되돌리지 않게
+        per = {}
+        for p, lv, _ in rows:
+            if lv:
+                per.setdefault(lv, []).append(self.styles.para.get(p.get("paraPrIDRef"), {}).get("line", 160))
+        if per:
+            self.fit_base["base_line"] = ",".join(f"{lv}:{max(set(ls), key=ls.count)}" for lv, ls in sorted(per.items()))
+        return n
 
     def fit_line_mark(self):
         """맞춤을 끝낸 문서에 수준(□ ○ - *)마다 남은 줄 간격 값들 — '1:150|170,2:140'. 이 문서를 다시 견본으로 쓸 때 그 밖의 값이
@@ -896,8 +943,9 @@ class RulesPart:
                 last_law = False
                 continue
             text = para_text(p)
-            if not in_law or not text.strip() or o_left is None:
-                res.append(p)
+            if not in_law or not text.strip() or o_left is None or p in getattr(self, "case_paras", {}):
+                res.append(p)  # 판례·해석례 발췌 줄은 case_refs가 맡음('관련 법령·판례'처럼 한 참고에 함께 둘 때)
+                last_law = last_law and p not in getattr(self, "case_paras", {})
                 continue
             pre, mark, body = split_marker(text)
             if mark and mark in "※*＊":
@@ -994,6 +1042,59 @@ class RulesPart:
                       "(법령 이름은 굵게, 항·호·목은 번호대로 들임 — 사용자 원칙).")
         return res
 
+    def case_refs(self, out):
+        """판례·해석례 발췌 블록(계획 {"case": "대법원 … 판결", "gist": […]} / {"interp": "법제처 … 회신", "q": …, "reply": …,
+        "reason": …}, plan_text가 '- 머리 줄'과 '(판결요지) …' 줄로 펼침)을 참고 쪽 인용 모양으로(받은 요청 2026-11-22 15번):
+        - 머리 줄 '- 대법원 …'은 '-'를 내어 써서 '대법원' 앞끝선 = '(판결요지' 앞끝선 = 둘째 줄 자리(○ 글자 자리), 다음 줄과 함께
+        - (판결요지)·(질의)·(회신)·(이유) 줄은 가운데점 없이 그 자리에서, 둘째 줄도 같은 자리, 이름표는 글자 그대로
+        - 사건 묶음 사이(판례·유권해석 사이 포함) 반 줄, 글자는 본문 ○보다 1pt 작게, 줄 간격 160%
+        - 원문 인용이라 근거법령 조문처럼 자간으로만 끝선(줄 바꿈 넣기·끝 줄 내리기·벌어진 줄 알림 없음 — law_paras)."""
+        if not getattr(self, "case_paras", None):
+            return out
+        lay = Layout(self.styles, self.metrics)
+        x0, body_pt = None, None
+        for p in out:
+            t = para_text(p)
+            if not para_tables(p) and marker_level(t) == 2 and p not in self.case_paras:
+                pp = self.styles.para.get(p.get("paraPrIDRef"), {})
+                x0, body_pt = pp.get("left", 0) - pp.get("intent", 0), self._main_pt(p)
+                break
+        heads = 0
+        for p in out:
+            kind = self.case_paras.get(p)
+            if not kind:
+                continue
+            if body_pt is None:
+                body_pt = self._main_pt(p)
+            delta = body_pt - 1 - self._main_pt(p)
+            if delta:
+                for r in indexed_runs(p):
+                    r.set("charPrIDRef", self.hedit.char_size(r.get("charPrIDRef"), delta))
+            pp = self.styles.para.get(p.get("paraPrIDRef"), {})
+            x = x0 if x0 is not None else pp.get("left", 0) - pp.get("intent", 0)
+            pid = self.hedit.para_align(self.hedit.para_line(p.get("paraPrIDRef"), CASE_LINE), "JUSTIFY")
+            size = self._main_pt(p)
+            if kind == "head":
+                text = para_text(p)
+                ws = len(text) - len(text.lstrip(" ⎵⍽"))
+                if ws:
+                    self._keep_chars(p, ws, len(text))
+                k = len(split_marker(para_text(p))[0])
+                w = int(round(sum(c[1] for c in lay.chars(p)[:k])))
+                pid = self.hedit.para_hang(self.hedit.para_margin(pid, "left", max(0, x - w)), w)
+                pid = self.hedit.para_margin(pid, "prev", int(round(size * CASE_LINE / 2)))  # 사건 묶음 사이 반 줄
+                pid = self.hedit.para_keep_next(pid)
+                heads += 1
+            else:
+                pid = self.hedit.para_hang(self.hedit.para_margin(pid, "left", x), 0)
+                pid = self.hedit.para_margin(pid, "prev", 100)
+            p.set("paraPrIDRef", pid)
+            self.law_paras[p] = x
+        if heads:
+            self.warn(f"판례·해석례 발췌 {heads}건은 인용 모양으로 두었습니다(머리 줄의 '-'를 내어 써서 요지와 앞끝선을 맞춤, 이름표는 글자 그대로, "
+                      f"{body_pt - 1:g}pt·줄 간격 {CASE_LINE}%, 사건 사이 반 줄).")
+        return out
+
     def _body_font_of(self, p):
         return next((self.styles.char.get(r.get("charPrIDRef"), {}).get("font") for r in indexed_runs(p) if run_text(r).strip()), None)
 
@@ -1003,8 +1104,8 @@ class RulesPart:
         in_law = False
         for p in [x for x in self.sec if x.tag == T("hp:p")]:
             if para_tables(p):
-                if self._is_ref_head(p):
-                    in_law = bool(re.search(r"법령|조문|법규", self._ref_title(p)))
+                if self._is_ref_head(p):  # 근거법령·판례·해석례 발췌 참고(인용 글 — 만들기의 law_refs·case_refs와 같게)
+                    in_law = bool(re.search(r"법령|조문|법규|판례|해석|회신", self._ref_title(p)))
                 continue
             text = para_text(p)
             if not in_law or not text.strip():
@@ -1037,6 +1138,40 @@ class RulesPart:
         if hits:
             self.warn(f"참고 머리표 바로 아래 ○ 줄 {len(hits)}개({', '.join(hits)}): 참고 쪽에는 ○ 한 줄 설명을 쓰지 않습니다 "
                       "— 표·내용을 바로 두고 설명은 표 아래 ※로 옮기세요.")
+
+    def law_source_lines(self, out):
+        """참고 근거법령 아래 '※ 출처 : 국가법령정보센터(…)' 줄은 쓰지 않는다(받은 요청 2026-11-22 14번 → 사용자 '모든 문서에서 뺌') —
+        계획에 있으면 알린다(표 자료 출처 '※ 자료 : …'는 그대로). 찾은 수."""
+        hits = [p for p in out if not para_tables(p)
+                and re.match(r"[ ⎵⍽]*※?[ ⎵⍽]*출[ ⎵⍽]*처[ ⎵⍽]*[:：].*(법령정보|법제처|law\.go\.kr)", para_text(p))]
+        if hits:
+            self.warn(f"참고 근거법령 아래 ‘※ 출처’ 줄 {len(hits)}개 — 출처 줄은 쓰지 않습니다(사용자 원칙 2026-11-22). 계획에서 빼 주세요.")
+        return len(hits)
+
+    def ref_head_gaps(self, out):
+        """참고 머리표 바로 밑에서 글이 시작하면 머리표와 첫 줄 사이를 그 글 줄 높이의 반 줄 이상 띄운다 — 밑에 표(·■ 제목·단위 줄)가
+        오면 지금처럼 붙여 둠(받은 요청 2026-11-22 13번, 사용자 '참고 상자 아래 표상자가 붙고 그 안에 본문이 붙으면 가까워도 좋지만,
+        참고상자 아래 바로 글이 전개될 경우 공간이 어느정도 있어야'). 머리표 문단 아래 여백 + 표 바깥 아래 여백 + 글 위 여백이
+        반 줄보다 작을 때만 글 위 여백을 늘린다. 늘린 곳 수."""
+        n = 0
+        for a, b in zip(out, out[1:]):
+            if not self._is_ref_head(a) or para_tables(b) or is_blank(b):
+                continue
+            text = para_text(b)
+            if UNIT_RE.match(text) or text.lstrip().startswith(TABLE_TITLE_MARK):
+                continue
+            pa = self.styles.para.get(a.get("paraPrIDRef"), {})
+            pb = self.styles.para.get(b.get("paraPrIDRef"), {})
+            om = para_tables(a)[0].find(T("hp:outMargin"))
+            have = pa.get("next", 0) + (int(om.get("bottom", "0")) if om is not None else 0) + pb.get("prev", 0)
+            line = pb.get("line", 160) if pb.get("line_type", "PERCENT") == "PERCENT" else 160
+            half = int(round(self._main_pt(b) * line / 2))  # 1/100pt — 글자 크기 × 줄 간격의 반
+            if have < half:
+                b.set("paraPrIDRef", self.hedit.para_margin(b.get("paraPrIDRef"), "prev", pb.get("prev", 0) + half - have))
+                n += 1
+        if n:
+            self.warn(f"참고 머리표 바로 밑에서 글이 시작하는 {n}곳은 머리표와 첫 줄 사이를 반 줄 띄웠습니다(밑에 표가 오면 붙여 둠).")
+        return n
 
     def table_titles(self, out):
         """본문 자료 표(머리 줄이 있는 여러 줄·여러 칸 표)는 ■ 제목을 단다(사용자 원칙 2026-11-04 '이 표는 제목이 없군요

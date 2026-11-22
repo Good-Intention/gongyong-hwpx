@@ -123,6 +123,18 @@ class Metrics:
 CHARS_CACHE = True  # 글자 폭 저장소 켜기(시험에서 끄고 견줌)
 
 
+def flow_tables(p):
+    """글 흐름에서 자리를 차지하는 표 — '글 앞으로'·'글 뒤로' 놓인 표(글자처럼 취급하지 않음)는 뺀다(의뢰서 양식의 '긴급 사항' 상자:
+    쪽 위에 떠 있는데 높이 19.2mm를 글 흐름에 세어 1쪽을 실제보다 일찍 찬다고 보고 쪽 나눔을 넣었음 — 한글 2024 확인 2026-11-22)."""
+    out = []
+    for t in para_tables(p):
+        pos = t.find(T("hp:pos"))
+        if t.get("textWrap") in ("IN_FRONT_OF_TEXT", "BEHIND_TEXT") and (pos is None or pos.get("treatAsChar") != "1"):
+            continue
+        out.append(t)
+    return out
+
+
 class Layout:
     """문단·표의 줄 수와 높이, 문서의 쪽 나눔을 어림한다(단위 HWPUNIT, 1mm ≈ 283.5)."""
 
@@ -308,7 +320,7 @@ class Layout:
         """(문단 높이, [줄 높이…], 위 간격, 아래 간격)."""
         pp = self.st.para.get(p.get("paraPrIDRef"), {})
         prev, nxt = pp.get("prev", 0), pp.get("next", 0)
-        tables = para_tables(p)
+        tables = flow_tables(p)
         if tables:
             # 줄 단위 높이: 긴 표는 한글이 줄 사이에서 다음 쪽으로 나눈다
             hs = [h for t in tables for h in self.table_rows(t)]
@@ -465,7 +477,7 @@ class Layout:
         for p in paras:
             h, hs, prev, nxt = self.para_height(p, body_w)
             pp = self.st.para.get(p.get("paraPrIDRef"), {})
-            tables = para_tables(p)
+            tables = flow_tables(p)
             text = para_text(p)
             items.append({"hs": hs, "prev": prev, "next": nxt, "keep": pp.get("keep_next", False),
                           "brk": p.get("pageBreak") == "1", "h": h,
@@ -566,7 +578,10 @@ class Layout:
                 page, y = page + 1, 0.0
                 used.append(0.0)
                 self.moved.append(i)
-            elif i in extra and y > 0:
+            elif i in extra and y > 0 and (not self.move_whole or body_h - y <= body_h / 3):
+                # 다음 쪽에 ○ 묶음 하나만 남지 않게 앞 ○도 넘기는 것은 앞 쪽이 3분의 1 넘게 비지 않을 때만(받은 요청 2026-11-22 2번과
+                # 같은 기준 — 의뢰서 시험에서 '○ (자문목적)'을 넘겨 2쪽이 40%만 참). 만들기(쪽 나눔을 박는 어림)에서만 — 이미 만든 문서의
+                # 쪽 어림(정돈·검사만·한글 맞대기)은 한글이 하는 대로
                 page, y = page + 1, 0.0
                 used.append(0.0)
                 self.moved.append(i)

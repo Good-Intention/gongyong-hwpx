@@ -19,6 +19,7 @@ class Fitter(LineFit, TableFit, PageFit):
         self.body_w = pg["body_width"] * HWPUNIT_PER_MM
         self.body_h = (pg["height"] - pg["top"] - pg["bottom"] - pg["header"] - pg["footer"]) * HWPUNIT_PER_MM
         self.forced = set()  # force_breaks가 쪽 나눔을 넣은 문단(묶음째 다음 쪽으로 넘김)
+        self.min_line, self.line_cap = MIN_LINE, LINE_CAP  # 쪽 맞춤 줄 간격 하한·상한(계획 line_pct면 둘 다 그 값)
         self.notes = []
 
     def paras(self):

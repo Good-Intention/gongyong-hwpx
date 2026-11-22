@@ -141,7 +141,27 @@ class Roles:
 
     def ref(self):
         c = self.of("참고 머리표")
-        return c[0] if c else None
+        return c[0] if c else self.borrow_ref()
+
+    def borrow_ref(self):
+        """견본에 참고 머리표가 없으면 기본 양식의 참고 머리표를 서식째 옮겨 와 견본 문단 끝에 더한다(받은 요청 2026-11-22 16번 →
+        사용자 '기본 양식에서 가져옴' — 의뢰서 양식처럼 참고 쪽이 없는 견본). 옮긴 번호, 못 옮기면 None."""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "basic_report.hwpx")
+        basic = Package(path)
+        sec = basic.xml(basic.sections()[0])
+        src = next((p for p in sec if p.tag == T("hp:p") and _ref_head(p)), None)
+        if src is None:
+            return None
+        p = self.b.hedit.import_para(basic.xml("Contents/header.xml"), src)
+        self.protos.append(p)
+        i = len(self.protos) - 1
+        self.role.append("참고 머리표")
+        pp = self.b.styles.para.get(p.get("paraPrIDRef"), {})
+        self.left.append(pp.get("left", 0))
+        self.start.append(pp.get("left", 0))
+        self.labeled.append(False)
+        self.b.warn("견본에 참고 머리표가 없어 기본 양식의 참고 머리표(참고1 상자)를 서식째 가져와 썼습니다.")
+        return i
 
     def ref_cells(self, i):
         """참고 머리표의 (머리표 칸, 제목 칸) 열쇠 '줄,칸'."""
@@ -161,6 +181,50 @@ class Roles:
             if mark and mark != "■" and mark not in seen:
                 seen[mark] = i
         return ", ".join(f"{m}({i}번)" for m, i in seen.items()) or "없음"
+
+
+def _ref_head(p):
+    """참고 머리표: 한 줄짜리 여러 칸 표로 첫 칸이 '참고'·'붙임' 등."""
+    tables = para_tables(p)
+    if not tables or tables[0].get("rowCnt") != "1" or tables[0].get("colCnt") == "1":
+        return False
+    grid = table_grid(tables[0])
+    return bool(grid) and cell_text(grid[0][4]).replace(" ", "")[:2] in REF_WORDS
+
+
+CASE_KEYS = {"case": ("gist",), "interp": ("q", "reply", "reason")}
+CASE_LABELS = {"gist": "판결요지", "q": "질의", "reply": "회신", "reason": "이유"}
+
+
+def _is_case_block(blk):
+    return isinstance(blk, dict) and ("case" in blk or "interp" in blk)
+
+
+def _case_blocks(blk, n, dash):
+    """판례·해석례 발췌 블록 → '- 머리 줄' + '(판결요지) …'(해석례는 (질의)·(회신)·(이유)) 줄 블록들(받은 요청 2026-11-22 15번).
+    머리 줄은 '-' 견본 문단, 이름표 줄은 같은 문단 모양에 기호 없이 — build_rules.case_refs가 인용 모양으로 맞춤."""
+    where = f"블록 {n}"
+    head_key = "case" if "case" in blk else "interp"
+    allowed = {head_key, *CASE_KEYS[head_key], "_src"}
+    extra = set(blk) - allowed
+    if extra or ("case" in blk and "interp" in blk):
+        raise BuildError(f"{where}: 판례 블록은 {{\"case\": \"대법원 … 판결\", \"gist\": [\"요지\", …]}}, 해석례 블록은 "
+                         f"{{\"interp\": \"법제처 … 회신\", \"q\": …, \"reply\": …, \"reason\": …}} 꼴입니다(모르는 항목: {sorted(extra)}).")
+    head = blk.get(head_key)
+    if not isinstance(head, str) or not head.strip():
+        raise BuildError(f"{where}: \"{head_key}\"에 사건·회신 이름(글)을 쓰세요.")
+    out = [{"like": dash, "text": head.strip(), "_case": "head", "_src": n}]
+    for key in CASE_KEYS[head_key]:
+        vals = blk.get(key)
+        vals = [vals] if isinstance(vals, str) else list(vals or [])
+        for k, v in enumerate(vals):
+            if not isinstance(v, str) or not v.strip():
+                raise BuildError(f"{where}: \"{key}\"는 글 또는 글 목록이어야 합니다.")
+            out.append({"like": dash, "text": (f"({CASE_LABELS[key]}) " if k == 0 else "") + v.strip(), "marker": False,
+                        "_case": "body", "_src": n})
+    if len(out) == 1:
+        raise BuildError(f"{where}: 요지·회신 글이 없습니다(" + "·".join(f'\"{k}\"' for k in CASE_KEYS[head_key]) + ").")
+    return out
 
 
 def _is_table_block(blk):
@@ -190,7 +254,8 @@ def expand_plan(plan, b):
     blocks = plan.get("blocks") if isinstance(plan, dict) else plan
     if not isinstance(blocks, list):
         return plan
-    if not any(isinstance(x, str) or (_is_table_block(x) and "like" not in x) for x in blocks):
+    if not any(isinstance(x, str) or (isinstance(x, dict) and "like" not in x and (_is_table_block(x) or _is_case_block(x)))
+               for x in blocks):
         return plan
     roles = Roles(b)
     how = "{\"like\": 번호, \"text\": …}"
@@ -218,6 +283,13 @@ def expand_plan(plan, b):
 
     for n, blk in enumerate(blocks, 1):
         where = f"블록 {n}"
+        if _is_case_block(blk) and "like" not in blk:
+            flush_pending(n)
+            dash = roles.item("-", "- 가", ctx)
+            if dash is None:
+                raise BuildError(f"{where}: 견본에 '-' 문단이 없어 판례·해석례 블록을 넣을 수 없습니다(견본에 있는 기호: {roles.marks()}).")
+            out += _case_blocks(blk, n, dash)
+            continue
         if isinstance(blk, dict):
             if _is_table_block(blk) and "like" not in blk:
                 rows = blk.get("table")

@@ -41,7 +41,7 @@ from layout import FIT_FLOOR, FW_EM, Layout, Metrics, spacing_after  # noqa: E40
 from spaces import compact_fw, lead_to_margin  # noqa: E402
 from build_base import DATE_LINE_RE, SKILL_VERSION, read_doc_meta  # noqa: E402
 from fit_base import CONNECTORS, REF_RE, fill_last_line  # noqa: E402
-from fit_lines import opener_cut  # noqa: E402 — 기호 앞 줄 바꿈 자리(작성 모드 opener_breaks와 같은 셈)
+from fit_lines import loose_hint, opener_cut  # noqa: E402 — 기호 앞 줄 바꿈 자리(작성 모드 opener_breaks와 같은 셈)
 from fit_tables import TableFit  # noqa: E402 — 제목 걸친 상자 찾기(_caption_content)를 작성 모드와 같게
 
 FW = "⎵"  # 고정폭 빈칸(1/4 글자, 양쪽 정렬 때 늘어나지 않음)
@@ -144,11 +144,11 @@ def flat(text):
 
 class Tidier:
     def __init__(self, path, keep_o=True, gaps=None, blank_mm=None, all_rules=False, gap_cap=None, no_lines=False, no_indent=False,
-                 hang_at=None, _round=0):
+                 hang_at=None, form_tables=False, _round=0):
         self.path = path
         self._round = _round  # 1 = 정돈 결과에 다시 거는 회차(_settle) — 그 안에서는 다시 걸지 않음
         self._opts = dict(keep_o=keep_o, gaps=gaps, blank_mm=blank_mm, all_rules=all_rules, gap_cap=gap_cap, no_lines=no_lines,
-                          no_indent=no_indent, hang_at=hang_at)
+                          no_indent=no_indent, hang_at=hang_at, form_tables=form_tables)
         # 둘째 줄 기준을 사용자가 밝힘(--hang-at): '기호'(머리 기호 뒤 첫 글자) 또는 '이름표'(이름표·쌍점 뒤, 없으면 기호 뒤).
         # 밝히면 기존 내어쓰기의 0.4글자 허용 없이 그 자리에 정확히, 한 줄 문단에도 같은 값(사용자 2026-11-10)
         self.hang_at = hang_at
@@ -171,6 +171,7 @@ class Tidier:
         self.lay.move_whole = False  # 쪽 어림은 한글이 하는 대로(쪽 나눔을 박지 않음)
         self.lay.head_of = self.head_len
         self.secs = [self.pkg.xml(n) for n in self.pkg.sections()]
+        self.form_tbls, self.made_all, self.narr = set(), "", ""  # 아래 표시를 읽은 뒤 채움
         self.changes = {}  # 문단 → [무엇을 바꿨나]
         self.notes = []
         self.touched = set()  # 줄 배치 기록을 지울 문단(한글이 다시 계산)
@@ -191,7 +192,27 @@ class Tidier:
         # 이 스킬의 작성 모드로 만든 문서(content.hpf 표시 made=판) — 작성 규칙이 맞춘 내어쓰기(낫표 당김·화살표 줄 포함)·
         # 끝 줄·이름표·칸·간격을 정돈의 어림으로 다시 만지면 되돌리게 된다(평가 2026-11-08: 낫표 줄 내어쓰기 5.4 → 3.1mm,
         # 화살표 줄 61.7 → 35.7mm). 그래서 내어쓰기가 아예 없는 문단(만든 뒤 사람이 더한 줄)·글자 단위 줄 나눔·빈칸만 손봄
-        self.made = "" if all_rules else read_doc_meta(self.pkg).get("made", "")
+        meta = read_doc_meta(self.pkg)
+        self.made = "" if all_rules else meta.get("made", "")
+        # --all로 다시 맞추는 만든 문서(받은 요청 2026-11-22 10·11·12번): 견본(양식) 표 모양·머리 기호와 이름표 자간·견본에 없던 ○ 위
+        # 간격은 작성 때 정한 그대로 둔다(따르는 차례 요청 → 견본 → 원칙 — 만든 문서의 이것들은 견본이 정한 것)
+        self.made_all = meta.get("made", "") if all_rules else ""
+        self.narr = meta.get("narr", "")  # 서술식 문서(의뢰서·예상질의) — 이름표 폭·이름표 뒤 둘째 줄을 작성 때처럼 쓰지 않음
+        if all_rules and self.narr and self.hang_at is None:
+            self.hang_at = "기호"
+        self.form_tbls = set() if form_tables or not self.made_all else self._form_tables(meta.get("form", ""))
+
+    def _form_tables(self, spec):
+        """만든 문서 표시 form=차례:줄x칸,… 의 견본(양식) 표 — 본문 표를 차례대로 세어 줄·칸 수가 같은 것만(한글에서 표를 더했으면 건너뜀)."""
+        tables = [t for sec in self.secs for p in sec if p.tag == T("hp:p") for t in para_tables(p)]
+        out = set()
+        for item in filter(None, spec.split(",")):
+            m = re.fullmatch(r"(\d+):(\d+)x(\d+)", item.strip())
+            if m and int(m.group(1)) < len(tables):
+                t = tables[int(m.group(1))]
+                if t.get("rowCnt") == m.group(2) and t.get("colCnt") == m.group(3):
+                    out.add(t)
+        return out
 
     # ------------------------------------------------------------ 바탕
     def all_paras(self):
@@ -332,6 +353,11 @@ class Tidier:
             return
         prevs = [self.styles.para.get(p.get("paraPrIDRef"), {}).get("prev", 0) for _, p in os_]
         nonzero = [v for v in prevs if v > 0]
+        if not nonzero and self.made_all and not self.gaps:
+            # 만든 문서에 ○ 위 간격이 하나도 없으면 견본이 그렇게 둔 것 — 넣지 않고 알림만(받은 요청 2026-11-22 11번: 190% 의뢰서에
+            # 3곳 넣어 쪽 배치가 바뀜). 넣으려면 --gap
+            self.notes.append(f"○ 위 간격이 없는 문서(견본대로 만든 문서)라 ○ {len(os_)}곳은 위 간격 없이 그대로 두었습니다 — 넣으려면 --gap 6.")
+            return
         target = Counter(nonzero).most_common(1)[0][0] if nonzero else O_GAP_DEFAULT
         todo = [(p, cur) for (k, p), cur in zip(os_, prevs)
                 if cur < target and not (k and is_blank(self.body[k - 1]))]  # 빈 줄로 이미 띄운 ○는 두 번 띄우지 않음
@@ -892,6 +918,8 @@ class Tidier:
                 self._box_group[p] = group
                 self._label_n0[p] = (len(self.lay.para_lines(p, body_w)[1]), body_w)
                 self._label_slack[p] = (len(self.lay.para_lines(p, body_w, shrink=SLACK)[1]), sum(c[1] for c in self.lay.chars(p)))
+                if self.narr:
+                    continue  # 서술식 문서(의뢰서·예상질의)는 작성 때처럼 이름표 폭을 맞추지 않음
                 body = text[len(pre):]
                 m = LABEL_RE.match(body)
                 want = 4
@@ -1039,7 +1067,10 @@ class Tidier:
     def head_spacing(self):
         """머리 기호·이름표(문단 첫머리) 글자의 자간을 같은 수준(○끼리, -끼리 …)에서 가장 많이 쓴 값 하나로 — 머리 자간이 문단마다
         다르면(전임자 문서에서 문단마다 -4%·-16% …) 이름표를 네 글자 폭으로 맞춰도 내용 시작점이 갈린다(실험: 31.6mm·36.1mm,
-        사용자 '사업개요부분은 여전히 이상하군요'). 사용자 원칙 '머리 기호·괄호 이름표 조각에는 자간 조정을 하지 않는다'."""
+        사용자 '사업개요부분은 여전히 이상하군요'). 사용자 원칙 '머리 기호·괄호 이름표 조각에는 자간 조정을 하지 않는다'.
+        이 스킬로 만든 문서는 --all에서도 하지 않는다 — 작성 모드가 줄 맞춤으로 정한 머리 자간(-2% 등)을 풀던 것(받은 요청 2026-11-22 12번)."""
+        if self.made_all:
+            return
         heads = {}
         for paras, body_w, scope in self.blocks():
             for p in paras:
@@ -1280,6 +1311,8 @@ class Tidier:
         pp = lambda p: self.styles.para.get(p.get("paraPrIDRef"), {})  # noqa: E731
         for sec in self.secs:
             for tbl in sec.iter(T("hp:tbl")):
+                if tbl in self.form_tbls:
+                    continue  # 견본(양식) 표 모양은 그대로
                 cells = []
                 for tc, w, mt in self._cells(tbl):
                     if not self._wide(tc, w):
@@ -1342,6 +1375,8 @@ class Tidier:
         for sec in self.secs:
             body_h = self.box(sec)[1]
             for tbl in sec.iter(T("hp:tbl")):
+                if tbl in self.form_tbls:
+                    continue  # 견본(양식) 표 모양은 그대로
                 for tc, w, mt in self._cells(tbl):
                     if not self._wide(tc, w):
                         continue
@@ -1363,7 +1398,7 @@ class Tidier:
         """줄 높이·쪽 끝 줄 손질에서 빼는 표: 상자(1칸)·제목 걸친 상자·도표(화살표만 든 칸)·칸 바탕 그림이 든 표."""
         img_fills = {bf.get("id") for bf in self.header.iter(T("hh:borderFill")) if bf.find(".//" + T("hc:imgBrush")) is not None}
         quotes = {tc for tc, _ in self._quote_cells()}
-        skip = set()
+        skip = set(self.form_tbls)  # 견본(양식) 표 — 만든 문서를 --all로 맞출 때(--form-tables면 넣지 않음)
         for sec in self.secs:
             for tbl in sec.iter(T("hp:tbl")):
                 grid = table_grid(tbl)
@@ -2111,6 +2146,7 @@ class Tidier:
 
     def sparse_lines(self):
         n_ok = n_left = n_plain = 0
+        left = []  # 남은 벌어진 줄 — 고칠 낱말·모자란 폭·줄일 거리(받은 요청 2026-11-22 9번)
         for paras, body_w, _ in self.blocks():
             for p in paras:
                 text = para_text(p)
@@ -2135,13 +2171,21 @@ class Tidier:
                     n_ok += 1
                 else:
                     n_left += 1
+                    chs, lines = self.lay.para_lines(p, body_w)
+                    k = next((k for k, (_, e, u, a) in enumerate(lines[:-1]) if a and u / a < PULL and self._ends_break(chs, e) is None), None)
+                    if k is not None:
+                        hint = loose_hint(chs, *lines[k])
+                        if hint:
+                            left.append(f"‘{self.name(p)}…’ {k + 1}째 줄 끝: {hint}")
         self._justify_notes()
         if n_plain:
             self.notes.append(f"표 칸 보고서 글 {n_plain}개는 다음 낱말이 길어 낱말 사이가 크게 벌어져 왼쪽 맞춤으로 바꿨습니다.")
         if n_ok:
             self.notes.append(f"다음 낱말이 넘어가 빈칸이 벌어지던 문단 {n_ok}개는 자간을 줄여(-18%까지) 그 낱말을 당겼습니다.")
         if n_left:
-            self.notes.append(f"빈칸이 벌어지는 줄이 남은 문단 {n_left}개 — 긴 낱말이 넘어가 자간으로는 못 당김(자간을 +5%까지 늘려 덜 벌어지게 한 것 포함).")
+            self.notes.append(f"빈칸이 벌어지는 줄이 남은 문단 {n_left}개 — 긴 낱말이 넘어가 자간으로는 못 당김(자간을 +5%까지 늘려 덜 벌어지게 한 것 포함). "
+                              "글을 고칠 수 있으면 아래 자리에서(정돈은 글을 바꾸지 않음):"
+                              + "".join(f"\n   · {t}" for t in left[:20]) + (f"\n   · … 그 밖 {len(left) - 20}곳" if len(left) > 20 else ""))
 
     # ------------------------------------------------------------ 4. 끝 줄 두세 글자 올리기(사용자 원칙 — 자간으로만)
     def _split_at(self, p, k):
@@ -2547,7 +2591,7 @@ class Tidier:
                         grid = table_grid(t)
                         if grid and REF_RE.match(" ".join(para_text(cp) for cp in cell_paras(grid[0][4]))):
                             title = " ".join(para_text(cp) for *_, tc in grid for cp in cell_paras(tc))
-                            in_law = bool(re.search(r"법령|조문|법규", title))
+                            in_law = bool(re.search(r"법령|조문|법규|판례|해석|회신", title))  # 판례·해석례 발췌도 원문 인용
                     continue
                 if in_law:
                     out.add(p)
@@ -2721,6 +2765,8 @@ class Tidier:
         n_tbl = 0
         for sec in self.secs:
             for tbl in sec.iter(T("hp:tbl")):
+                if tbl in self.form_tbls:
+                    continue  # 견본(양식) 표 모양은 그대로
                 hit = 0
                 for *_, tc in table_grid(tbl):
                     sub = tc.find(T("hp:subList"))
@@ -3276,6 +3322,8 @@ def main():
     ap.add_argument("--blank-mm", type=float, help="□ 앞 빈 줄 높이가 제각각일 때 이 높이(mm)에 가장 가까운 빈 줄로 모두 맞춤")
     ap.add_argument("--all", action="store_true",
                     help="이 스킬의 작성 모드로 만든 문서도 정돈 규칙으로 모두 다시 맞춤(기본은 작성 규칙이 맞춘 것을 그대로 둠)")
+    ap.add_argument("--form-tables", action="store_true",
+                    help="--all로 만든 문서를 다시 맞출 때 견본(양식) 표의 줄 높이·칸 여백·세로 정렬도 맞춤(기본은 양식 표 모양 그대로)")
     ap.add_argument("--hang-at", choices=("기호", "이름표"),
                     help="사용자가 둘째 줄 기준을 밝혔을 때만: 기호(머리 기호 뒤 첫 글자) 또는 이름표(이름표·쌍점 뒤, 없으면 기호 뒤) — "
                          "기존 내어쓰기를 허용치로 두지 않고 그 자리에 정확히, 한 줄 문단에도")
@@ -3287,7 +3335,7 @@ def main():
     if same_path(out, a.path):
         raise SystemExit("결과를 원본과 같은 이름으로 저장하지 않습니다 — 다른 이름을 주세요.")
     sys.exit(tidy_file(a.path, out, keep_o=not a.no_keep_o, gaps=[int(round(a.gap * 100))] if a.gap else None, blank_mm=a.blank_mm,
-                       all_rules=a.all, max_pages=a.max_pages, hang_at=a.hang_at))
+                       all_rules=a.all, max_pages=a.max_pages, hang_at=a.hang_at, form_tables=a.form_tables))
 
 
 if __name__ == "__main__":

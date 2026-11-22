@@ -233,6 +233,9 @@ class Builder(FillPart, RulesPart):
             raise BuildError("계획에 블록이 하나도 없습니다.")
         opts = plan if isinstance(plan, dict) else {}
         self.fit_base = self.made_reset()  # 이 스킬이 만든 문서를 견본으로 쓸 때 앞 판의 맞춤값을 되돌리고, 맞추기 전 기준값을 잼
+        self.line_pct = opts.get("line_pct")
+        if self.line_pct:  # 본문 줄 간격을 정함(의뢰서 190% 등) — 쪽 맞춤은 이 값을 바꾸지 않음
+            self.apply_line_pct(int(self.line_pct))
         blocks = [dict(b, _src=b.get("_src", n + 1)) if isinstance(b, dict) else b for n, b in enumerate(blocks)]
         if opts.get("omit_dots", True):
             self.omit_dots(blocks)  # (중략)·(후략) → ··· — 이름표 맞추기가 (중략)을 이름표로 벌리기 전에
@@ -270,7 +273,15 @@ class Builder(FillPart, RulesPart):
             blocks = self.space_blocks(blocks)
         if opts.get("number_items", True):
             self.number_items(blocks)
-        if opts.get("align_labels", True):
+        # 서술식 문서(계획 "narrative": true — 문장으로 쓰는 문서를 부르는 스킬이 넘김): 이름표 폭·이름표 뒤 둘째 줄·괄호 줄이기 기본 끔
+        # (받은 요청 2026-11-22 4·5번. 공용 스킬은 문서 이름을 보고 고르지 않음 — 사용자 '법률자문 스킬은 따로 있다')
+        self.narrative = "서술식" if opts.get("narrative") else ""
+        off = [name for key, name in (("align_labels", "이름표 폭 맞추기"), ("label_hang", "이름표 뒤 둘째 줄 맞추기"),
+                                      ("paren_small", "괄호 글자 줄이기")) if self.narrative and key not in opts]
+        if off:
+            self.warn(f"서술식 문서(계획 narrative)라 {'·'.join(off)}를 기본으로 껐습니다(둘째 줄은 머리 기호 다음 글자 자리에 — "
+                      "켜려면 계획에 그 옵션을 true로).")
+        if opts.get("align_labels", not self.narrative):
             self.align_labels(blocks)
         if opts.get("table_notes", True):
             self.table_notes(blocks)
@@ -282,7 +293,10 @@ class Builder(FillPart, RulesPart):
         if self.omit:
             self.warn("계획에서 일부러 뺀다고 한 것(omit — " + "·".join(OMIT_KEYS[k] for k in sorted(self.omit))
                       + ")은 검사하지 않고, 그에 대한 지적은 알림으로만 둡니다(만든 문서에 표시가 남아 검사만도 같음).")
+        self.data_tbls = set()  # 계획이 줄·칸을 준 표(make_block) — 나머지 여러 칸 표는 견본(양식) 표
         out = [self.make_block(n, b) for n, b in enumerate(blocks)]
+        # 판례·해석례 발췌 블록이 펼쳐진 문단(plan_text — '- 머리 줄'·'(판결요지) …' 줄) → case_refs가 인용 모양으로
+        self.case_paras = {p: b["_case"] for b, p in zip(blocks, out) if isinstance(b, dict) and b.get("_case")}
         out = self.org_settings(out)  # 기준값 파일의 기관 그림(다른 기관 공용) — 첫 문단(쪽 설정을 받을 문단)을 정하기 전에
         self.flow_gaps(out)
         self.lone_dashes(out)
@@ -292,8 +306,11 @@ class Builder(FillPart, RulesPart):
             self.table_titles(out)
         self.flow_steps(out)
         self.check_endings(out)
-        out = self.law_refs(out)  # 참고 근거법령은 상자·머리 기호 없이 원문 번호로(사용자 2026-11-15 시안 B) — 법령 이름 ○를 빼므로 아래 알림 앞에
+        out = self.law_refs(out)
+        out = self.case_refs(out)  # 판례·해석례 발췌 — 인용 모양(받은 요청 2026-11-22 15번)  # 참고 근거법령은 상자·머리 기호 없이 원문 번호로(사용자 2026-11-15 시안 B) — 법령 이름 ○를 빼므로 아래 알림 앞에
         self.ref_bullets(out)
+        self.ref_head_gaps(out)  # 참고 머리표 밑에 글이 바로 오면 반 줄 띄움(밑에 표면 그대로)
+        self.law_source_lines(out)  # 참고 근거법령 '※ 출처' 줄은 쓰지 않음 — 알림
         if opts.get("keep_groups", True):
             self.keep_groups(out)
         first = out[0]
@@ -327,8 +344,9 @@ class Builder(FillPart, RulesPart):
         self.org_phone()  # 날짜·부서 줄 전화 앞자리(기준값 파일 — 기본 053-803이면 그대로)
         if opts.get("word_wrap", True):
             self.word_wrap()
-        if opts.get("paren_small", PROFILE["paren_smaller_pt"]):
-            self.small_parens(opts.get("paren_small", PROFILE["paren_smaller_pt"]))
+        paren = opts.get("paren_small", 0 if self.narrative else PROFILE["paren_smaller_pt"])
+        if paren:
+            self.small_parens(paren)
         if opts.get("note_small", True):
             self.small_notes()
         if opts.get("square_small", True):
@@ -337,12 +355,14 @@ class Builder(FillPart, RulesPart):
             self.date_gap()
         if opts.get("tighten_quotes", True):
             self.tighten_quotes()
-        if self.colons or opts.get("label_hang", True):
-            self.colon_hang(colons=self.colons, labels=opts.get("label_hang", True))
+        if self.colons or opts.get("label_hang", not self.narrative):
+            self.colon_hang(colons=self.colons, labels=opts.get("label_hang", not self.narrative))
         self.fit_notes = []
         if opts.get("fit", True):
             f = Fitter(self)
             f.push = opts.get("push_down", True)  # 끝 줄 한두 낱말 내리기(끄면 올리기만)
+            if self.line_pct:  # 정한 본문 줄 간격은 쪽 맞춤이 줄이지도 넓히지도 않음
+                f.min_line = f.line_cap = int(self.line_pct)
             f.defer_hints = True  # '한 줄 줄이기 후보'는 맞춤을 다 끝낸 뒤 검사만과 같은 셈으로(fit_lines)
             f.fit_tables()
             f.fit_tables(again=True)  # 한 번 더: 자간·한 줄로 입력·폭 빌리기 뒤 다시 재도 같은 결과가 되게(다듬기의 고정점)
@@ -473,6 +493,15 @@ class Builder(FillPart, RulesPart):
             meta["fit_line"] = fit_line
         if getattr(self, "table_pt", None):
             meta["table_pt"] = str(self.table_pt)
+        if getattr(self, "narrative", ""):
+            meta["narr"] = "1"  # 서술식 문서 — 정돈 --all도 이름표 폭·둘째 줄을 작성 때처럼
+        # 견본(양식) 표: 계획이 줄·칸을 주지 않은 여러 칸 표(차례:줄x칸) — 정돈 --all이 양식 표 모양(줄 높이·칸 여백)을 바꾸지 않게
+        # (받은 요청 2026-11-22 10번: 의뢰서 긴급 사항 칸 줄 높이 19.2 → 11.8mm)
+        tables = [t for p in self.sec if p.tag == T("hp:p") for t in para_tables(p)]
+        form = [f"{i}:{t.get('rowCnt')}x{t.get('colCnt')}" for i, t in enumerate(tables)
+                if t not in getattr(self, "data_tbls", ()) and len(table_grid(t)) > 1]
+        if form:
+            meta["form"] = ",".join(form)
         write_doc_meta(self.pkg, meta)
         text = "\r\n".join(para_text(p).replace(COMPOSE_CHAR, "") for p in self.sec if p.tag == T("hp:p"))
         if "Preview/PrvText.txt" in self.pkg.data:
@@ -488,10 +517,15 @@ def main():
     ap.add_argument("--out", required=True, help="만들 hwpx")
     ap.add_argument("--brief", action="store_true",
                     help="글 차례를 빼고 보임(고쳐야 함을 고치며 다시 만들 때 — 전하기 전 마지막 판은 빼지 않음)")
+    ap.add_argument("--try", dest="try_file",
+                    help="문장 후보 시험(JSON) — 블록 글을 후보마다 바꿔 만들어 보고 줄 수·벌어진 줄·끝 줄을 보임(파일은 만들지 않음). "
+                         "꼴: [{\"find\": \"블록 글 일부\" 또는 \"block\": 번호, \"texts\": [\"후보 글\", …]}, …]")
     a = ap.parse_args()
     if same_path(a.template, a.out):
         raise SystemExit("견본 파일에 덮어쓰지 않습니다. --out에 다른 이름을 주세요.")
     plan = read_plan(a.plan)
+    if a.try_file:
+        sys.exit(try_candidates(a.template, plan, a.try_file, os.path.dirname(os.path.abspath(a.plan))))
     pkg = Package(a.template)
     try:
         b = Builder(pkg, base_dir=os.path.dirname(os.path.abspath(a.plan)))
@@ -530,6 +564,93 @@ def main():
     print_report(errors, notes, None if a.brief else outline)
     # 끝 번호: 0 = 고칠 것 없음, 1 = 구조 검사 문제(파일을 쓰면 안 됨), 3 = 파일은 만들었고 '고쳐야 함'이 남음
     sys.exit(1 if errors else 3 if (fix or notes) else 0)
+
+
+def _core(text):
+    """견줄 글 — 머리 기호·이름표·꾸밈 표시·빈칸을 뺀 앞부분."""
+    rest = split_marker(text)[2]
+    rest = re.sub(r"\*\*|\^\^", "", rest)
+    rest = re.sub(r"^[\s⎵⍽]*[(〔［\[][^)〕］\]]{1,14}[)〕］\]]", "", rest)
+    return re.sub(r"[\s⎵⍽]", "", rest)[:16]
+
+
+def try_candidates(template, plan, path, base_dir):
+    """--try: 계획 블록 글을 후보로 바꿔 하나씩 만들어 보고(파일은 쓰지 않음) 그 문단의 줄 수·크게 벌어진 줄·끝 줄 길이를 보인다
+    (받은 요청 2026-11-22 8번: 레이아웃 함수로 미리 잰 결과와 실제 만들기 결과가 달라 후보마다 만들기를 다시 돌려 봄 — 만들기와
+    같은 셈으로). 끝 번호 0(후보 하나라도 통과), 3(모두 남음), 1(후보 파일·블록을 못 찾음)."""
+    from fit_lines import loose_hint, loose_line
+    try:
+        tries = json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        print(f"후보 파일을 읽지 못함 — {e}")
+        return 1
+    tries = tries.get("tries", tries) if isinstance(tries, dict) else tries
+    blocks = plan.get("blocks") if isinstance(plan, dict) else plan
+    if not isinstance(tries, list) or not isinstance(blocks, list):
+        print("후보 파일은 [{\"find\": \"블록 글 일부\", \"texts\": [\"후보\", …]}, …] 꼴이어야 합니다.")
+        return 1
+
+    def block_text(b):
+        return b if isinstance(b, str) else b.get("text", "") if isinstance(b, dict) else ""
+
+    def measure(variant, k, text):
+        pl = copy.deepcopy(plan)
+        bl = pl["blocks"] if isinstance(pl, dict) else pl
+        bl[k] = text if isinstance(bl[k], str) else dict(bl[k], text=text)
+        pkg = Package(template)
+        b = Builder(pkg, base_dir=base_dir)
+        try:
+            b.build(pl)
+        except BuildError as e:
+            return f"만들지 못함 — {e}", False
+        f = Fitter(b)
+        want = _core(text)
+        hit = next(((p, w) for p, w in f.text_boxes() if want and _core(para_text(p)).startswith(want[:12])), None)
+        pages = next((w.replace("어림 쪽 수 ", "") for w in b.fit_notes if w.startswith("어림 쪽 수")), "")
+        if hit is None:
+            return "그 문단을 찾지 못함(글이 크게 바뀌었으면 find를 새 글로)", False
+        p, w = hit
+        chs, lines = f.lay.para_lines(p, w)
+        loose = [n for n, (s, e, u, av) in enumerate(lines[:-1])
+                 if loose_line(chs, s, e, u, av) and "\n" not in (chs[e - 1][0], chs[e][0] if e < len(chs) else "")]
+        s, e = lines[-1][0], lines[-1][1]
+        tail = sum(1 for c in chs[s:e] if c[0] not in (" ", "⎵", "⍽", "\n"))
+        short = len(lines) > 1 and tail <= 3
+        ok = not loose and not short
+        msg = f"{len(lines)}줄, 끝 줄 {tail}자" + (f", {pages}" if pages else "")
+        if loose:
+            hint = loose_hint(chs, *lines[loose[0]])
+            msg += f" — 크게 벌어진 줄 {len(loose)}개({loose[0] + 1}째 줄 끝{': ' + hint if hint else ''})"
+        if short:
+            msg += " — 끝 줄이 두서너 자"
+        return msg, ok
+
+    any_ok, code = False, 3
+    for n, t in enumerate(tries, 1):
+        if not isinstance(t, dict) or not isinstance(t.get("texts"), list):
+            print(f"후보 {n}: \"texts\"(후보 글 목록)가 있어야 합니다.")
+            return 1
+        if isinstance(t.get("block"), int):
+            k = t["block"] - 1
+        else:
+            find = re.sub(r"\*\*|\^\^", "", str(t.get("find", "")))
+            k = next((i for i, b in enumerate(blocks) if find and find in re.sub(r"\*\*|\^\^", "", block_text(b))), None)
+        if k is None or not 0 <= k < len(blocks) or not block_text(blocks[k]):
+            print(f"후보 {n}: 계획에서 그 블록을 찾지 못함(find는 블록 글의 일부, block은 1부터 센 번호).")
+            return 1
+        orig = block_text(blocks[k])
+        pre, mark, _ = split_marker(orig)
+        print(f"## 후보 시험 — 블록 {k + 1} ‘{_core(orig)[:14]}…’")
+        msg, _ = measure("지금", k, orig)
+        print(f" - 지금 글: {msg}")
+        for m, cand in enumerate(t["texts"], 1):
+            cand = str(cand)
+            if mark and not split_marker(cand)[1]:
+                cand = pre + cand  # 머리 기호를 빼고 준 후보는 원래 기호를 붙임
+            msg, ok = measure(m, k, cand)
+            any_ok |= ok
+            print(f" - 후보 {m}: {'통과' if ok else '남음'} — {msg}")
+    return 0 if any_ok else code
 
 
 def margin_note(pi):

@@ -5,6 +5,42 @@ from hwpx_lib import edit_run_text, plain_run, quote_indent  # noqa: E402
 from layout import FW_EM  # noqa: E402
 
 
+LONG_PARTICLE_RE = re.compile(r"\S+?(으로써|으로서|으로|에서|에게|에는|에도|까지|부터|보다|처럼|하여|되어|이라는|라는|이므로|하므로|하는|되는)$")
+
+
+def loose_hint(chs, s, e, used, avail):
+    """벌어진 줄(s~e)을 고칠 자리 — 다음 줄 첫 낱말이 넘어가 생긴 것이므로 그 낱말과 모자란 폭(글자 수), 이 줄에서 줄일 거리
+    (쉼표·긴 조사·띄어쓰기)를 짧은 글로(받은 요청 2026-11-22 9번: 정돈 뒤 남은 줄마다 고칠 낱말 위치와 고쳐 쓸 후보를 함께).
+    글은 도구가 고치지 않는다 — 쓰는 쪽이 고를 거리."""
+    body = [c for c in chs[s:e] if c[0] not in (" ", "⎵", "⍽", NL)]
+    if not body:
+        return ""
+    em = max(c[2] for c in body)
+    k = e
+    while k < len(chs) and chs[k][0] in " ⎵⍽":
+        k += 1
+    w_end = k
+    while w_end < len(chs) and chs[w_end][0] not in (" ", "⎵", "⍽", NL):
+        w_end += 1
+    word = "".join(c[0] for c in chs[k:w_end])
+    if not word:
+        return ""
+    space = next((c[1] for c in chs[s:e] if c[0] == " "), em / 2)
+    need = (sum(c[1] for c in chs[k:w_end]) + space - (avail - used)) / em
+    line = "".join(c[0] for c in chs[s:e]).replace("⎵", " ").replace("⍽", " ")
+    words = line.split()
+    longs = [w.rstrip(",.·") for w in words if LONG_PARTICLE_RE.match(w.rstrip(",.·"))][:3]
+    cand = []
+    if line.count(","):
+        cand.append(f"쉼표 {line.count(',')}곳")
+    if longs:
+        cand.append("·".join(f"‘{w}’" for w in longs))
+    if len(words) > 1:
+        cand.append(f"띄어쓰기 {len(words) - 1}곳 중 붙여 쓸 곳")
+    return (f"‘{word}’가 넘어감 — 이 줄을 {max(need, 0.1):.1f}자 줄이면 올라감"
+            + (f"(줄일 거리: {', '.join(cand)})" if cand else ""))
+
+
 def loose_line(chs, s, e, used, avail):
     """빈칸이 크게 벌어지는 줄인가: 덜 찬 줄(LOOSE 밑)이거나, 빈칸이 적어 빈칸 하나가 글자 폭의 SPREAD_EM배 넘게 늘어나는 줄
     (소하천 문서 71번 — 87.7% 찼지만 빈칸 셋이 1.4글자씩 벌어짐, 검사만이 놓쳤음 2026-11-15)."""
@@ -342,16 +378,19 @@ class LineFit:
                 continue  # 가운데·왼쪽 정렬 줄은 낱말 사이가 벌어지지 않음
             chs, lines = self.lay.para_lines(p, box_w)
             # 줄 바꿈으로 끝나는 줄은 한글이 벌리지 않으므로 세지 않음(만든 뒤 검사만이 '빈칸 큰 줄'로 보던 것 — 평가 2026-11-09)
-            if any(self._loose(chs, s, e, used, avail) and "\n" not in (chs[e - 1][0], chs[e][0] if e < len(chs) else "")
-                   for s, e, used, avail in lines[:-1]):
+            bad = [k for k, (s, e, used, avail) in enumerate(lines[:-1])
+                   if self._loose(chs, s, e, used, avail) and "\n" not in (chs[e - 1][0], chs[e][0] if e < len(chs) else "")]
+            if bad:
                 text = para_text(p)
                 # 상자·표 칸 안 문단이면 밝힌다 — 같은 글이 본문에도 있으면 어느 쪽인지 알 수 없었음(시험 2026-11-12: 표지 개요 상자의 줄)
                 inside = "(상자·표 칸 안) " if any(a.tag == T("hp:tc") for a in p.iterancestors()) else ""
-                loose.append(inside + text[head_length(text):].replace("⎵", " ").strip()[:14])
+                hint = loose_hint(chs, *lines[bad[0]])  # 고칠 낱말 위치·모자란 폭·줄일 거리(받은 요청 2026-11-22 9번)
+                loose.append(f"‘{inside}{text[head_length(text):].replace('⎵', ' ').strip()[:14]}…’"
+                             + (f"({bad[0] + 1}째 줄 끝 — {hint})" if hint else ""))
         if loose:
             self.notes.append(fix_note(f"그래도 빈칸이 크게 벌어지는 줄이 남은 문단 {len(loose)}개 — 긴 낱말이 다음 줄로 넘어감. "
-                              "낱말을 줄이거나 순서를 바꾸거나 두 줄로 나누면 좋아집니다: "
-                              + ", ".join(f"‘{t}…’" for t in loose)))
+                              "낱말을 줄이거나 순서를 바꾸거나 두 줄로 나누면 좋아집니다(고쳐 쓴 글은 --try로 미리 시험): "
+                              + ", ".join(loose)))
         if not getattr(self, "defer_hints", False):
             self.report_cut_hints()
         # 내리기로도 못 고친(끝 줄 바로 위에 나눌 빈칸이 없는 등) 문단은 글을 고쳐야 하므로 '고쳐야 함'으로 알린다

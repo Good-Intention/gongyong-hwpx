@@ -109,7 +109,7 @@ MID_DOTS = "·ㆍ"
 # — 계획의 "doc_type"이 이 꼴이면 근거법령 검사(맨 앞으로 옮기기·'근거법령이 없습니다')를 건너뛴다(사용자 2026-11-07 '충돌이 있는
 # 근거법령부분은 특정 보고에서는 빼도록 조정합시다'). 검사만(review)은 만든 문서에 남긴 표시나 제목 상자 글로도 알아본다.
 BASIS_EXEMPT_RE = re.compile(r"회의\s*자료|보도\s*자료|보도\s*(관련\s*)?대응|언론|답변서?|주간\s*(업무)?\s*보고|사업\s*설명서")
-SKILL_VERSION = "2.15"  # 만든 문서에 남기는 판(meta made=…) — 판을 올릴 때 README '지금 판'과 함께 바꿈
+SKILL_VERSION = "2.16"  # 만든 문서에 남기는 판(meta made=…) — 판을 올릴 때 README '지금 판'과 함께 바꿈
 # 계획 "omit": 사용자가 일부러 뺀 요소 — 그 요소의 '고쳐야 함'을 알림으로 낮춘다(평가 2026-11-08 '사용자가 일부러 뺀 것을
 # 선언할 길이 없다 — 날짜 줄·요약 상자를 빼라고 해도 끝 번호 3'). 키 → 보이는 이름. 알림이 키를 kind로 든다(fix_note)
 OMIT_KEYS = {"date": "날짜·부서 줄", "summary": "요약 상자", "basis": "근거법령", "table_title": "■ 표 제목"}
@@ -149,31 +149,53 @@ def check_plan(plan):
     small = opts.get("paren_small")
     if small is True or (small not in (None, False) and not isinstance(small, (int, float))):
         raise BuildError(f"\"paren_small\"은 줄일 글자 크기(pt) 숫자여야 합니다 — 끄려면 false(받은 값: {small!r}).")
+    narr = opts.get("narrative")
+    if narr is not None and not isinstance(narr, bool):
+        raise BuildError(f"\"narrative\"(서술식 문서)는 true 또는 false여야 합니다(받은 값: {narr!r}).")
+    line = opts.get("line_pct")
+    if line is not None and (isinstance(line, bool) or not isinstance(line, (int, float)) or not 100 <= line <= 300):
+        raise BuildError(f"\"line_pct\"는 본문 줄 간격(%) 숫자여야 합니다 — 100~300, 예: \"line_pct\": 190(받은 값: {line!r}).")
     return blocks
 
 
 LAW_RE = re.compile(r"「([^「」\n]{2,40})」")
-LAW_NAME_RE = re.compile(r"(법|법률|시행령|시행규칙|규칙|규정|조례|훈령|예규|고시|지침|협약)$")
+LAW_NAME_RE = re.compile(r"(법|법률|령|규칙|규정|조례|훈령|예규|고시|지침|요령|기준|세칙|내규)$")
 ARTICLE_RE = re.compile(r"제\s*(\d+)\s*조(?:의\s*(\d+))?(?:\s*제\s*(\d+)\s*항)?(?:\s*제\s*(\d+)\s*호)?")
+# 법령이 아닌 문서(협약·약관·계약서 등) — 낫표 이름이 이 꼴이거나 조문 바로 앞에 이 말이 오면 법령 확인 목록에서 뺀다
+# (받은 요청 2026-11-22 17번: 「○○」 제14조제1항처럼 협약 이름 뒤 조문을 법령으로 잡던 것)
+AGREEMENT_RE = re.compile(r"(협약서?|협정서?|약정서?|약관|계약서?|정관|양해각서|MOU|규약)")
+SENTENCE_END_RE = re.compile(r"(?<![\d.])[.?!](?=\s|$)")  # 문장 끝(날짜 ’26. 11. 의 점은 아님)
 
 
 def law_citations(texts):
     """글에 나온 법령 인용을 뽑는다 — 돌려주는 것: (인용 글 목록, 번호를 아직 안 채운 '제○조' 꼴 수). 법령이 있는지·조문이 맞는지는
-    여기서 알 수 없어 글을 쓰는 쪽이 법령 검색 도구로 확인한다(도구는 조문을 지어내지 않게 목록만 — 평가 조언 2026-11-09)."""
+    여기서 알 수 없어 글을 쓰는 쪽이 법령 검색 도구로 확인한다(도구는 조문을 지어내지 않게 목록만 — 평가 조언 2026-11-09).
+    조문은 같은 문장 안의 낫표 법령에만 붙이고, 그 사이에 협약·약관 같은 다른 문서 이름이 오면 그 문서의 조문으로 보아 뺀다
+    ('(제8조제2항)'처럼 앞말 없는 괄호 조문이 앞 문장의 다른 법령에 붙던 것 — 받은 요청 2026-11-22 17번). 낫표 이름이 법령 꼴이
+    아니면(「○○ 플랫폼」 같은 사업·협약 이름) 조문이 붙어도 목록에 넣지 않는다."""
     found, blanks = [], 0
     for text in texts:
         text = text.replace("⎵", " ").replace("⍽", " ")
         marks = list(LAW_RE.finditer(text))
         for k, m in enumerate(marks):
             stop = marks[k + 1].start() if k + 1 < len(marks) else min(len(text), m.end() + 60)
-            tail = text[m.end():stop]
+            end = SENTENCE_END_RE.search(text, m.end(), stop)
+            tail = text[m.end():end.start() if end else stop]
             blanks += len(re.findall(r"제\s*[○◯Ｏ]+\s*조", tail))
-            arts = ["".join(("제" + a.group(1) + "조", "의" + a.group(2) if a.group(2) else "", "제" + a.group(3) + "항" if a.group(3) else "",
-                             "제" + a.group(4) + "호" if a.group(4) else "")) for a in ARTICLE_RE.finditer(tail)]
-            # 낫표는 계획·사업 이름에도 쓴다(「2026년도 ○○ 시행계획」) — 조문이 없으면 이름이 법령 꼴일 때만
-            if not arts and "○" not in tail[:12] and LAW_NAME_RE.search(m.group(1)):
+            name = m.group(1).strip()
+            if AGREEMENT_RE.search(name) or not LAW_NAME_RE.search(name):
+                # 낫표는 계획·사업·협약 이름에도 쓴다(「2026년도 ○○ 시행계획」·「○○ 플랫폼」) — 법령 꼴 이름만
+                continue
+            arts, at = [], 0
+            for a in ARTICLE_RE.finditer(tail):
+                if AGREEMENT_RE.search(tail[at:a.start()]):
+                    break  # 이 조문부터는 그 사이에 나온 협약·약관 등의 조문
+                arts.append("".join(("제" + a.group(1) + "조", "의" + a.group(2) if a.group(2) else "",
+                                     "제" + a.group(3) + "항" if a.group(3) else "", "제" + a.group(4) + "호" if a.group(4) else "")))
+                at = a.end()
+            if not arts and "○" not in tail[:12]:
                 arts = [""]
-            found += [f"「{m.group(1)}」 {a}".rstrip() for a in arts]
+            found += [f"「{name}」 {a}".rstrip() for a in arts]
     found = list(dict.fromkeys(found))
     with_art = {c.split("」")[0] for c in found if not c.endswith("」")}  # 조문까지 적은 법령은 이름만 줄을 뺌
     return [c for c in found if not (c.endswith("」") and c.split("」")[0] in with_art)], blanks
