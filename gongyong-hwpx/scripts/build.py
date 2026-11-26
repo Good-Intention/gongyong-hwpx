@@ -26,7 +26,7 @@ from build_fill import FillPart  # noqa: E402
 from build_rules import RulesPart  # noqa: E402
 from plan_text import expand_plan  # noqa: E402
 import proofread  # noqa: E402
-from spaces import compact_fw, lead_to_margin  # noqa: E402
+from spaces import compact_fw, lead_to_margin, protect_lead  # noqa: E402
 
 
 class Builder(FillPart, RulesPart):
@@ -146,12 +146,19 @@ class Builder(FillPart, RulesPart):
         # '새 번호로 시작'을 제목 상자(쪽 너비 표) 앞에 따로 두면 한글이 그 표를 다음 줄로 밀어 제목 위에 빈 줄이 생긴다
         # (한글 확인 2026-11-01) — 같은 쪽의 첫 글 문단(날짜 줄 등) 맨 앞에 둔다
         first_text = next((q for q in paras[end:end + 4] if para_text(q).strip() and not para_tables(q)), None)
-        for p, tag, attrs in ((paras[0], "hp:pageHiding",
+        # 슬로건이 없으면 표지 첫 문단이 제목 띠(표) 문단이 된다 — '감추기' 조각을 거기 두면 한글이 그 조각에 한 줄을 주어 표지 전체가
+        # 3.5~6mm 내려감(v2.17 3번). 그때는 표지 쪽의 첫 글 문단(부서명 등)에 둔다(감추기는 그 쪽 어디에 있어도 같음)
+        hide_at = paras[0]
+        if para_tables(paras[0]) and not para_pics(paras[0]):
+            cover_text = next((q for q in paras[1:end] if para_text(q).strip() and not para_tables(q) and not para_pics(q)), None)
+            if cover_text is not None:
+                hide_at = cover_text
+        for p, tag, attrs in ((hide_at, "hp:pageHiding",
                                (("hideHeader", "1"), ("hideFooter", "0"), ("hideMasterPage", "0"), ("hideBorder", "0"),
                                 ("hideFill", "0"), ("hidePageNum", "1"))),
                               (first_text if first_text is not None else paras[end], "hp:newNum",
                                (("num", "1"), ("numType", "PAGE")))):
-            if p is first_text:
+            if p is first_text or p is not paras[0] and tag == "hp:pageHiding":
                 ctrl = etree.Element(T("hp:ctrl"))
                 el = etree.SubElement(ctrl, T(tag))
                 for k, v in attrs:
@@ -237,6 +244,7 @@ class Builder(FillPart, RulesPart):
         if self.line_pct:  # 본문 줄 간격을 정함(의뢰서 190% 등) — 쪽 맞춤은 이 값을 바꾸지 않음
             self.apply_line_pct(int(self.line_pct))
         blocks = [dict(b, _src=b.get("_src", n + 1)) if isinstance(b, dict) else b for n, b in enumerate(blocks)]
+        blocks = self.section_blocks(blocks)  # {"section": "가로"} — 그 블록부터 새 구역(가로 쪽 등, v2.17 2번)
         if opts.get("omit_dots", True):
             self.omit_dots(blocks)  # (중략)·(후략) → ··· — 이름표 맞추기가 (중략)을 이름표로 벌리기 전에
         blocks = self.table_units(blocks)  # 이름표 맞추기 등이 '(기준 : …)'을 괄호 이름표로 다루기 전에
@@ -276,8 +284,10 @@ class Builder(FillPart, RulesPart):
         # 서술식 문서(계획 "narrative": true — 문장으로 쓰는 문서를 부르는 스킬이 넘김): 이름표 폭·이름표 뒤 둘째 줄·괄호 줄이기 기본 끔
         # (받은 요청 2026-11-22 4·5번. 공용 스킬은 문서 이름을 보고 고르지 않음 — 사용자 '법률자문 스킬은 따로 있다')
         self.narrative = "서술식" if opts.get("narrative") else ""
-        off = [name for key, name in (("align_labels", "이름표 폭 맞추기"), ("label_hang", "이름표 뒤 둘째 줄 맞추기"),
-                                      ("paren_small", "괄호 글자 줄이기")) if self.narrative and key not in opts]
+        off = [name for key, name in (("align_labels", "이름표 폭 맞추기"), ("paren_small", "괄호 글자 줄이기"),
+                                      ("opener_breaks", "괄호·낫표 앞 줄 바꿈"), ("connector_breaks", "연결어 앞 줄 바꿈"),
+                                      ("push_down", "끝 줄 내리기 줄 바꿈"))
+               if self.narrative and key not in opts]
         if off:
             self.warn(f"서술식 문서(계획 narrative)라 {'·'.join(off)}를 기본으로 껐습니다(둘째 줄은 머리 기호 다음 글자 자리에 — "
                       "켜려면 계획에 그 옵션을 true로).")
@@ -304,6 +314,7 @@ class Builder(FillPart, RulesPart):
         self.ref_sole_titles(out)  # 참고 자체가 표 하나면 ■ 제목 줄을 빼고(머리표 제목이 표 제목) 검사
         if "table_title" not in self.omit:
             self.table_titles(out)
+        self.table_gaps(out)  # 표 → 다음 표 ■ 제목 사이 빈 줄 하나(사용자 2026-11-26)
         self.flow_steps(out)
         self.check_endings(out)
         out = self.law_refs(out)
@@ -313,6 +324,10 @@ class Builder(FillPart, RulesPart):
         self.law_source_lines(out)  # 참고 근거법령 '※ 출처' 줄은 쓰지 않음 — 알림
         if opts.get("keep_groups", True):
             self.keep_groups(out)
+        elif opts.get("keep_heads", True):  # 묶음 유지를 꺼도 머리 문단은 아래 첫 문단과 함께(받은 글 2026-11-26 2번)
+            self.keep_heads(out)
+        if opts.get("keep_lines", bool(self.narrative)):  # 문단 보호 — 서술식 문서 기본
+            self.keep_lines_all(out)
         first = out[0]
         k = 0
         for r in self.struct_runs:
@@ -355,14 +370,40 @@ class Builder(FillPart, RulesPart):
             self.date_gap()
         if opts.get("tighten_quotes", True):
             self.tighten_quotes()
-        if self.colons or opts.get("label_hang", not self.narrative):
-            self.colon_hang(colons=self.colons, labels=opts.get("label_hang", not self.narrative))
+        # 괄호 이름표 뒤 둘째 줄은 늘 '(' 자리(머리 기호 뒤) — 사용자 2026-11-26 '늘 ( 자리로'(11-15 '개조식이면 )에'를 바꿈).
+        # 계획 label_hang: true면 옛 방식(개조식은 이름표 ')' 뒤 첫 글자)
+        if self.colons or opts.get("label_hang", False):
+            self.colon_hang(colons=self.colons, labels=opts.get("label_hang", False))
         self.fit_notes = []
+        for p in self.sec.iter(T("hp:p")):
+            # 머리(기호·이름표·쌍점과 뒤 빈칸)와 내용을 다른 조각으로 — 줄 맞춤은 내용 조각만 자간을 바꾸고 어림도 그렇게 잼. 이름표 둘째 줄을
+            # '(' 자리로 두면서(2026-11-26) colon_hang의 조각 나누기를 거치지 않는 문단이 생겨, 머리와 붙은 내용 조각에 자간이 안 들어갔음
+            h = head_length(para_text(p))
+            if h and not para_tables(p):
+                self._split_run_at(p, h)
+        secs = self.split_sections()  # 계획의 "section" 블록에서 새 구역(첫 구역은 self.sec 그대로)
+        sec0, reports, pt = self.sec, [], []
+        for k, s in enumerate(secs):
+            self.sec = s
+            self._fit_section(opts, k, reports, pt)
+        self.sec = sec0
+        if len(secs) > 1:
+            self.fit_notes = [n for n in self.fit_notes if not n.startswith("어림 쪽 수")] + [self._join_reports(reports)]
+        self.table_pt = min(pt) if pt else None
+        self._finish(opts)
+
+    def _fit_section(self, opts, k, reports, pt):
+        """구역 하나(self.sec)를 맞춘다 — 구역마다 쪽 크기(가로 쪽 등)가 다르므로 Fitter가 그 구역의 쪽 설정으로 잰다."""
         if opts.get("fit", True):
             f = Fitter(self)
-            f.push = opts.get("push_down", True)  # 끝 줄 한두 낱말 내리기(끄면 올리기만)
-            if self.line_pct:  # 정한 본문 줄 간격은 쪽 맞춤이 줄이지도 넓히지도 않음
+            # 강제 줄 바꿈(끝 줄 내리기·괄호 앞·연결어 앞)은 서술식 문서에서 기본으로 끔 — 한글은 줄 바꿈 앞 줄을 양쪽 정렬하지 않아
+            # 오른쪽이 비어 보임(받은 글 2026-11-26 1번, 물음 '서술식만 끔'). 못 고친 끝 줄·벌어진 줄은 '고쳐야 함'으로 문장 고치기를 안내
+            f.push = opts.get("push_down", not self.narrative)  # 끝 줄 한두 낱말 내리기(끄면 올리기만)
+            f.openers = opts.get("opener_breaks", not self.narrative)
+            f.connectors = opts.get("connector_breaks", not self.narrative)
+            if self.line_pct:  # 정한 본문 줄 간격은 쪽 맞춤이 줄이지도 넓히지도 않음 — 빈 줄·○ 위 간격도(받은 글 2026-11-26 2번)
                 f.min_line = f.line_cap = int(self.line_pct)
+                f.fixed_rhythm = True
             f.defer_hints = True  # '한 줄 줄이기 후보'는 맞춤을 다 끝낸 뒤 검사만과 같은 셈으로(fit_lines)
             f.fit_tables()
             f.fit_tables(again=True)  # 한 번 더: 자간·한 줄로 입력·폭 빌리기 뒤 다시 재도 같은 결과가 되게(다듬기의 고정점)
@@ -383,12 +424,128 @@ class Builder(FillPart, RulesPart):
                 f.fill_ends()  # 낫표 당기기로 줄어든 폭까지 보고 끝선에
             f.rescan_hints = True  # 내린 두 줄 문단의 '한 줄 줄이기 후보'를 다 맞춘 문서에서(검사만과 같게)
             f.report_cut_hints()
-            self.fit_notes = f.notes + [f.report()]
-            shrunk = [f._main_size(t) for t, d in getattr(f, "page_shrink", {}).items() if d]
-            self.table_pt = min(shrunk) if shrunk else None  # 한 장에 넣으려 줄인 표 글자 — 문서에 남겨 검사만이 다시 키우는 것으로 보지 않게
+            rep = f.report()
+            reports.append((rep, f.pages_used if hasattr(f, "pages_used") else None))
+            tag = "" if k == 0 else f"[{k + 1}째 구역] "
+
+            def tagged(n):
+                """구역 표시를 붙여도 '고쳐야 함' 등급(Note.level·kind)은 그대로 — 글만 이으면 보통 글이 되어 알림으로 내려갔음."""
+                if not tag:
+                    return n
+                return fix_note(tag + n, getattr(n, "kind", None)) if getattr(n, "level", "info") == "fix" else tag + n
+            self.fit_notes += [tagged(n) for n in f.notes] + [rep]
+            pt += [f._main_size(t) for t, d in getattr(f, "page_shrink", {}).items() if d]  # 한 장에 넣으려 줄인 표 글자
         elif opts.get("one_space", True):
             self.one_space()
-        self._finish(opts)
+
+    @staticmethod
+    def _join_reports(reports):
+        """구역마다 '어림 쪽 수 N쪽(1쪽 …%, …)'을 이어 한 줄로 — 쪽 차례는 이어서 셈."""
+        total, parts, fixes = 0, [], []
+        for rep, _ in reports:
+            m = re.match(r"어림 쪽 수 (\d+)쪽\((.*?)\)(.*)$", str(rep))
+            if not m:
+                continue
+            n = int(m.group(1))
+            fill = re.sub(r"(\d+)쪽", lambda x: f"{int(x.group(1)) + total}쪽", m.group(2))
+            parts.append(fill)
+            total += n
+            if m.group(3):
+                fixes.append(m.group(3))
+        msg = f"어림 쪽 수 {total}쪽({', '.join(parts)})" + "".join(fixes)
+        return fix_note(msg) if fixes and any("두 쪽에 걸친" in x for x in fixes) else msg
+
+    SECTION_WORDS = {"가로": "가로", "landscape": "가로", "세로": "세로", "portrait": "세로"}
+
+    def section_blocks(self, blocks):
+        """{"section": "가로"}만 있는 블록은 다음 블록에 붙인다(기호로 쓴 계획에서도 쓰게). 값은 가로·세로."""
+        out, pending = [], None
+        for b in blocks:
+            if isinstance(b, dict) and "section" in b:
+                v = self.SECTION_WORDS.get(str(b["section"]).strip().lower())
+                if v is None:
+                    raise BuildError(f"블록 {b.get('_src', '?')}: \"section\"은 \"가로\" 또는 \"세로\"입니다(받은 값: {b['section']!r}).")
+                if "like" not in b and set(b) <= {"section", "_src"}:
+                    pending = v
+                    continue
+                b = dict(b, section=v)
+            elif pending and isinstance(b, dict):
+                b = dict(b, section=pending)
+            if isinstance(b, dict) and b.get("section"):
+                pending = None
+            out.append(b)
+        if pending:
+            raise BuildError("계획 맨 끝의 {\"section\": …} 뒤에 블록이 없습니다 — 새 구역에 넣을 블록을 그 뒤에 쓰세요.")
+        return out
+
+    def split_sections(self):
+        """계획의 "section" 블록(make_block이 section_marks에 적음)에서 새 구역을 만든다: 첫 구역의 쪽 설정(secPr)·머리말·꼬리말·쪽 번호
+        조각을 복사하고 방향만 바꿈(가로 = landscape NARROWLY — 저장 크기는 그대로, 한글 2024 확인 2026-11-09). 그 구역의 쪽 너비 표는
+        새 본문 폭에 맞춰 칸 너비를 비율대로 넓힌다. 쪽 번호는 이어진다. 돌려주는 것: 구역 목록(첫 구역 = self.sec)."""
+        marks = getattr(self, "section_marks", {})
+        paras = [p for p in self.sec if p.tag == T("hp:p")]
+        cuts = []
+        for i, p in enumerate(paras):
+            if p not in marks or i == 0:
+                continue
+            k = i
+            while k > 1 and not para_tables(paras[k - 1]) and (UNIT_RE.match(para_text(paras[k - 1]))
+                                                              or para_text(paras[k - 1]).lstrip().startswith("■")):
+                k -= 1  # 표 위 ■ 제목·단위 줄은 표와 같은 구역으로
+            if k != i:
+                marks[paras[k]] = marks.pop(p)
+            cuts.append(k)
+        if not cuts:
+            return [self.sec]
+        secpr = next(self.sec.iter(T("hp:secPr")))
+        w0 = page_info(self.sec)["body_width"] * HWPUNIT_PER_MM
+        secs = [self.sec]
+        bounds = cuts + [len(paras)]
+        for a, b in zip(bounds, bounds[1:]):
+            root = etree.Element(self.sec.tag, nsmap=self.sec.nsmap)
+            for k2, v2 in self.sec.attrib.items():
+                root.set(k2, v2)
+            for p in paras[a:b]:
+                root.append(p)  # 첫 구역에서 옮김
+            first = paras[a]
+            first.set("pageBreak", "0")  # 구역이 바뀌면 새 쪽 — 쪽 나눔을 겹쳐 두면 빈 쪽이 생길 수 있음
+            runs = para_runs(first)
+            proto = runs[0] if runs else None
+            new_sp = copy.deepcopy(secpr)
+            pp = new_sp.find(T("hp:pagePr"))
+            if pp is not None:
+                pp.set("landscape", "NARROWLY" if marks[first] == "가로" else "WIDELY")
+            r = copy.deepcopy(proto) if proto is not None else etree.Element(T("hp:run"))
+            for ch in list(r):
+                r.remove(ch)
+            r.append(new_sp)
+            for sr in self.struct_runs:  # 머리말·꼬리말·쪽 번호 넣기 조각(쪽 설정 조각은 위에서 새로)
+                for ch in sr:
+                    if ch.tag == T("hp:ctrl") and any(etree.QName(x).localname in ("header", "footer", "pageNum") for x in ch):
+                        r.append(copy.deepcopy(ch))
+            first.insert(list(first).index(runs[0]) if runs else len(first), r)
+            drop_linesegs(first)
+            w1 = page_info(root)["body_width"] * HWPUNIT_PER_MM
+            if abs(w1 - w0) > HWPUNIT_PER_MM:
+                for p in root:
+                    for tbl in para_tables(p):
+                        self._scale_table(tbl, w0, w1)
+            secs.append(root)
+        self.extra_secs = secs[1:]
+        return secs
+
+    @staticmethod
+    def _scale_table(tbl, w0, w1):
+        """쪽 너비 표(본문 폭과 같은 표)를 새 본문 폭에 맞춰 칸 너비를 비율대로 넓힌다(가로 쪽 구역)."""
+        sz = tbl.find(T("hp:sz"))
+        if sz is None or abs(int(sz.get("width", "0")) - w0) > 2 * HWPUNIT_PER_MM:
+            return
+        r = w1 / w0
+        sz.set("width", str(int(round(int(sz.get("width")) * r))))
+        for tc in tbl.iter(T("hp:tc")):
+            cs = tc.find(T("hp:cellSz"))
+            if cs is not None:
+                cs.set("width", str(int(round(int(cs.get("width", "0")) * r))))
 
     def one_space(self):
         """빈칸 한 칸(spaces.py — 정돈과 같은 규칙, 사용자 2026-11-08 '작성도 바꾸기'): 맞춤을 다 끝낸 뒤 머리의 고정폭 빈칸
@@ -410,6 +567,8 @@ class Builder(FillPart, RulesPart):
             # 맞춤 뒤에 돌므로 줄 수를 다시 잰다 — 늘면 그 문단은 그대로(옛 판: 40자 붙은 낱말이 1줄 → 2줄, 평가 2026-11-09)
             n0 = len(lay.para_lines(p, body_w)[1]) if p in body else None
             saved = (p.get("paraPrIDRef"), [(r, r.get("charPrIDRef"), copy.deepcopy(list(r))) for r in para_runs(p)], list(p)) if n0 else None
+            if p in body:  # 기호 없는 줄머리 빈칸은 자간 0(받은 글 2026-11-26 5번) — 본문 문단만(양식 표 칸 글은 그대로)
+                protect_lead(p, self.styles, self.hedit, split, self.tab_proto)
             lead_to_margin(p, self.styles, self.hedit, lay, split, fonts_ok, self.tab_proto, 10 ** 6)
             compact_fw(p, self.styles, self.hedit, split, self.tab_proto)
             if n0 and len(lay.para_lines(p, body_w)[1]) > n0:
@@ -456,10 +615,19 @@ class Builder(FillPart, RulesPart):
                     el.set("id", new_id(used))
         for name in self.sec_names[1:]:
             self.pkg.drop_section(name)
-            self.warn(f"견본의 {name}(둘째 구역부터)은 결과 문서에서 뺐습니다.")
+            self.warn(f"견본의 {name}(둘째 구역부터)은 결과 문서에서 뺐습니다 — 가로 쪽 등 새 구역은 계획에 {{\"section\": \"가로\"}}로.")
+        extra = getattr(self, "extra_secs", [])
+        for k, root in enumerate(extra, 1):
+            for p in root.iter(T("hp:p")):
+                p.set("id", new_id(used))
+            for tag in ("hp:tbl", "hp:pic", "hp:rect", "hp:line", "hp:ellipse", "hp:container", "hp:equation"):
+                for el in root.iter(T(tag)):
+                    if el.get("id") is not None:
+                        el.set("id", new_id(used))
+            self.pkg.add_section(f"Contents/section{k}.xml", root)
         head = self.pkg.xml("Contents/header.xml")
         if head.get("secCnt"):
-            head.set("secCnt", "1")
+            head.set("secCnt", str(1 + len(extra)))
         self._drop_unused_images()
         if clear_print_method(self.pkg):
             self.warn("견본의 모아찍기 인쇄 설정을 껐습니다 — 켜 두면 인쇄·PDF가 한 장에 2쪽씩 묶입니다.")

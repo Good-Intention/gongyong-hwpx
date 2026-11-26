@@ -115,6 +115,11 @@ class LineFit:
     def set_delta(self, p, d):
         """문단 내용 조각의 자간을 d만큼 바꾼다. 머리 기호·괄호 이름표 조각은 그대로 둔다(줄 맞춤 유지)."""
         head = head_length(para_text(p))
+        if head and hasattr(self.b, "_split_run_at"):
+            # 머리와 내용이 한 조각이면(‘⎵○○ 4년을…’처럼 이름표 뒤 빈칸부터 내용이 한 조각) 머리 끝에서 나눈다 — 안 나누면 그 조각을
+            # 머리로 보고 건너뛰어, 어림(글자 단위로 머리 뒤만 줄임)은 한 줄인데 실제 자간은 그대로였음(2026-11-26: 이름표 둘째 줄을
+            # '(' 자리로 바꾸며 colon_hang의 조각 나누기를 거치지 않게 된 문단)
+            self.b._split_run_at(p, head)
         pos = 0
         for r in para_runs(p):
             if r.find(T("hp:tbl")) is not None:
@@ -308,8 +313,8 @@ class LineFit:
         2) 그래도 안 되면 줄 바꿈 자리는 그대로 두고 자간을 늘려(+5%까지) 덜 벌어지게 한다. 돌려주는 것: (줄인 값들, 늘린 값들)."""
         pulled, widened = [], []
         for p, box_w in self.text_boxes():
-            if not self.checked(p):
-                continue
+            if not self.checked(p) or p in getattr(self, "_comma_done", ()):
+                continue  # 쉼표 뒤에서 줄을 바꾼 문단은 그 줄을 일부러 늘린 것 — 다시 당기면 낱말이 윗줄로 되돌아감
             chs, lines = self.lay.para_lines(p, box_w)
             if len(lines) < 2:
                 continue
@@ -354,9 +359,76 @@ class LineFit:
                 widened.append(self._content_spacing(p))
         return pulled, widened
 
+    COMMA_WORD = 5  # 쉼표 뒤 다음 마디 첫 낱말이 이 글자 수 안이면 윗줄 끝에 홀로 남은 것으로 봄
+
+    def comma_breaks(self):
+        """줄 끝에 ‘…, 낱말’처럼 쉼표 뒤 다음 마디의 첫 낱말 하나만 남으면, 그 줄의 쉼표까지 글자 자간을 조금 늘려(WIDEN_MAX까지) 그 낱말을
+        아랫줄 첫머리로 보낸다(사용자 2026-11-26 수정본: ‘…○○)하고, ○○ / ○○은 ○○로 구분’ → 윗줄 자간 +2%로 ‘…하고, / ○○
+        ○○은…’). 줄 바꿈은 넣지 않는다(한글은 줄 바꿈 앞 줄을 벌리지 않아 오른쪽이 빔 — 받은 글 2026-11-26 1번). 줄 수가 늘거나 아랫줄에
+        빈칸 큰 줄이 생기면 하지 않음. 요약 상자·인용 글은 그대로."""
+        done = []
+        summary = self.summary_paras()
+        for p, box_w in self.text_boxes():
+            if p in summary or not self.checked(p) or "\n" in para_text(p):
+                continue
+            if self.st.para.get(p.get("paraPrIDRef"), {}).get("align") not in ("JUSTIFY", "DISTRIBUTE"):
+                continue
+            head = head_length(para_text(p))
+            for _ in range(3):
+                chs, lines = self.lay.para_lines(p, box_w)
+                hit = None
+                for li, (s, e, used, avail) in enumerate(lines[:-1]):
+                    seg = "".join(c[0] for c in chs[s:e]).rstrip()
+                    m = re.search(r"[,，][ ⎵⍽]+([^ ⎵⍽,，]+)$", seg)
+                    if m and len(m.group(1)) <= self.COMMA_WORD and s + m.start() > max(s, head) + 4:
+                        hit = (li, max(s, head), s + m.start() + 1, s + m.start(1))
+                        break
+                if hit is None:
+                    break
+                li, lo, cut, word = hit
+                self.b._split_run_at(p, lo)
+                self.b._split_run_at(p, cut)
+                seg_runs, pos = [], 0
+                for r in para_runs(p):
+                    t = run_text(r)
+                    at, pos = pos, pos + len(t)
+                    if r.find(T("hp:t")) is not None and t and lo <= at < cut \
+                            and self.st.char.get(r.get("charPrIDRef"), {}).get("spacing", 0) >= FLOOR:
+                        seg_runs.append(r)
+                if not seg_runs:
+                    break
+                base0 = {r: r.get("charPrIDRef") for r in seg_runs}
+
+                def try_d(d):
+                    for r, cid in base0.items():
+                        base = self.st.char.get(cid, {}).get("spacing", 0)
+                        new = spacing_after(base, d, FLOOR)
+                        r.set("charPrIDRef", self.b.hedit.char_spacing(cid, new) if new != base else cid)
+                    # 낱말을 아랫줄로 보내는 쪽이라 어림 오차는 반대로 — 폭을 조금 넓게(1/SLACK) 잡아도 넘어가야 함
+                    c2, l2 = self.lay.para_lines(p, box_w / SLACK)
+                    return (len(l2) <= len(lines) and len(l2) > li + 1 and l2[li + 1][0] == word
+                            and not any(self._loose(c2, s2, e2, u2, a2) for s2, e2, u2, a2 in l2[li + 1:-1]))
+
+                got = next((d for d in range(1, WIDEN_MAX + 1) if try_d(d)), None)
+                if got is not None and got < WIDEN_MAX and try_d(got + 1):
+                    got += 1  # 어림 오차(0.5% 안)에 대비해 한 단계 더 — 한글이 그 낱말을 윗줄에 그대로 두지 않게
+                elif got is not None:
+                    try_d(got)
+                if got is None:
+                    for r, cid in base0.items():
+                        r.set("charPrIDRef", cid)
+                    break
+                done.append(got)
+                self.__dict__.setdefault("_comma_done", set()).add(p)  # 빈칸 맞춤(_sparse_pass)이 되당기지 않게
+        if done:
+            self.notes.append(f"줄 끝에 쉼표 뒤 다음 마디의 첫 낱말만 남던 줄 {len(done)}곳은 그 줄 자간을 조금 늘려({pct_range(done, plus=True)}) "
+                              "낱말을 아랫줄 첫머리로 보냈습니다(쉼표 뒤에서 줄이 바뀌게).")
+
     def widen_sparse(self):
         # 기호 앞 줄 바꿈이 먼저 — 넓히기(자간 +)가 윗줄을 채운 뒤에는 '앞 글자 올리기' 자리·'크게 벌어지는 줄'을 알아볼 수 없음
-        self.opener_breaks()
+        if getattr(self, "openers", True):  # 서술식 문서는 기본으로 끔(계획 opener_breaks — 받은 글 2026-11-26 1번)
+            self.opener_breaks()
+        self.comma_breaks()
         pulled, widened = self._sparse_pass()
         if pulled:
             self.notes.append(f"다음 낱말이 넘어가 빈칸이 크게 벌어질 문단 {len(pulled)}개는 자간을 줄여"
@@ -487,7 +559,8 @@ class LineFit:
             self.notes.append(f"화살표 뒤 내용이 줄 끝에서 갈라지던 문단 {done}개는 화살표부터 끝까지를 다음 줄로 내렸습니다.")
         if hung:
             self.notes.append(f"화살표 뒤 내용이 다음 줄로 이어지는 문단 {hung}개는 둘째 줄부터를 화살표 뒤 첫 글자 밑에 맞췄습니다.")
-        self.connector_breaks()
+        if getattr(self, "connectors", True):  # 서술식 문서는 기본으로 끔(계획 connector_breaks)
+            self.connector_breaks()
 
     def connector_breaks(self):
         """본문 문단의 줄 끝에 연결어·연결 기호('+'·'및'·'또는'·'='·'×')가 남으면 그 앞에서 줄을 바꿔 다음 줄 첫머리로

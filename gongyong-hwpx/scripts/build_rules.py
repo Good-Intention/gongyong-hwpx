@@ -21,10 +21,17 @@ class RulesPart:
 
         lv_list = [lv(k) for k in range(len(out))]
         member = (3, 4, "T", "T1", "U")
+        tbl = ("T", "T1", "U")
         for i in range(len(out) - 1):
             a, b = lv_list[i], lv_list[i + 1]
             c = lv_list[i + 2] if i + 2 < len(lv_list) else None
             if out[i + 1].get("pageBreak") == "1":
+                continue
+            title = next((para_text(q) for q in out[i + 1:i + 4] if not para_tables(q) and para_text(q).lstrip().startswith("■")), None)
+            if a in (2, 3) and (b in tbl or (b == "blank" and c in tbl)) and not self._leads_table(out[i], title):
+                # 표 묶음(■ 제목·단위 줄·표)은 앞 ○·- 글 줄과 붙이지 않는다 — 그 줄이 표를 여는 말일 때만 붙임(사용자 2026-11-26
+                # 수정본: ‘○ (○○○○) 평균 ○.○년…’ 뒤 표가 쪽 끝에 안 들어가자 도구가 ○까지 새 쪽으로 넘겼는데 사용자는 ○를 앞 쪽에 두고
+                # ■ 제목부터 새 쪽으로 옮김). 표는 그대로 통째로(사용자 원칙 2026-11-04 '큰 표는 밑으로 내려 한 장에')
                 continue
             keep = ((a == 1 and b not in ("blank", 0))
                     or (a in (2, 3, 4, "T", "T1", "U") and b in member)
@@ -39,6 +46,85 @@ class RulesPart:
                 out[i].set("paraPrIDRef", self.hedit.para_keep_next(out[i].get("paraPrIDRef")))
                 if a == 2 and getattr(self, "narrative", ""):  # 서술식 문서의 ○ 제목(질의사항 등)은 두 쪽에 갈라지지 않게
                     out[i].set("paraPrIDRef", self.hedit.para_keep_lines(out[i].get("paraPrIDRef")))
+
+    def _start_x(self, p):
+        """문단 첫 글자가 시작하는 자리(HWPUNIT) — 왼쪽 여백 + 첫 줄 들여쓰기 + 줄머리 빈칸(보통 빈칸 반 글자·고정폭 빈칸 1/4·전각 1글자)."""
+        pp = self.styles.para.get(p.get("paraPrIDRef"), {})
+        lead = re.match(r"^[ ⎵⍽　]*", para_text(p)).group(0)
+        runs = para_runs(p)
+        size = (self.styles.char.get(runs[0].get("charPrIDRef"), {}).get("size") if runs else None) or 14
+        return pp.get("left", 0) + max(pp.get("intent", 0), 0) + sum({"⎵": 25, "　": 100}.get(ch, 50) for ch in lead) * size
+
+    def keep_heads(self, out):
+        """keep_groups를 끈 문서에도 머리 문단은 바로 아래 첫 문단과 한 쪽에(다음 문단과 함께) — □·Ⅰ. 제목, 아래 문단이 더 들어가 시작하는
+        문단(‘1) 사실관계’ → ○, ‘○ 쟁점사항’ → ‘(쟁점 1)’, ‘(갑설) …’ → ①, ○ → - 등 — 기호 종류가 아니라 들여 쓴 깊이로 가림, 사이 빈 줄도
+        함께), ■ 제목·단위 줄과 그 표, 표를 여는 ○·- 줄과 그 표(_leads_table). keep_groups와 달리 묶음 전체를 붙이지 않고 쪽 맞춤의
+        묶음 넘기기·빈 줄 좁힘도 부르지 않는다(받은 글 2026-11-26 2번 — 끄니 갈린 문단에 ‘다음 문단과 함께’가 없었음). 붙인 문단 수."""
+        n = 0
+        for i, p in enumerate(out):
+            if para_tables(p) or is_blank(p):
+                continue
+            j = i + 1
+            while j < len(out) and is_blank(out[j]):
+                j += 1
+            if j >= len(out) or out[j].get("pageBreak") == "1":
+                continue
+            q, text = out[j], para_text(p)
+            if para_tables(q):
+                keep = (UNIT_RE.match(text) or is_table_title(p, out[i + 1:i + 5])
+                        or (marker_level(text) in (2, 3) and self._leads_table(p, None)))
+            else:
+                keep = ((marker_level(text) == 1 and not is_table_title(p, out[i + 1:i + 5]))
+                        or UNIT_RE.match(text) or is_table_title(p, out[i + 1:i + 5])
+                        or self._start_x(q) > self._start_x(p) + 100)
+            if keep:
+                for k in range(i, j):
+                    out[k].set("paraPrIDRef", self.hedit.para_keep_next(out[k].get("paraPrIDRef")))
+                n += 1
+        return n
+
+    def keep_lines_all(self, out):
+        """본문 글 문단을 ‘문단 보호’(쪽 경계에서 나누지 않음)로 — 서술식 문서의 기본(받은 글 2026-11-26 2번: 배경 ○ 문단의 마지막 한 줄만
+        다음 쪽으로, 갑설 ③ 문단이 두 쪽에 걸침). 계획 keep_lines로 켜고 끔. 참고 쪽(참고 머리표부터)의 법령·발췌 원문은 그대로. 바꾼 문단 수."""
+        n = 0
+        for p in out:
+            if para_tables(p):
+                if self._is_ref_head(p):
+                    break
+                continue
+            if is_blank(p):
+                continue
+            pid = p.get("paraPrIDRef")
+            if not self.styles.para.get(pid, {}).get("keep_lines"):
+                p.set("paraPrIDRef", self.hedit.para_keep_lines(pid))
+                n += 1
+        return n
+
+    TITLE_COMMON = ("현황", "계획", "결과", "기준", "비교", "분포", "구성", "지표", "대수", "내역", "추이", "단위")
+
+    @classmethod
+    def _leads_table(cls, p, title=None):
+        """○·- 글 줄이 바로 아래 표를 여는 말인가: 쌍점으로 끝나거나 ‘다음과 같음’·‘아래 표’처럼 표를 가리키거나, 숫자 없는 짧은
+        제목 꼴(‘○ 연도별 예산 현황’ — 30자 안, 문장 끝맺음 없음), 또는 이름표·글의 낱말(세 글자 이상, ‘현황’ 같은 흔한 말 빼고)이
+        표 ■ 제목에 들어 있음(‘○ (○○기준) …’ → ‘■ 구분별 ○○기준’). ■ 제목이 없는 표는 붙여 둠. 아니면 표와 따로 쪽을 나눌
+        수 있는 내용 줄(‘○ (○○○○) 평균 ○.○년…’ → ‘■ 종류별 ○○ 기초 지표’ — 사용자 2026-11-26 수정본)."""
+        whole = split_marker(para_text(p).replace(FW, " ").replace("⍽", " "))[2].replace("**", "").strip()
+        m = re.match(r"^[(（]([^)）]{1,14})[)）]\s*", whole)
+        label = m.group(1).replace(" ", "") if m else ""
+        body = whole[m.end():] if m else whole  # 괄호 이름표는 빼고 봄
+        if not body or body[-1] in ":：" or re.search(r"(다음|아래)[과와]? ?같|같음$|(다음|아래|별첨|붙임) ?표|<표", body):
+            return True
+        if len(body) <= 30 and not re.search(r"\d", body) and not re.search(r"(음|함|임|됨|다|요|\.)$", body):
+            return True
+        if title is None:
+            return True
+        t = re.sub(r"\s", "", title.lstrip().lstrip("■"))
+        for c in cls.TITLE_COMMON:
+            t = t.replace(c, "\0")
+        if label and len(label) >= 2 and label in t:
+            return True
+        b = re.sub(r"\s", "", body)
+        return any(b[k:k + 3] in t for k in range(len(b) - 2) if "\0" not in b[k:k + 3] and not re.search(r"[\d.,()·%~]", b[k:k + 3]))
 
     def word_wrap(self):
         """쓰는 문단 모양을 모두 어절(단어) 단위 줄 나눔으로 맞춘다."""
@@ -55,7 +141,7 @@ class RulesPart:
             raise BuildError(f"{where}: 블록마다 \"like\"(견본 문단 번호)가 있어야 합니다: {block!r}")
         known = {"like", "text", "runs", "table", "cells", "page_break", "marker", "header_rows", "body_like",
                  "last_like", "keep_header", "cols", "widths", "note", "unit", "_src", "_align", "flow", "arrow",
-                 "title", "rows", "_case"}
+                 "title", "rows", "_case", "section"}
         if ("title" in block or "rows" in block) and "flow" not in block:
             raise BuildError(f"{where}: title은 표·도표 블록에만(표는 위 ■ 제목 줄, 도표는 < 제목 >), rows는 도표(flow) 블록에만 씁니다.")
         extra = set(block) - known
@@ -78,6 +164,8 @@ class RulesPart:
             self.data_tbls.update(para_tables(p))  # 계획이 줄·칸을 준 표 — 나머지 표는 견본(양식) 표(만든 문서 표시 form)
         if "page_break" in block:
             p.set("pageBreak", "1" if block["page_break"] else "0")
+        if block.get("section"):
+            self.__dict__.setdefault("section_marks", {})[p] = block["section"]  # 이 문단부터 새 구역(split_sections)
         if block.get("_align"):
             p.set("paraPrIDRef", self.hedit.para_align(p.get("paraPrIDRef"), block["_align"]))
         return p
@@ -301,7 +389,8 @@ class RulesPart:
     def colon_hang(self, colons=True, labels=True):
         """두 줄 이상인 문단의 둘째 줄부터를 내용 첫 글자에 맞춰 내어쓴다.
         - 쌍점: '인센티브 : 밤 10시…' → 쌍점 뒤 첫 글자(사용자 원칙: 쌍점 뒤 처음 시작하는 글자의 끝선에 아랫줄을 맞춤)
-        - 괄호 이름표: '○ (근  거) 「법」…' → 이름표 뒤 첫 글자(사용자 의견 2026-10-31: 근거·홍보 다음 첫 글자에 끝선 맞춤)
+        - 괄호 이름표: '○ (근  거) 「법」…' → 이름표 '(' 자리(머리 기호 뒤 첫 글자 — 사용자 2026-11-26 '늘 ( 자리로'). labels=True(계획
+          label_hang: true)면 옛 방식 — 개조식은 이름표 뒤 첫 글자(사용자 의견 2026-10-31), 서술형·둘째 줄이 길면 '(' 자리(2026-11-15)
         내어쓰기가 본문 폭의 40%를 넘으면(이름표가 너무 김) 하지 않는다."""
         lay = Layout(self.styles, self.metrics)
         pg = page_info(self.sec)
@@ -321,7 +410,7 @@ class RulesPart:
                 continue
             k = content_at(text)
             if not k:
-                if labels and label_content(text) and is_narrative(text) and not label_colon(text):
+                if label_content(text) and not label_colon(text) and (is_narrative(text) or not labels):
                     self._marker_hang(p, text, lay)  # 서술형: 이름표 '(' 자리(기호 뒤)에 정확히(견본 내어쓰기가 작아도 — Codex 검토)
                 elif not (label_content(text) or label_colon(text)):
                     self._reset_hang(p, text, lay)
@@ -1171,6 +1260,30 @@ class RulesPart:
                 n += 1
         if n:
             self.warn(f"참고 머리표 바로 밑에서 글이 시작하는 {n}곳은 머리표와 첫 줄 사이를 반 줄 띄웠습니다(밑에 표가 오면 붙여 둠).")
+        return n
+
+    def table_gaps(self, out):
+        """표(와 그 뒤 ※·* 설명 줄) 바로 뒤에 다음 표의 ■ 제목이 오면 사이에 빈 줄 하나를 둔다 — 참고·본문 모두(사용자 2026-11-26
+        수정본: 한 참고 안 두 표 사이에 빈 줄을 넣음, 물음 '참고와 본문 모두'). 빈 줄은 참고 쪽 채우기가 덩어리를 모을 때 쓰는 것과 같은
+        모양(_block_spacer). 참고 머리표 바로 밑 ■은 그대로. 넣은 곳 수."""
+        sp = self._block_spacer()
+        if sp is None:
+            return 0
+        n, k = 0, 1
+        while k < len(out):
+            p = out[k]
+            if out[k].get("pageBreak") == "1" or not is_table_title(p, out[k + 1:k + 5]):
+                k += 1
+                continue
+            j = k - 1
+            while j >= 0 and not para_tables(out[j]) and marker_level(para_text(out[j])) == 4:
+                j -= 1  # 표 뒤 ※·* 설명 줄은 표에 딸린 줄
+            prev = out[j] if j >= 0 else None
+            if prev is not None and para_tables(prev) and not self._is_ref_head(prev):
+                out.insert(k, self.clone(sp, "표 사이 빈 줄"))
+                n += 1
+                k += 1
+            k += 1
         return n
 
     def table_titles(self, out):

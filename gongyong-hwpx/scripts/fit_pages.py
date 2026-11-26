@@ -63,6 +63,10 @@ class PageFit:
             texts = [p for p in seg if not para_tables(p) and para_text(p).strip()
                      and self.st.para.get(p.get("paraPrIDRef"), {}).get("line_type") == "PERCENT"]
             summary_gap = self._summary_gap(seg)
+            if getattr(self, "fixed_rhythm", False):
+                # 계획 line_pct로 본문 줄 간격을 정한 문서는 빈 줄·○ 위 간격도 그 박자대로 둔다(받은 글 2026-11-26 2번: 190% 의뢰서에서
+                # 쪽 맞춤이 빈 줄 15개를 100%로 좁힘) — 쪽 맞춤은 그래프 높이·묶음 나누기만
+                spacers, summary_gap = [], None
             saved = {p: (p.get("paraPrIDRef"), [r.get("charPrIDRef") for r in para_runs(p)])
                      for p in spacers + texts + ([summary_gap] if summary_gap is not None else [])}
             for p, (pid, _) in saved.items():  # 줄이기 전 문단 모양 — 자리가 남는 마지막 본문 쪽은 되돌림(spread_pages)
@@ -157,6 +161,8 @@ class PageFit:
                 plans += [(f"□ 사이 빈 줄 조금 좁힘 + 줄 간격 {v}%", SPACER_COST + top - v,
                            lambda v=v: (shrink_spacers(), line_to(v))) for v in steps]
             low = steps[-1] if steps else None
+            if getattr(self, "fixed_rhythm", False):
+                low = None  # ○ 위 간격 절반도 하지 않음
             extra = []  # 마지막 수단(표 위아래 여백은 지키고 위쪽을 더 줄임 — 사용자 2026-11-05): 쪽 수가 줄 때만 고른다
             if low is not None:
                 extra.append((f"□ 사이 빈 줄 조금 좁힘 + 줄 간격 {low}% + ○ 위 간격 절반", SPACER_COST + top - low + PREV_HALF_COST,

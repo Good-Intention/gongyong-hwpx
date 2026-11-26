@@ -171,12 +171,20 @@ class Inspector:
     def tidy_preview(self):
         """정돈을 한 번 돌려 보고(저장하지 않음) 실제로 바뀌는 문단과 쪽 수를 적는다 — 옛 판은 작성 도구로 어림해 정돈이 하지 않는 일을
         적고 하는 일은 빠뜨렸음(평가 2026-11-09)."""
+        import os
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix=".hwpx")
+        os.close(fd)
         try:
+            # 실제 정돈과 같은 길(임시 파일에 저장 → 두 번째 정돈까지 _settle)로 — 한 번만 돌리면 예고가 실제보다 적게 나왔음(v2.17 5번)
             t = Tidier(self.path)
-            before, after, _ = t.run(None)
+            before, after, _ = t.run(tmp)
         except Exception as e:  # noqa: BLE001 — 다른 사람 문서라 어떤 짜임이든 올 수 있음
             self.info.append(f"정돈 어림 중 멈춤({type(e).__name__}: {e}) — 이 문서는 정돈 전에 짜임을 봐야 합니다.")
             return
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
         self.polish += t.change_lines()
         if self.polish:
             self.polish.append(f"정돈하면 어림 쪽 수 {before}쪽 → {after}쪽")
@@ -189,10 +197,15 @@ class Inspector:
         before_warn = len(b.warnings)
         try:
             b.tighten_quotes()
-            b.colon_hang(colons=True, labels=True)
+            b.colon_hang(colons=True, labels=False)  # 괄호 이름표 둘째 줄은 늘 '(' 자리(사용자 2026-11-26)
+            for p in b.sec.iter(T("hp:p")):  # 만들기와 같게 — 머리와 내용을 다른 조각으로(내용 조각만 자간)
+                h = head_length(para_text(p))
+                if h and not para_tables(p):
+                    b._split_run_at(p, h)
             f = Fitter(b)
             f.lay.move_whole = False  # 쪽 나눔을 박지 않음 — 한글이 하는 대로 셈
-            f.push = True
+            narr = bool(read_doc_meta(self.pkg).get("narr"))  # 서술식 문서는 강제 줄 바꿈을 기본으로 안 넣음(만들기와 같게)
+            f.push = f.openers = f.connectors = not narr
             f.keep_table_pt = int(read_doc_meta(self.pkg).get("table_pt", 0)) or None
             f.rescan_hints = True  # 이미 내린 끝 줄도 '한 줄 줄이기 후보'로 봄(만들기와 같은 지적)
             if tables:
@@ -210,21 +223,34 @@ class Inspector:
 
     # ------------------------------------------------------------ 실행
     def run(self, tables=True):
-        f = Fitter(self.b)
-        f.lay.move_whole = False  # 원본 쪽 수도 한글이 하는 대로
-        pages = f.report()  # 바꾸기 전 어림(원본 쪽 수)
-        if len(self.b.sec_names) > 1:  # 글·짜임 검사와 위 쪽 수는 첫 구역만 — 말없이 넘어가면 둘째 구역의 문제를 '없음'으로 읽음(검토 2026-11-12)
-            self.info.append(f"구역이 {len(self.b.sec_names)}개인 문서입니다 — 위 쪽 수와 '고쳐야 함'(글·짜임)은 첫 구역만 본 것이고, "
-                             "'정돈이 고칠 것'은 모든 구역을 봅니다.")
+        # 구역이 여럿이면(가로 쪽 등) 쪽 수와 글·짜임 검사를 구역마다 그 쪽 크기로 하고 잇는다(v2.17 2번 — 옛 판은 첫 구역만)
+        sec0 = self.b.sec
+        secs = [sec0] + [self.pkg.xml(n) for n in self.b.sec_names[1:]]
+        reports = []
+        for s in secs:
+            self.b.sec = s
+            f = Fitter(self.b)
+            f.lay.move_whole = False  # 원본 쪽 수도 한글이 하는 대로
+            reports.append((f.report(), None))  # 바꾸기 전 어림(원본 쪽 수)
+        self.b.sec = sec0
+        pages = reports[0][0] if len(secs) == 1 else Builder._join_reports(reports)
+        if len(secs) > 1:
+            self.info.append(f"구역이 {len(secs)}개인 문서입니다 — 쪽 수와 '고쳐야 함'(글·짜임)은 구역마다 그 쪽 크기(가로 쪽 등)로 보고 이었습니다.")
         self.fonts()
         self.basis()
         self.title_and_summary()
-        self.rules()
-        if read_doc_meta(self.pkg).get("made"):  # 이 스킬이 만든 문서: 두 쪽에 걸친 □ 묶음 지적도 만들 때와 같은 셈으로
-            whole = Fitter(self.b).report()
-            if note_is_fix(whole):
-                self.fix.append(whole)
-        self.dry_fit(tables)
+        made = read_doc_meta(self.pkg).get("made")
+        for k, s in enumerate(secs):
+            self.b.sec = s
+            self.paras = [p for p in s if p.tag == T("hp:p")]
+            self.rules()
+            if made:  # 이 스킬이 만든 문서: 두 쪽에 걸친 □ 묶음 지적도 만들 때와 같은 셈으로
+                whole = Fitter(self.b).report()
+                if note_is_fix(whole) and whole not in self.fix:
+                    self.fix.append(whole)
+            self.dry_fit(tables)
+        self.b.sec = sec0
+        self.paras = [p for p in sec0 if p.tag == T("hp:p")]
         self.tidy_preview()
         # 만들 때(또는 --omit) 일부러 뺀다고 한 요소의 지적은 알림으로 — 근거법령 검사를 끈 문서(--no-basis·문서 종류)의 근거법령 지적도
         off = self.omit | ({"basis"} if self._basis_skip() else set())
@@ -266,7 +292,7 @@ def main():
     print("## 고쳐야 함(글·짜임 — 작성자가 정할 것)")
     for w in ins.fix or ["없음"]:
         print(" - " + w)
-    print("## 정돈이 고칠 것(서식 — 정돈을 한 번 돌려 본 결과, 파일은 그대로)")
+    print("## 정돈이 고칠 것(서식 — 실제 정돈과 같게 돌려 본 결과, 파일은 그대로)")
     for w in ins.polish or ["없음"]:
         print(" - " + w)
     print_citations(para_text(p) for p in ins.b.sec.iter(T("hp:p")))

@@ -87,8 +87,15 @@ def top_paras(sec):
 def show(path):
     """문단 번호·글, 표는 칸마다 줄·칸 번호와 글 앞부분."""
     pkg = Package(path)
-    sec = pkg.xml(pkg.sections()[0])
-    for k, p in enumerate(top_paras(sec)):
+    names = pkg.sections()
+    tops = []
+    for si, name in enumerate(names):
+        tops += [(si, name, p) for p in top_paras(pkg.xml(name))]
+    last = 0
+    for k, (si, name, p) in enumerate(tops):
+        if si != last:
+            print(f"── {si + 1}째 구역({name}) — 번호는 이어서 셈")
+            last = si
         tables = para_tables(p)
         if not tables:
             print(f"[{k}] {para_text(p).replace('⎵', ' ')[:60]}")
@@ -99,8 +106,8 @@ def show(path):
                 text = " / ".join(para_text(cp).replace("⎵", " ").strip() for cp in cell_paras(tc) if para_text(cp).strip())
                 span = f" 합침 {rs}×{cs}" if rs > 1 or cs > 1 else ""
                 print(f"     ({r},{c}){span} {text[:60]}")
-    if len(pkg.sections()) > 1:
-        print(f"※ 이 파일은 구역이 {len(pkg.sections())}개입니다 — 위 번호는 첫 구역만. 칸 채우기도 첫 구역만 합니다.")
+    if len(names) > 1:
+        print(f"※ 이 파일은 구역이 {len(names)}개입니다 — 번호는 모든 구역을 이어서 셉니다(칸 채우기도 모든 구역). keep·drop(양식 구간 떼기)은 첫 구역 문단만.")
 
 
 def plain_char(hedit, cid):
@@ -582,6 +589,9 @@ def fill(path, plan, out, base_dir=None):
     names = pkg.sections()
     sec = pkg.xml(names[0])
     tops = top_paras(sec)
+    n_first = len(tops)
+    for name in names[1:]:  # 칸 채우기·칸 너비는 모든 구역(번호는 이어서 — --list와 같게, v2.17 2번)
+        tops += top_paras(pkg.xml(name))
     check_plan(plan, len(tops))
     ctx = Ctx(pkg, styles, hedit, sec, base_dir, plan)
     # 칸 너비 먼저 — 칸 안 표가 칸 폭에 맞춘다
@@ -617,6 +627,9 @@ def fill(path, plan, out, base_dir=None):
     # 양식 구간 떼기
     keep = plan.get("keep")
     drop = set(plan.get("drop") or [])
+    if any(k >= n_first for k in list(drop) + list(keep or [])):
+        raise FormError(f"keep·drop은 첫 구역 문단(0~{n_first - 1})만 고를 수 있습니다 — 뒤 구역은 그대로 두거나 keep으로 첫 구역 구간을 고르면 뺍니다.")
+    tops = tops[:n_first]
     a, b = (keep if keep else (0, len(tops) - 1))
     if not 0 <= a <= b < len(tops):
         raise FormError(f"keep은 [처음, 끝] 문단 번호여야 합니다(0~{len(tops) - 1}).")

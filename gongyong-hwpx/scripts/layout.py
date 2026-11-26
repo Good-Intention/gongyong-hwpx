@@ -413,6 +413,41 @@ class Layout:
             self.row_cache[tbl] = list(out)
         return out
 
+    def _groups_of(self, tbl):
+        """row_groups를 표마다 한 번만(쪽 맞춤이 쪽 어림을 수십 번 부름 — 300줄 표에서 매번 칸을 다 훑으면 만들기가 15초 → 34초)."""
+        cache = self.__dict__.setdefault("_groups_cache", {})
+        key = (id(tbl), tbl.get("rowCnt"), tbl.get("colCnt"))
+        if key not in cache:
+            cache[key] = self.row_groups(tbl)
+        return cache[key]
+
+    @staticmethod
+    def row_groups(tbl):
+        """세로로 합친 칸(머리 줄 밖)이 걸친 줄 묶음: 묶음 첫 줄 → 끝 줄. 겹치는 묶음은 하나로 잇는다. 줄 사이에서만 나누는 표(TABLE)에서
+        한글은 이 묶음을 나누지 않는다(실측 2026-11-27: 4줄을 합친 칸이 쪽 끝에 걸리자 두 줄 자리가 남아도 통째로 다음 쪽)."""
+        if tbl.get("pageBreak") == "CELL":
+            return {}
+        spans = []
+        for r, c, rs, cs, tc in table_grid(tbl):
+            if rs > 1:
+                spans.append((r, r + rs - 1))
+        spans.sort()
+        out, cur = {}, None
+        for a, b in spans:
+            if cur and a <= cur[1]:
+                cur = (cur[0], max(cur[1], b))
+            else:
+                if cur:
+                    out[cur[0]] = cur[1]
+                cur = (a, b)
+        if cur:
+            out[cur[0]] = cur[1]
+        head = 0
+        for tr in tbl:
+            if tr.tag == T("hp:tr") and any(tc.get("header") == "1" for tc in tr if tc.tag == T("hp:tc")):
+                head += 1
+        return {a: b for a, b in out.items() if a >= head}
+
     def row_pieces(self, tbl):
         """칸 안에서 쪽을 나누는 표(pageBreak=CELL)의 줄마다 나눌 수 있는 조각 높이 — 가장 높은 칸의 글 줄 단위, 칸 안 표는 글자처럼 취급되어 통째로.
         줄을 통째로 옮겨 세면 355mm 줄 하나로 실제 5쪽 문서가 6쪽이 된다(공모전 양식 시험 2026-11-09)."""
@@ -489,6 +524,7 @@ class Layout:
                           "pieces": (self.row_pieces(tables[0]) if len(tables) == 1 and tables[0].get("pageBreak") == "CELL"
                                      and tables[0].find(T("hp:pos")) is not None and tables[0].find(T("hp:pos")).get("treatAsChar") != "1"
                                      else None),
+                          "groups": self._groups_of(tables[0]) if len(tables) == 1 else {},
                           "blank": not tables and not para_pics(p) and not text.strip(),
                           # 글자처럼 취급하지 않은 표: 한글은 바로 뒤 문단의 위 간격을 쓰지 않는다(실측 — 표 바깥 아래 여백만)
                           "float": bool(tables) and all(t.find(T("hp:pos")) is None
@@ -618,8 +654,17 @@ class Layout:
                         at += len(row)
                 row_start = None
                 rec = self.row_pos.setdefault(k, []) if it["table"] else None
+                groups = it.get("groups") if not row_end else None
                 for u_i, lh in enumerate(units):
-                    if y + lh > body_h + 1 and y > 0:
+                    # 세로로 합친 칸이 걸친 줄 묶음은 한글이 나누지 않고 통째로 다음 쪽으로(2026-11-27 한글 확인 — v2.17 4번):
+                    # 묶음 첫 줄에서 묶음 전체가 들어가는지 본다(한 쪽보다 길면 줄마다)
+                    g_end = groups.get(u_i) if groups else None
+                    g_h = sum(units[u_i:g_end + 1]) if g_end is not None else lh
+                    if g_end is not None and y + g_h > body_h + 1 and y > 0 and g_h <= body_h:
+                        lh_check = g_h
+                    else:
+                        lh_check = lh
+                    if y + lh_check > body_h + 1 and y > 0:
                         used[page] = y
                         page, y = page + 1, 0.0
                         used.append(0.0)

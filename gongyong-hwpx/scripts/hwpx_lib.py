@@ -110,6 +110,26 @@ class Package:
             )
         return names
 
+    def add_section(self, name, root):
+        """구역 파일 하나를 묶음과 목차(content.hpf — 항목·읽는 차례 끝)에 더한다(가로 쪽 구역 등 — build.split_sections)."""
+        self._xml[name] = root
+        self.data[name] = b""
+        if "Contents/content.hpf" not in self.data:
+            return
+        hpf = self.xml("Contents/content.hpf")
+        items = [it for it in hpf.iter(T("opf:item")) if re.match(r"Contents/section\d+\.xml$", it.get("href", ""))]
+        refs = [r for r in hpf.iter(T("opf:itemref")) if r.get("idref") in {it.get("id") for it in items}]
+        if not items or not refs:
+            return
+        sid = re.sub(r"\.xml$", "", name.split("/")[-1])
+        it = copy.deepcopy(items[-1])
+        it.set("id", sid)
+        it.set("href", name)
+        items[-1].addnext(it)
+        ref = copy.deepcopy(refs[-1])
+        ref.set("idref", sid)
+        refs[-1].addnext(ref)
+
     def drop_section(self, name):
         """구역 하나를 묶음과 목차(content.hpf)에서 뺀다."""
         self.data.pop(name, None)

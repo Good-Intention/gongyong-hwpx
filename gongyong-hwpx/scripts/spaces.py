@@ -69,6 +69,45 @@ def compact_fw(p, styles, hedit, split, tab_proto):
     return n
 
 
+LEAD_RE = re.compile(r"^[ ⎵⍽　]+")
+
+
+def protect_lead(p, styles, hedit, split, tab_proto):
+    """머리 기호 없이 빈칸으로 들인 문단('      (갑설) …')의 줄머리 빈칸은 자간을 받지 않게(0%) 한다 — 줄 맞춤이 내용 조각에 준
+    자간이 같은 조각 안 줄머리 빈칸까지 줄여 같은 역할 첫 줄의 시작 자리가 어긋났음((갑설) 14.7mm · (을설) 13.3mm, 받은 글
+    2026-11-26 5번). 줄머리 빈칸이 든 조각을 빈칸 조각(자간 0)과 나머지로 나눈다. 바꿨으면 True."""
+    text = para_text(p)
+    m = LEAD_RE.match(text)
+    if not m or split(text)[1]:
+        return False
+    k, pos, done = len(m.group(0)), 0, False
+    for r in list(para_runs(p)):
+        if pos >= k:
+            break
+        t = run_text(r)
+        st, pos = pos, pos + len(t)
+        if not t:
+            continue
+        cid = r.get("charPrIDRef")
+        if styles.char.get(cid, {}).get("spacing", 0) == 0:
+            continue
+        if not plain_run(r):
+            return done
+        cut = min(k - st, len(t))
+        zero = hedit.char_spacing(cid, 0)
+        if cut >= len(t):
+            r.set("charPrIDRef", zero)
+        else:
+            tabs = run_tabs(r)
+            twin = copy.deepcopy(r)
+            set_run_text(twin, t[:cut], tab_proto, [])
+            twin.set("charPrIDRef", zero)
+            set_run_text(r, t[cut:], tab_proto, tabs)
+            r.addprevious(twin)
+        done = True
+    return done
+
+
 def lead_to_margin(p, styles, hedit, lay, split, fonts_ok, tab_proto, w):
     """머리 기호 앞 줄머리 빈칸(보통·고정폭)을 지우고 그 폭만큼 문단 여백으로 — 첫 줄 자리·둘째 줄 자리 모두 그대로.
     fonts_ok(p): 보통 빈칸 폭을 믿을 수 있는 글꼴인가(고정폭 빈칸만이면 묻지 않음). 옮겼으면 True."""
