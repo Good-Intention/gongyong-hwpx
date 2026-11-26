@@ -21,7 +21,7 @@ description: "공무원 한글문서 편집스킬(호출명 /gongyong-hwpx). 한
 - 애매하면(hwpx만 올리고 "이거 손봐 줘") 번호로 묻는다: ① 이 내용으로 새로 쓰기(작성 — 짜임·문장까지) ② 그대로 정돈(글은 그대로, 줄 나눔·간격·맞춤만). PDF·그림 문서는 정돈 대신 '옮겨 쓰기'(tidy.md 끝).
 - 글자·숫자 몇 군데, 표 줄 하나 같은 **부분 수정**은 모드가 아니다 — 파일 속 글을 직접 고치고 그 문단의 `linesegarray`를 지워 한글이 다시 나누게.
 
-필요할 때만: 짧은 계획서(추진계획(안))가 아닌 종류 → `doc-types.md`(그 종류 한 행) · 표지 → `cover.md` · 도표·그림·참고 조문 발췌 → `boxes-figures.md` · 기본 양식 번호표 → `basic-report-map.md` · 조각 모양·견본 표 줄·칸 너비·자동 처리 끄기 → `plan-format-advanced.md` · 낱말 → `words.md` · 만들기 알림 뜻 → `auto-fit.md` · 정돈 알림 뜻 → `tidy-detail.md` · 규칙 내력 → `history.md` · 다른 부서 기준값(본문 pt·자간 범위 등) → `assets/profile.json`.
+필요할 때만: 짧은 계획서(추진계획(안))가 아닌 종류 → `doc-types.md`(그 종류 한 행) · 표지 → `cover.md` · 도표·그림·참고 조문 발췌 → `boxes-figures.md` · 기본 양식 번호표 → `basic-report-map.md` · 조각 모양·견본 표 줄·칸 너비·자동 처리 끄기 → `plan-format-advanced.md` · 낱말 → `words.md` · 만들기 알림 뜻 → `auto-fit.md` · 정돈 알림 뜻 → `tidy-detail.md` · 규칙 내력 → `history.md` · 다른 부서 기준값(본문 pt·자간 범위 등) → `assets/profile.json` · 아직 못 하는 것(한글에서 하도록 안내) → `plan-format-advanced.md` 끝.
 
 ## 전달하기
 
